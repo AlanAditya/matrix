@@ -12,7 +12,7 @@
 using namespace metal;
 
 template <typename T>
-kernel void TransposeGPU(device T* out_buffer [[buffer(0)]], device const T* in_buffer [[buffer(1)]], constant size_t* inputStrides [[buffer(2)]], constant size_t* outputStrides [[buffer(3)]], constant int& dims [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+kernel void TransposeGPU(device T* out_buffer [[buffer(0)]], device const T* in_buffer [[buffer(1)]], constant size_m* inputStrides [[buffer(2)]], constant size_m* outputStrides [[buffer(3)]], constant int& dims [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
     size_t index = 0;
     uint remainder = gid;
     for (int i = 0; i < dims; i++) {
