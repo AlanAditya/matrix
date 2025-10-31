@@ -3,3 +3,16 @@ module GPUManager {
     export *
     link "c++"
 }
+
+module GeometryNode {
+    header "Mods/GeometryNode.h"
+    export *
+    link "c++"
+}
+
+
+module Utils {
+    header "Mods/Utils.h"
+    export *
+    link "c++"
+}
