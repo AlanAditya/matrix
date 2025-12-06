@@ -1,0 +1,5 @@
+module GPUManager {
+    header "Mods/GPUManager.h"
+    export *
+    link "c++"
+}
