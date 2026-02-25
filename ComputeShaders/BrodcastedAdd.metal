@@ -10,9 +10,88 @@
 
 using namespace metal;
 
+template <typename T>
+kernel void BrodcastedAddGPU_1Dgg(device T* result [[buffer(0)]], device const T* A [[buffer(1)]], device const T* B [[buffer(2)]], constant size_m& strideR [[buffer(3)]], constant size_m& strideA [[buffer(4)]], constant size_m& strideB [[buffer(5)]], uint gid [[thread_position_in_grid]]) {
+    // gid is general and not based on result Buffer
+    // Convert GID into respective axis index;
+    
+    // globalIndex for A, B and R
+    size_t GindexA = gid * (size_t)strideA;
+    size_t GindexB = gid * (size_t)strideB;
+    size_t indexR =  gid * (size_t)strideR;
+    
+    result[indexR] = A[GindexA] + B[GindexB];
+    
+}
 
 template <typename T>
-kernel void BrodcastedAddGPU(device T* result [[buffer(0)]], device const T* A [[buffer(1)]], device const T* B [[buffer(2)]], constant size_m* strideR [[buffer(3)]], constant size_m* strideA [[buffer(4)]], constant size_m* strideB [[buffer(5)]], constant int& dims [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
+kernel void BrodcastedAddGPU_2Dgg(device T* result [[buffer(0)]], device const T* A [[buffer(1)]], device const T* B [[buffer(2)]], constant size_m* strideR [[buffer(3)]], constant size_m* strideA [[buffer(4)]], constant size_m* strideB [[buffer(5)]], uint2 gid [[thread_position_in_grid]]) {
+    // gid is general and not based on result Buffer
+    // Convert GID into respective axis index;
+    
+    // globalIndex for A, B and R
+    size_t GindexA = gid.x * (size_t)strideA[1] + gid.y * (size_t)strideA[0];
+    size_t GindexB = gid.x * (size_t)strideB[1] + gid.y * (size_t)strideB[0];
+    size_t indexR =  gid.x * (size_t)strideR[1] + gid.y * (size_t)strideR[0];
+    
+    result[indexR] = A[GindexA] + B[GindexB];
+    
+}
+
+template <typename T>
+kernel void BrodcastedAddGPU_3Dgg(device T* result [[buffer(0)]], device const T* A [[buffer(1)]], device const T* B [[buffer(2)]], constant size_m* strideR [[buffer(3)]], constant size_m* strideA [[buffer(4)]], constant size_m* strideB [[buffer(5)]], uint3 gid [[thread_position_in_grid]]) {
+    // gid is general and not based on result Buffer
+    // Convert GID into respective axis index;
+    
+    // globalIndex for A, B and R
+    size_t GindexA = gid.x * (size_t)strideA[2] + gid.y * (size_t)strideA[1] + gid.z * (size_t)strideA[0];
+    size_t GindexB = gid.x * (size_t)strideB[2] + gid.y * (size_t)strideB[1] + gid.z * (size_t)strideB[0];
+    size_t indexR  = gid.x * (size_t)strideR[2] + gid.y * (size_t)strideR[1] + gid.z * (size_t)strideR[0];
+    
+    result[indexR] = A[GindexA] + B[GindexB];
+    
+}
+
+// General General N Dimensional Brodcasted Add where result buffer as well as any other buffer can be non contiguous in memory
+template <typename T>
+kernel void BrodcastedAddGPU_NDgg(device T* result [[buffer(0)]], device const T* A [[buffer(1)]], device const T* B [[buffer(2)]], constant size_m* strideR [[buffer(3)]], constant size_m* strideA [[buffer(4)]], constant size_m* strideB [[buffer(5)]], constant const size_m* result_shape [[buffer(6)]], constant int& ndims [[buffer(7)]], uint3 gid [[thread_position_in_grid]]) {
+    // gid is general and not based on result Buffer
+    // Convert GID into respective axis index;
+    // Adopting a fast approach as x is the innermost dimension as it changes the fastest and metal threads are optomised for fast changing x. Plus it avoids 2 mudulo operations which take ~ 60 cycles
+    
+    // globalIndex for A, B and R
+    size_t GindexA = gid.x * (size_t)strideA[ndims-1] + gid.y * (size_t)strideA[ndims-2];
+    size_t GindexB = gid.x * (size_t)strideB[ndims-1] + gid.y * (size_t)strideB[ndims-2];
+    size_t indexR  = gid.x * (size_t)strideR[ndims-1] + gid.y * (size_t)strideR[ndims-2];
+    
+    
+    size_t rem = gid.z;
+    for (int i = ndims-3; i >= 0; --i) {
+        size_t dim_index = rem % result_shape[i];
+        GindexA += dim_index * strideA[i];
+        GindexB += dim_index * strideB[i];
+        indexR  += dim_index * strideR[i];
+        rem /= result_shape[i];
+    }
+    
+    result[indexR] = A[GindexA] + B[GindexB];
+}
+
+#define INSTANTIATE_FROM_TYPE(src_idx, type) \
+    instantiate_kernel("BrodcastedAddGPU_" #src_idx "_0", BrodcastedAddGPU_1Dgg, type); \
+    instantiate_kernel("BrodcastedAddGPU_" #src_idx "_1", BrodcastedAddGPU_2Dgg, type); \
+    instantiate_kernel("BrodcastedAddGPU_" #src_idx "_2", BrodcastedAddGPU_3Dgg, type); \
+    instantiate_kernel("BrodcastedAddGPU_" #src_idx "_3", BrodcastedAddGPU_NDgg, type); \
+
+INSTANTIATE_FROM_TYPE(0, float);
+INSTANTIATE_FROM_TYPE(1, half);
+INSTANTIATE_FROM_TYPE(2, uint8_t);
+INSTANTIATE_FROM_TYPE(3, int);
+
+// Not functional yet
+// General Brodcasted Add ND version where gid is based on result buffer directly as result buffer is contiguous in memory
+template <typename T>
+kernel void BrodcastedAddGPU_NDg(device T* result [[buffer(0)]], device const T* A [[buffer(1)]], device const T* B [[buffer(2)]], constant size_m* strideR [[buffer(3)]], constant size_m* strideA [[buffer(4)]], constant size_m* strideB [[buffer(5)]], constant int& dims [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
     // gid is based on result Buffer
     // Convert GID into respective axis index;
     
@@ -37,10 +116,10 @@ kernel void BrodcastedAddGPU(device T* result [[buffer(0)]], device const T* A [
     
 }
 
-instantiate_kernel("BrodcastedAddGPU_0", BrodcastedAddGPU, float);
-instantiate_kernel("BrodcastedAddGPU_1", BrodcastedAddGPU, half);
-instantiate_kernel("BrodcastedAddGPU_2", BrodcastedAddGPU, uint8_t);
-instantiate_kernel("BrodcastedAddGPU_3", BrodcastedAddGPU, int);
+instantiate_kernel("BrodcastedAddGPU_0", BrodcastedAddGPU_NDg, float);
+instantiate_kernel("BrodcastedAddGPU_1", BrodcastedAddGPU_NDg, half);
+instantiate_kernel("BrodcastedAddGPU_2", BrodcastedAddGPU_NDg, uint8_t);
+instantiate_kernel("BrodcastedAddGPU_3", BrodcastedAddGPU_NDg, int);
 
 
 // SUDO CODE

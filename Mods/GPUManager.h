@@ -81,17 +81,23 @@ public:
     bool ConvolveFullInit[3];
     id<MTLComputePipelineState> ConvolveFullComputeState[3];
     
-    bool BrodcastedAddInit[3];
-    id<MTLComputePipelineState> BrodcastedAddComputeState[3];
+    bool BrodcastedAddInit[4][4];
+    id<MTLComputePipelineState> BrodcastedAddComputeState[4][4];
     
-    bool BrodcastedSubInit[3];
-    id<MTLComputePipelineState> BrodcastedSubComputeState[3];
+    bool BrodcastedSubInit[4][4];
+    id<MTLComputePipelineState> BrodcastedSubComputeState[4][4];
     
-    bool BrodcastedMulInit[3];
-    id<MTLComputePipelineState> BrodcastedMulComputeState[3];
+    bool BrodcastedMulInit[4][4];
+    id<MTLComputePipelineState> BrodcastedMulComputeState[4][4];
     
-    bool BrodcastedDivInit[3];
-    id<MTLComputePipelineState> BrodcastedDivComputeState[3];
+    bool BrodcastedDivInit[4][4];
+    id<MTLComputePipelineState> BrodcastedDivComputeState[4][4];
+    
+    bool Concat_2M[4];
+    id<MTLComputePipelineState> Concat_2M_ComputeState[4];
+    
+    bool CopyInplace[4][4];
+    id<MTLComputePipelineState> CopyInplace_ComputeState[4][4];
     
     NSMutableDictionary<NSString*, NSNumber*>* shaderNameToIndex;
     NSMutableArray<id<MTLComputePipelineState>>* customComputeShader;
@@ -121,17 +127,25 @@ public:
         for (int i = 0; i < 3; i++) {
             ConvolveFullInit[i] = false;
         }
-        for (int i = 0; i < 3; i++) {
-            BrodcastedAddInit[i] = false;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                BrodcastedAddInit[i][j] = false;
+            }
         }
-        for (int i = 0; i < 3; i++) {
-            BrodcastedSubInit[i] = false;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                BrodcastedSubInit[i][j] = false;
+            }
         }
-        for (int i = 0; i < 3; i++) {
-            BrodcastedMulInit[i] = false;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                BrodcastedMulInit[i][j] = false;
+            }
         }
-        for (int i = 0; i < 3; i++) {
-            BrodcastedDivInit[i] = false;
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                BrodcastedDivInit[i][j] = false;
+            }
         }
         for (int i = 0; i < 3; i++) {
             SinInit[i] = false;
@@ -409,34 +423,33 @@ public:
         ConvolveFullInit[i] = true;
     }
     
-    void initBrodcastedAddInit(int i) {
+    void initBrodcastedAddInit(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedAddGPU_%i", i]];
-        BrodcastedAddComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
-        BrodcastedAddInit[i] = true;
-        BrodcastedAddInit[i] = true;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedAddGPU_%i_%i", typeCode, dimSpecialiation]];
+        BrodcastedAddComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        BrodcastedAddInit[typeCode][dimSpecialiation] = true;
     }
     
-    void initBrodcastedSubInit(int i) {
+    void initBrodcastedSubInit(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedSubGPU_%i", i]];
-        BrodcastedSubComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
-        BrodcastedSubInit[i] = true;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedSubGPU_%i_%i", typeCode, dimSpecialiation]];
+        BrodcastedSubComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        BrodcastedSubInit[typeCode][dimSpecialiation] = true;
     }
 
 
-    void initBrodcastedMulInit(int i) {
+    void initBrodcastedMulInit(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedMulGPU_%i", i]];
-        BrodcastedMulComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
-        BrodcastedMulInit[i] = true;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedMulGPU_%i_%i", typeCode, dimSpecialiation]];
+        BrodcastedMulComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        BrodcastedMulInit[typeCode][dimSpecialiation] = true;
     }
 
-    void initBrodcastedDivInit(int i) {
+    void initBrodcastedDivInit(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedDivGPU_%i", i]];
-        BrodcastedDivComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
-        BrodcastedDivInit[i] = true;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedDivGPU_%i_%i", typeCode, dimSpecialiation]];
+        BrodcastedDivComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        BrodcastedDivInit[typeCode][dimSpecialiation] = true;
     }
     void initExp(int i) {
         NSError* error = nil;
