@@ -5,7 +5,7 @@ module GPUManager {
 }
 
 module GeometryNode {
-    header "Mods/GeometryNode.h"
+    header "Mods/GeometryNode.mm"
     export *
     link "c++"
 }
@@ -13,6 +13,12 @@ module GeometryNode {
 
 module Utils {
     header "Mods/Utils.h"
+    export *
+    link "c++"
+}
+
+module Camera3D {
+    header "Mods/Camera3D.h"
     export *
     link "c++"
 }

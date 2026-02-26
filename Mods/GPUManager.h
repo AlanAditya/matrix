@@ -5,10 +5,13 @@
 //  Created by Aditya Dudeja on 25/11/25.
 //
 @import Metal;
-@import std_private_string_string_fwd;
-@import std_string;
+#include <string>
+#include <utility>
 
-using size_m = uint32;
+//@import std_string;
+@import Utils;
+@import simd;
+#pragma once // <--- 1. Prevents recursive inclusion
 template <int dims, typename Type>
 class MatrixH;
 
@@ -16,6 +19,8 @@ class GPUManager {
 public:
     id<MTLDevice> metalDevice = MTLCreateSystemDefaultDevice();
     id<MTLCommandQueue> gCommandQueue = [metalDevice newCommandQueue];
+    id<MTLCommandBuffer> gCommandBuffer = [gCommandQueue commandBuffer];
+    id<MTLComputeCommandEncoder> gCommandEncoder = [gCommandBuffer computeCommandEncoder];
     
     id<MTLLibrary> library = [metalDevice newDefaultLibrary];
     
@@ -102,6 +107,7 @@ public:
     NSMutableDictionary<NSString*, NSNumber*>* shaderNameToIndex;
     NSMutableArray<id<MTLComputePipelineState>>* customComputeShader;
     
+    
     GPUManager() {
         customComputeShader = [[NSMutableArray alloc] init];
         shaderNameToIndex = [[NSMutableDictionary alloc] init];
@@ -162,11 +168,34 @@ public:
         for (int i = 0; i < 3; i++) {
             SqrtInit[i] = false;
         }
+        for (int i = 0; i < 4; i++) {
+            Concat_2M[i] = false;
+        }
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                CopyInplace[i][j] = false;
+            }
+        }
     }
     
     bool hasShader(std::string name) {
         NSString* shaderName = [NSString stringWithUTF8String:name.c_str()];
         return shaderNameToIndex[shaderName] != nil;
+    }
+    
+    id<MTLCommandBuffer> getCommandBuffer() {
+        if (!gCommandBuffer) {
+            gCommandBuffer = [gCommandQueue commandBuffer];
+        }
+        return gCommandBuffer;
+    }
+    
+    id<MTLComputeCommandEncoder> getCommandEncoder() {
+        if (!gCommandEncoder) {
+            
+            gCommandEncoder = [getCommandBuffer() computeCommandEncoder];
+        }
+        return gCommandEncoder;
     }
     
     id<MTLLibrary> getSourceOfMetalFiles(id<MTLDevice> device) {
@@ -457,4 +486,29 @@ public:
         ExpComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ExpInit[i] = true;
     }
+    
+    void initConcat_2M_GPU(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"concatGPU_2M_%i", i]];
+        Concat_2M_ComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        Concat_2M[i] = true;
+    }
+    
+    void initCopyInplace(int typeCode, int dimSpecialiation) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"CopyInplaceGPU_%i_%i", typeCode, dimSpecialiation]];
+        CopyInplace_ComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        CopyInplace[typeCode][dimSpecialiation] = true;
+        NSLog([NSString stringWithFormat:@"CopyInplaceGPU_%i_%i", typeCode, dimSpecialiation]);
+    }
 };
+
+//simd_float4x4 DAMM() {
+//    simd_float4 row0 = {1.0f, 0.0f, 0.0f, 0.0f};
+//    simd_float4 row1 = {0.0f, 1.0f, 0.0f, 0.0f};
+//    simd_float4 row2 = {0.0f, 0.0f, 1.0f, 0.0f};
+//    simd_float4 row3 = {0.0f, 0.0f, 0.0f, 1.0f};
+//    return simd_matrix(row0, row1, row2, row3);
+//}
+
+static GPUManager GlobalGPUManager = GPUManager();
