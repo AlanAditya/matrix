@@ -55,23 +55,26 @@ kernel void TypeCastingGPUStepUpDown(device const InT* in_buffer [[buffer(0)]], 
 
 
 // 0 = float
-// 1 = uint8_t
-// 2 = int
-// 3 = uint16_t
-// 4 = uint32_t
-// 5 = simd_float2
-// 6 = simd_float3
-// 7 = simd_float4
+// 1 = float
+// 2 = uint8_t
+// 3 = int
+// 4 = uint16_t
+// 5 = uint32_t
+// 6 = simd_float2
+// 7 = simd_float3
+// 8 = simd_float4
 #define INSTANTIATE_FROM_TYPE(src_idx, src_type) \
     instantiate_kernel("TypeCastingGPU_" #src_idx "_0", TypeCastingGPU, src_type, float); \
-    instantiate_kernel("TypeCastingGPU_" #src_idx "_1", TypeCastingGPU, src_type, uint8_t); \
-    instantiate_kernel("TypeCastingGPU_" #src_idx "_2", TypeCastingGPU, src_type, int); \
-    instantiate_kernel("TypeCastingGPU_" #src_idx "_3", TypeCastingGPU, src_type, uint16_t); \
-    instantiate_kernel("TypeCastingGPU_" #src_idx "_4", TypeCastingGPU, src_type, uint32_t); \
+    instantiate_kernel("TypeCastingGPU_" #src_idx "_1", TypeCastingGPU, src_type, half); \
+    instantiate_kernel("TypeCastingGPU_" #src_idx "_2", TypeCastingGPU, src_type, uint8_t); \
+    instantiate_kernel("TypeCastingGPU_" #src_idx "_3", TypeCastingGPU, src_type, int); \
+    instantiate_kernel("TypeCastingGPU_" #src_idx "_4", TypeCastingGPU, src_type, uint16_t); \
+    instantiate_kernel("TypeCastingGPU_" #src_idx "_5", TypeCastingGPU, src_type, uint32_t); \
 
 // All possible type casting kernel instantiations (64 total combinations)
 INSTANTIATE_FROM_TYPE(0, float);
-INSTANTIATE_FROM_TYPE(1, uint8_t);
-INSTANTIATE_FROM_TYPE(2, int);
-INSTANTIATE_FROM_TYPE(3, uint16_t);
-INSTANTIATE_FROM_TYPE(4, uint32_t);
+INSTANTIATE_FROM_TYPE(1, half);
+INSTANTIATE_FROM_TYPE(2, uint8_t);
+INSTANTIATE_FROM_TYPE(3, int);
+INSTANTIATE_FROM_TYPE(4, uint16_t);
+INSTANTIATE_FROM_TYPE(5, uint32_t);

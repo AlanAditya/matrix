@@ -23,7 +23,7 @@ T Dot(device const T* A, device const T* B, size_t size) {
 // In A * B => dot(rows of A, col of B) --> Matmul(A, B.T) --> dot(rows of A, cols now become rows of B)
 // This is done as our matrices our row major matrices so doting rows is more efficient
 template <typename T>
-kernel void MatMul(device T* out_buffer [[buffer(0)]], device const T* A [[buffer(1)]], device const T* B [[buffer(2)]], constant size_t* shape1 [[buffer(3)]], constant size_t* shape2 [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+kernel void MatMul(device T* out_buffer [[buffer(0)]], device const T* A [[buffer(1)]], device const T* B [[buffer(2)]], constant size_m* shape1 [[buffer(3)]], constant size_m* shape2 [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
     // Orignal: [m, k] * [k, n] => [m, n]
     // Transposed:  [m, k] * [n, k] => [m, n]
     // shape 2 => [k, n]
@@ -39,4 +39,5 @@ kernel void MatMul(device T* out_buffer [[buffer(0)]], device const T* A [[buffe
 }
 
 instantiate_kernel("MatMulGPU_0", MatMul, float);
-instantiate_kernel("MatMulGPU_1", MatMul, int);
+instantiate_kernel("MatMulGPU_1", MatMul, half);
+instantiate_kernel("MatMulGPU_3", MatMul, int);

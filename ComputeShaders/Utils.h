@@ -8,6 +8,7 @@
 #ifndef Utils_h
 #define Utils_h
 
+using size_m = uint32_t;
 #define instantiate_kernel(name, func, ...) \
   template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
 

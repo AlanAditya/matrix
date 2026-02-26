@@ -23,7 +23,8 @@ kernel void TransposeGPU(device T* out_buffer [[buffer(0)]], device const T* in_
 }
 
 instantiate_kernel("TransposeGPU_0", TransposeGPU, float);
-instantiate_kernel("TransposeGPU_1", TransposeGPU, uint8_t);
-instantiate_kernel("TransposeGPU_2", TransposeGPU, int);
+instantiate_kernel("TransposeGPU_1", TransposeGPU, half);
+instantiate_kernel("TransposeGPU_2", TransposeGPU, uint8_t);
+instantiate_kernel("TransposeGPU_3", TransposeGPU, int);
 
 
