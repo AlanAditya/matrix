@@ -165,3 +165,129 @@ CollapsedDims_2 collapse_dims(const size_m shape[], const size_m stridesA[], con
     result.out_dims = last_index+1;
     return result;
 }
+
+void PatternFill(void* destination, const void* pattern, size_t patternSize, uint32_t n) {
+    uint32_t exp = 0;
+    uint32_t pO2 = 1;
+    while ((1u << (exp + 1)) <= n) {
+        ++exp;
+    }
+    
+    memcpy(destination, pattern, patternSize);
+    for (int i = 1; i < exp+1; i++) {
+        memcpy((char*)destination + patternSize * pO2, destination, patternSize*pO2);
+        // ByteShift To Multiply By 2
+        pO2 <<= 1;
+    }
+    
+    memcpy((char*)destination + patternSize * ((int)pO2), destination, (n - pO2) * patternSize);
+}
+
+void append_uint32(uint32_t value, std::vector<uint8_t>& header)
+{
+    uint8_t* ptr = reinterpret_cast<uint8_t*>(&value);
+
+    header.insert(header.end(), ptr, ptr + sizeof(uint32_t));
+};
+
+
+void write_string(const std::string& s, std::vector<uint8_t>& data) {
+    size_t old_size = data.size();
+
+    data.resize(old_size + s.size() + 1);
+
+    std::memcpy(data.data() + old_size,
+                s.data(),
+                s.size());
+
+    data.back() = '\0';
+}
+
+void write_attr(std::vector<uint8_t>& data,
+                const std::string& name,
+                const std::string& type_name,
+                const std::vector<uint8_t>& value_bytes)
+{
+    write_string(name, data);
+
+    write_string(type_name, data);
+
+    append_uint32(
+        static_cast<uint32_t>(value_bytes.size()),
+        data
+    );
+
+    data.insert(data.end(),
+                value_bytes.begin(),
+                value_bytes.end());
+}
+
+void write_box2i(std::vector<uint8_t>& data,
+                 int32_t xmin,
+                 int32_t ymin,
+                 int32_t xmax,
+                 int32_t ymax)
+{
+    data.reserve(data.size() + 16);
+
+    append_raw(xmin, data);
+    append_raw(ymin, data);
+    append_raw(xmax, data);
+    append_raw(ymax, data);
+}
+
+std::vector<uint8_t> write_box2i_out(
+                 int32_t xmin,
+                 int32_t ymin,
+                 int32_t xmax,
+                 int32_t ymax)
+{
+    std::vector<uint8_t> data;
+    data.reserve(data.size() + 16);
+
+    append_raw(xmin, data);
+    append_raw(ymin, data);
+    append_raw(xmax, data);
+    append_raw(ymax, data);
+    return data;
+}
+
+void write_v2f(std::vector<uint8_t>& data,
+               float x,
+               float y)
+{
+    data.reserve(data.size() + 8);
+
+    append_raw(x, data);
+    append_raw(y, data);
+}
+
+std::vector<uint8_t> write_v2f_out(
+               float x,
+               float y)
+{
+    std::vector<uint8_t> data;
+    data.reserve(data.size() + 8);
+
+    append_raw(x, data);
+    append_raw(y, data);
+    return data;
+}
+
+std::ostream& operator<<(std::ostream& os, const std::vector<uint8_t>& vec) {
+    os << "bytearray(b'";
+
+    for(uint8_t byte : vec) {
+        os << "\\x"
+           << std::hex
+           << std::setw(2)
+           << std::setfill('0')
+           << static_cast<int>(byte);
+    }
+
+    os << "')";
+
+    os << std::dec;
+
+    return os;
+}

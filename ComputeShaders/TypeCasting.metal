@@ -55,7 +55,7 @@ kernel void TypeCastingGPUStepUpDown(device const InT* in_buffer [[buffer(0)]], 
 
 
 // 0 = float
-// 1 = float
+// 1 = half
 // 2 = uint8_t
 // 3 = int
 // 4 = uint16_t

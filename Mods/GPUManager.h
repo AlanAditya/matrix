@@ -101,8 +101,9 @@ public:
     bool Concat_2M[4];
     id<MTLComputePipelineState> Concat_2M_ComputeState[4];
     
-    bool CopyInplace[4][4];
-    id<MTLComputePipelineState> CopyInplace_ComputeState[4][4];
+    bool CopyInplace[6][6][6];
+    id<MTLComputePipelineState> CopyInplace_ComputeState[6][6][6];
+    
     
     NSMutableDictionary<NSString*, NSNumber*>* shaderNameToIndex;
     NSMutableArray<id<MTLComputePipelineState>>* customComputeShader;
@@ -171,9 +172,11 @@ public:
         for (int i = 0; i < 4; i++) {
             Concat_2M[i] = false;
         }
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
-                CopyInplace[i][j] = false;
+        for (int i = 0; i < 6; i++) {
+            for (int j = 0; j < 6; j++) {
+                for (int k = 0; k < 6; k++) {
+                    CopyInplace[i][j][k] = false;
+                }
             }
         }
     }
@@ -188,6 +191,9 @@ public:
             gCommandBuffer = [gCommandQueue commandBuffer];
         }
         return gCommandBuffer;
+    }
+    void commitCommandBuffer() {
+        [gCommandBuffer commit];
     }
     
     id<MTLComputeCommandEncoder> getCommandEncoder() {
@@ -494,12 +500,13 @@ public:
         Concat_2M[i] = true;
     }
     
-    void initCopyInplace(int typeCode, int dimSpecialiation) {
+    void initCopyInplace(int dstTypeCode, int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"CopyInplaceGPU_%i_%i", typeCode, dimSpecialiation]];
-        CopyInplace_ComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
-        CopyInplace[typeCode][dimSpecialiation] = true;
-        NSLog([NSString stringWithFormat:@"CopyInplaceGPU_%i_%i", typeCode, dimSpecialiation]);
+        NSLog([NSString stringWithFormat:@"CopyInplaceGPU_%i_%i_%i", dstTypeCode, typeCode, dimSpecialiation]);
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"CopyInplaceGPU_%i_%i_%i", dstTypeCode, typeCode, dimSpecialiation]];
+        CopyInplace_ComputeState[dstTypeCode][typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        CopyInplace[dstTypeCode][typeCode][dimSpecialiation] = true;
+        
     }
 };
 

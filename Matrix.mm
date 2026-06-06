@@ -9,69 +9,1735 @@
 //#import <Metal/Metal.h>
 //#import <simd/simd.h>
 #import <iostream>
+@import Utils;
+@import GPUManager;
 #include <vector>
-//#import "Matrix.mm"
-//
-//
-//
+#include <atomic>
+#import <Metal/Metal.h>
+#include <iomanip>
+#include <sstream>
+#include <type_traits>
+#include <algorithm>
+#include <arm_neon.h>
+#include <arm_fp16.h>
+#include <CoreGraphics/CoreGraphics.h>
+#include <ImageIO/ImageIO.h>
+#include "matrix.h"
 
-//class Primitive {
-//    mat operand1;
-//    mat operand2;
-//    
-//    std::string MSLCode;
-//};
+using R = Range;
 
-class mat {
-public:
-    int dims;
-    size_t* shape;
-    size_t* strides;
-    size_t total_size;
-    std::vector<std::string> prevCode;
-    std::string MSLCode;
-    mat(const std::string& name): MSLCode(name) {
-        
-    }
-    mat() : dims(0), shape(nullptr), strides(nullptr), total_size(0), MSLCode("") {}
+enum class dtype {
+    Float = 0,
+    Float16 = 1,
+    UInt8 = 2,
+    Int32 = 3,
+    Int16 = 4,
+    UInt32 = 5,
+    UInt16 = 6
+    // Add more as needed
+};
 
-    
-    mat operator +( mat operand2) {
-        mat result;
-        result.prevCode.reserve(prevCode.size() + operand2.prevCode.size());
-        std::copy(prevCode.begin(), prevCode.end(), result.prevCode.begin());
-        std::copy(operand2.prevCode.begin(), operand2.prevCode.end(), result.prevCode.begin() + prevCode.size());
-        result.MSLCode = MSLCode + " + " + operand2.MSLCode;
-        return result;
+template<dtype code> struct type_from_dtype;
+
+template<> struct type_from_dtype<dtype::Float>   { using type = float; };
+template<> struct type_from_dtype<dtype::Float16>  { using type = float16_t; };
+template<> struct type_from_dtype<dtype::UInt8>   { using type = uint8_t; };
+template<> struct type_from_dtype<dtype::Int32>   { using type = int; };
+template<> struct type_from_dtype<dtype::Int16>   { using type = int16_t; };
+template<> struct type_from_dtype<dtype::UInt32>  { using type = uint32_t; };
+template<> struct type_from_dtype<dtype::UInt16>  { using type = uint16_t; };
+
+
+template<typename T> dtype dtype_from_type();
+
+template<> constexpr inline dtype dtype_from_type<float>()           { return dtype::Float; }
+template<> constexpr inline dtype dtype_from_type<float16_t>()       { return dtype::Float16; }
+template<> constexpr inline dtype dtype_from_type<uint8_t>()         { return dtype::UInt8; }
+template<> constexpr inline dtype dtype_from_type<int>()             { return dtype::Int32; }
+
+template<> constexpr inline dtype dtype_from_type<int16_t>()           { return dtype::Int16; }
+template<> constexpr inline dtype dtype_from_type<uint32_t>()        { return dtype::UInt32; }
+template<> constexpr inline dtype dtype_from_type<uint16_t>()        { return dtype::UInt16; }
+
+
+constexpr size_t dtype_size(dtype d) {
+    //     switch (d) {
+    //     case dtype::Float:   return sizeof(float);
+    //     case dtype::Float16: return sizeof(float16_t);
+    //     case dtype::UInt8:   return sizeof(uint8_t);
+    //     case dtype::Int32:   return sizeof(int32_t);
+    //     case dtype::Int16:   return sizeof(int16_t);
+    //     case dtype::UInt16:  return sizeof(uint16_t);
+    //     case dtype::UInt32:  return sizeof(uint32_t);
+    // }
+    static constexpr size_t sizes[] = {
+        sizeof(float),     // 0: Float
+        sizeof(float16_t), // 1: Float16
+        sizeof(uint8_t),   // 2: UInt8
+        sizeof(int32_t),   // 3: Int32
+        sizeof(int16_t),   // 4: Int16
+        sizeof(uint32_t),  // 5: UInt32
+        sizeof(uint16_t)   // 6: UInt16
+    };
+    return sizes[static_cast<size_t>(d)];
+}
+
+struct SharedArrayDescriptor {
+    std::atomic<uint32_t> refCount;
+    inline size_m* shape() { return reinterpret_cast<size_m*>(this + 1); }
+    inline size_m* strides(int dims) { return shape() + dims; }
+
+    static SharedArrayDescriptor* create(uint32_t dims) {
+        size_t total_bytes = sizeof(SharedArrayDescriptor) + (dims * 2 * sizeof(size_m));
+        void* mem = ::operator new(total_bytes);
+        SharedArrayDescriptor* shared = new (mem) SharedArrayDescriptor();
+        shared->refCount.store(1, std::memory_order_relaxed);
+        return shared;
     }
-    
-    mat operator -(mat operand2) {
-        mat result;
-        result.prevCode.reserve(prevCode.size() + operand2.prevCode.size());
-        std::copy(prevCode.begin(), prevCode.end(), result.prevCode.begin());
-        std::copy(operand2.prevCode.begin(), operand2.prevCode.end(), result.prevCode.begin() + prevCode.size());
-        result.MSLCode = MSLCode + " - " + operand2.MSLCode;
-        return result;
-    }
-    
-    mat operator *(mat operand2) {
-        mat result;
-        result.prevCode.reserve(prevCode.size() + operand2.prevCode.size());
-        std::copy(prevCode.begin(), prevCode.end(), result.prevCode.begin());
-        std::copy(operand2.prevCode.begin(), operand2.prevCode.end(), result.prevCode.begin() + prevCode.size());
-        result.MSLCode = MSLCode + " * " + operand2.MSLCode;
-        return result;
-    }
-    
-    mat operator /(mat operand2) {
-        mat result;
-        result.prevCode.reserve(prevCode.size() + operand2.prevCode.size());
-        std::copy(prevCode.begin(), prevCode.end(), result.prevCode.begin());
-        std::copy(operand2.prevCode.begin(), operand2.prevCode.end(), result.prevCode.begin() + prevCode.size());
-        result.MSLCode = MSLCode + " + " + operand2.MSLCode;
-        return result;
+
+    void release() {
+        if (refCount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            this->~SharedArrayDescriptor();
+            ::operator delete(this);
+        }
     }
 };
+
+template <typename Func>
+inline void dispatch_type(dtype type, void* buffer, Func&& function_to_run) {
+    if (!buffer) return;
+
+    // The switch statement happens exactly ONCE here.
+    // It casts the void* to the strict C++ type, and passes it into your lambda.
+    switch (type) {
+        case dtype::Float:
+            function_to_run(static_cast<float*>(buffer));
+            break;
+        case dtype::Float16:
+            // Standard C++ doesn't have a native 16-bit float yet on all compilers.
+            // We cast it to uint16_t for storage/printing purposes.
+            function_to_run(static_cast<uint16_t*>(buffer));
+            break;
+        case dtype::Int32:
+            function_to_run(static_cast<int32_t*>(buffer));
+            break;
+        case dtype::UInt32:
+            function_to_run(static_cast<uint32_t*>(buffer));
+            break;
+        case dtype::UInt8:
+            function_to_run(static_cast<uint8_t*>(buffer));
+            break;
+        case dtype::Int16:
+            function_to_run(static_cast<int16_t*>(buffer));
+            break;
+        case dtype::UInt16:
+            function_to_run(static_cast<uint16_t*>(buffer));
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype during dispatch");
+    }
+}
+
+
+// Detect if a type is an initializer_list
+template <typename T> struct is_init_list : std::false_type {};
+template <typename T> struct is_init_list<std::initializer_list<T>> : std::true_type {};
+
+// Count the depth of the nested initializer lists (Compile-time)
+template <typename T> struct init_list_depth { static constexpr int value = 0; };
+template <typename T> struct init_list_depth<std::initializer_list<T>> {
+    static constexpr int value = 1 + init_list_depth<T>::value;
+};
+
+// Find the lowest-level base type (e.g., float, int) (Compile-time)
+template <typename T> struct init_list_base { using type = T; };
+template <typename T> struct init_list_base<std::initializer_list<T>> {
+    using type = typename init_list_base<T>::type;
+};
+
+class primitive;
+class AdditionPrimitive;
+
+class matrix {
+public:
+    static constexpr int SBO_MAX_DIMS = 3;
+    
+    union array_descriptor {
+        size_m inline_buffer[SBO_MAX_DIMS * 2]; // For dims <= 3
+        SharedArrayDescriptor* shared_arr_desc;  // For dims > 3
+    } array_desc;
+
+
+    void* buffer = nullptr;
+    size_t total_size;
+    id<MTLBuffer> metalBuffer = nil;
+    std::atomic<uint32_t>* refCount = nil;
+    primitive* tape = nullptr;
+    
+    dtype type;
+    uint32_t dims = 0;
+    uint8_t flags = 0;
+    
+    template <typename Type>
+    matrix(std::initializer_list<Type> list) {
+        total_size = list.size();
+        shape()[0] = (size_m)list.size();
+        buffer = new Type[total_size];
+        memcpy(buffer, list.begin(), sizeof(Type) * list.size());
+        strides()[0] = 1;
+        type = dtype_from_type<Type>();
+        dims = 1;
+        if (total_size > 10) {
+            buildMetalBuffer();
+        }
+    }
+    
+    matrix(uint32_t rank, size_t total_size_inp, dtype type_inp) {
+        dims = rank;
+        total_size = total_size_inp;
+        type = type_inp;
+        
+        if (dims > SBO_MAX_DIMS) {
+            array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
+        }
+        buffer = new uint8_t[total_size * dtype_size(type)];
+        if (total_size_inp > 10) {
+            buildMetalBuffer();
+        }
+    }
+    
+    matrix(uint32_t rank, dtype type_inp) {
+        dims = rank;
+        type = type_inp;
+        
+        if (dims > SBO_MAX_DIMS) {
+            array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
+        }
+    }
+    
+    template <typename Type>
+    matrix(std::initializer_list<std::initializer_list<Type>> list) {
+        setup_from_list<2, Type>(list);
+    }
+    template <typename Type>
+    matrix(std::initializer_list<std::initializer_list<std::initializer_list<Type>>> list) {
+        setup_from_list<3, Type>(list);
+    }
+    template <typename Type>
+    matrix(std::initializer_list<std::initializer_list<std::initializer_list<std::initializer_list<Type>>>> list) {
+        setup_from_list<4, Type>(list);
+    }
+    
+    // MARK: // --- Unified Initialization Logic ---
+    template <int Dims, typename BaseType, typename NestedList>
+    void setup_from_list(const NestedList& list) {
+        this->dims = Dims;
+        
+        type = dtype_from_type<BaseType>();
+
+        // 2. Trigger SBO logic if dimensions exceed threshold
+        if (this->dims > SBO_MAX_DIMS) {
+            array_desc.shared_arr_desc = SharedArrayDescriptor::create(this->dims);
+        }
+
+        // 3. Extract the shape dynamically
+        extract_shape(this->shape(), list, 0);
+
+        // 4. Calculate strides and total size
+        this->total_size = 1;
+        for (int i = 0; i < this->dims; ++i) {
+            this->total_size *= this->shape()[i];
+        }
+
+        size_m current_stride = 1;
+        for (int i = this->dims - 1; i >= 0; --i) {
+            this->strides()[i] = current_stride;
+            current_stride *= this->shape()[i];
+        }
+
+        // 5. Allocate raw memory
+        this->buffer = new uint8_t[this->total_size * sizeof(BaseType)];
+
+        // 6. Flatten and copy data
+        BaseType* raw_ptr = static_cast<BaseType*>(this->buffer);
+        size_m offset = 0;
+        copy_data(raw_ptr, list, offset);
+    }
+
+    // --- Recursive Helpers (from previous step) ---
+    template <typename ListType>
+    void extract_shape(size_m* shape_arr, const std::initializer_list<ListType>& list, int current_dim) {
+        shape_arr[current_dim] = static_cast<size_m>(list.size());
+        if constexpr (is_init_list<ListType>::value) {
+            if (list.size() > 0) {
+                extract_shape(shape_arr, *list.begin(), current_dim + 1);
+            }
+        }
+    }
+
+    template <typename ListType, typename BaseType>
+    void copy_data(BaseType* dest, const std::initializer_list<ListType>& list, size_m& offset) {
+        if constexpr (is_init_list<ListType>::value) {
+            for (const auto& sub_list : list) {
+                copy_data(dest, sub_list, offset);
+            }
+        } else {
+            for (const auto& item : list) {
+                dest[offset++] = item;
+            }
+        }
+    }
+    
+    
+    inline size_m* shape() {
+        return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer : array_desc.shared_arr_desc->shape();
+    }
+    inline size_m* strides() {
+        return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer + SBO_MAX_DIMS : array_desc.shared_arr_desc->strides(dims);
+    }
+    
+    inline const size_m* shape() const {
+        return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer : array_desc.shared_arr_desc->shape();
+    }
+
+    inline const size_m* strides() const {
+        return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer + SBO_MAX_DIMS : array_desc.shared_arr_desc->strides(dims);
+    }
+    
+    inline void buildMetalBuffer() {
+        metalBuffer = [GlobalGPUManager.metalDevice newBufferWithBytesNoCopy:buffer length:effectiveBufferSize() * dtype_size(type) options:MTLResourceStorageModeShared deallocator:^(void * _Nonnull pointer, NSUInteger length) {
+        }];
+    }
+    inline void detach_shape() {
+        if (dims > SBO_MAX_DIMS) {
+            auto old_desc = array_desc.shared_arr_desc;
+            if (old_desc->refCount.load(std::memory_order_acquire) == 1)
+                return; // already exclusive
+            array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
+            memcpy(shape(), old_desc->shape(), dims * sizeof(size_m));
+            memcpy(strides(), old_desc->strides(dims), dims * sizeof(size_m));
+
+            old_desc->release();
+        }
+    }
+    inline void shareBuffer(matrix& mat) const {
+        mat.releaseBuffer();
+        if (refCount) {
+            mat.refCount = refCount;
+            refCount->fetch_add(1);
+        } else {
+            mat.flags |= NON_OWNERSHIP_FLAG;
+        }
+        mat.buffer = buffer;
+    }
+    
+    inline void beginReferenceCounting() {
+        refCount = new std::atomic<uint32_t>(1);
+    }
+    void calcStrides() {
+        size_m* l_strides = strides();
+        size_m* l_shape = shape();
+        size_m acc = 1;
+        for (int i = dims-1; i >= 0; i--) {
+            l_strides[i] = acc;
+            acc *= l_shape[i];
+        }
+    }
+    
+    size_t accumul(uint32_t start, uint32_t end) const {
+        const size_m* shape_arr = shape();
+        size_t acc = 1;
+        for (uint32_t i = start; i < end; i ++) {
+            acc *= shape_arr[i];
+        }
+        return acc;
+    }
+    size_t effectiveBufferSize() const {
+        if (flags & NON_CONTIGUOUS_FLAG) {
+            // CORRECT: Calculate the maximum memory offset generated by the strides
+            size_t max_offset = 0;
+            for (int d = 0; d < dims; ++d) {
+                if (shape()[d] > 0) {
+                    // The max index for this dimension is (count - 1) * stride
+                    max_offset += (shape()[d] - 1) * strides()[d];
+                }
+            }
+            // Buffer must be large enough to hold the last element
+            return (max_offset + 1);
+        } else {
+            return total_size;
+        }
+    }
+    
+    static matrix withShape(std::initializer_list<size_m> shape, dtype type) {
+        matrix output(shape.size(), type);
+        memcpy(output.shape(), shape.begin(), output.dims * sizeof(size_m));
+        output.calcStrides();
+        output.total_size = output.accumul(0, output.dims);
+        output.buffer = new uint8_t[output.total_size * dtype_size(type)];
+        if (output.total_size > 10) {
+            output.buildMetalBuffer();
+        }
+        return output;
+    }
+    
+    void print() const {
+        if (!buffer || dims == 0) return;
+
+        // The single dispatch call that handles the type erasure
+        dispatch_type(this->type, this->buffer, [&](auto* typed_data) {
+            
+            // Extract the exact C++ type we are currently working with
+            using T = std::decay_t<decltype(*typed_data)>;
+
+            // 1. PRE-PASS: Find the maximum character width for alignment
+            uint32_t max_width = 0;
+            for (size_t i = 0; i < total_size; ++i) {
+                std::ostringstream oss;
+                // Treat chars as numbers for printing
+                if constexpr (std::is_same_v<T, char> || std::is_same_v<T, unsigned char> || std::is_same_v<T, int8_t>) {
+                    oss << static_cast<int>(typed_data[i]);
+                } else {
+                    oss << typed_data[i];
+                }
+                
+                uint32_t current_length = (uint32_t)oss.str().length();
+                if (current_length > max_width) max_width = current_length;
+            }
+
+            const size_m* s = shape();
+            const size_m* st = strides();
+
+            // Tiny helper to print a single element with correct width and casting
+            auto print_elem = [&](size_t flat_index) {
+                std::cout << std::setw(max_width);
+                if constexpr (std::is_same_v<T, char> || std::is_same_v<T, unsigned char> || std::is_same_v<T, int8_t>) {
+                    std::cout << static_cast<int>(typed_data[flat_index]);
+                } else {
+                    std::cout << typed_data[flat_index];
+                }
+            };
+
+            // 2. YOUR HARDCODED LOOPS (Strictly typed, zero branching!)
+            if (dims == 1) {
+                std::cout << "{ ";
+                for (size_t i = 0; i < s[0]; i++) {
+                    print_elem(st[0] * i);
+                    std::cout << " ";
+                }
+                std::cout << "}\n";
+            }
+            else if (dims == 2) {
+                std::cout << "{\n";
+                for (size_t i = 0; i < s[0]; i++) {
+                    std::cout << "  { ";
+                    for (size_t j = 0; j < s[1]; j++) {
+                        print_elem(st[0] * i + st[1] * j);
+                        if (j < s[1] - 1) std::cout << ", ";
+                    }
+                    std::cout << " }\n";
+                }
+                std::cout << "}\n";
+            }
+            else if (dims == 3) {
+                std::cout << "{\n";
+                for (size_t i = 0; i < s[0]; i++) {
+                    std::cout << "  {\n";
+                    for (size_t j = 0; j < s[1]; j++) {
+                        std::cout << "    { ";
+                        for (size_t k = 0; k < s[2]; k++) {
+                            print_elem(st[0] * i + st[1] * j + st[2] * k);
+                            if (k < s[2] - 1) std::cout << ", ";
+                        }
+                        std::cout << " }";
+                        if (j < s[1] - 1) std::cout << ",\n";
+                    }
+                    std::cout << "\n  }";
+                    if (i < s[0] - 1) std::cout << ",\n";
+                }
+                std::cout << "\n}\n";
+            }
+            else if (dims == 4) {
+                for (size_t l = 0; l < s[0]; l++) {
+                    for (size_t i = 0; i < s[1]; i++) {
+                        for (size_t j = 0; j < s[2]; j++) {
+                            std::cout << "{ ";
+                            for (size_t k = 0; k < s[3]; k++) {
+                                print_elem(st[0] * l + st[1] * i + st[2] * j + st[3] * k);
+                                std::cout << " ";
+                            }
+                            std::cout << "} ";
+                        }
+                        std::cout << "\n";
+                    }
+                    std::cout << "\n";
+                }
+            }
+            else {
+                std::cerr << "Printing only supported up to 4D matrices.\n";
+            }
+            
+        }); // End of lambda & dispatcher
+    }
+    
+
+    friend inline void setBufferOrBytes(id<MTLComputeCommandEncoder> commandEncoder, const matrix& tensor, NSUInteger index) {
+    if (tensor.metalBuffer) {
+        [commandEncoder setBuffer:tensor.metalBuffer offset:0 atIndex:index];
+    } else {
+        [commandEncoder setBytes:tensor.buffer length:tensor.effectiveBufferSize() * dtype_size(tensor.type) atIndex:index];
+    }
+}
+    
+    static matrix zeros(std::initializer_list<size_m> shapeI, dtype type = dtype::Float) {
+        matrix output((uint32_t)shapeI.size(), type);
+        
+        if (output.dims > SBO_MAX_DIMS) {
+            output.array_desc.shared_arr_desc = SharedArrayDescriptor::create(output.dims);
+        }
+        memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+        output.calcStrides();
+        output.total_size = output.accumul(0, output.dims);
+        output.buffer = new uint8_t[output.total_size * dtype_size(type)];
+        if (output.total_size > 10) {
+            output.buildMetalBuffer();
+        }
+        memset(output.buffer, 0, output.total_size * dtype_size(type));
+        return output;
+    }
+    
+    static matrix ones(std::initializer_list<size_m> shapeI, dtype type = dtype::Float) {
+        matrix output((uint32_t)shapeI.size(), type);
+        
+        if (output.dims > SBO_MAX_DIMS) {
+            output.array_desc.shared_arr_desc = SharedArrayDescriptor::create(output.dims);
+        }
+        memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+        output.calcStrides();
+        output.total_size = output.accumul(0, output.dims);
+        output.buffer = new uint8_t[output.total_size * dtype_size(type)];
+        if (output.total_size > 10) {
+            output.buildMetalBuffer();
+        }
+        dispatch_type(type, output.buffer, [&](auto* typed_ptr) {
+            std::fill(typed_ptr, typed_ptr + output.total_size, 1);
+        });
+        return output;
+    }
+    
+    matrix ones() const {
+        matrix output(dims, type);
+        
+        if (output.dims > SBO_MAX_DIMS) {
+            output.array_desc.shared_arr_desc = SharedArrayDescriptor::create(output.dims);
+        }
+        memcpy(output.shape(), shape(), dims * sizeof(size_m));
+        output.calcStrides();
+        output.total_size = output.accumul(0, dims);
+        output.buffer = new uint8_t[output.total_size * dtype_size(type)];
+        if (total_size > 10) {
+            output.buildMetalBuffer();
+        }
+        dispatch_type(type, output.buffer, [&](auto* typed_ptr) {
+            std::fill(typed_ptr, typed_ptr + output.total_size, 1);
+        });
+        return output;
+    }
+    
+    matrix zeros() const {
+        matrix output(dims, type);
+        
+        if (output.dims > SBO_MAX_DIMS) {
+            output.array_desc.shared_arr_desc = SharedArrayDescriptor::create(output.dims);
+        }
+        memcpy(output.shape(), shape(), dims * sizeof(size_m));
+        output.calcStrides();
+        output.total_size = output.accumul(0, dims);
+        output.buffer = new uint8_t[output.total_size * dtype_size(type)];
+        if (total_size > 10) {
+            output.buildMetalBuffer();
+        }
+        memset(output.buffer, 0, output.total_size * dtype_size(type));
+        return output;
+    }
+    
+    static matrix repeating(std::initializer_list<size_m> shapeI, const matrix& pattern) {
+        #ifdef SAFE_MODE
+        if (shapeI.size() + dimsI != dims) {
+            std::cerr << "Dimensions Dont Add up, Pattern: " << dimsI << " + Repeat:" << shapeI.size() << " != Total Dim" << dims << "\n";
+            throw std::invalid_argument("MatrixH: Repeating shape dimensions mismatch.");
+        }
+        #endif
+        matrix output(pattern.dims + shapeI.size(), pattern.type);
+        
+        memcpy(output.shape(), shapeI.begin(), shapeI.size() * sizeof(size_m));
+        memcpy(output.shape() + shapeI.size(), pattern.shape(), pattern.dims * sizeof(size_m));
+        output.calcStrides();
+        output.total_size = output.accumul(0, output.dims);
+        output.buffer = new uint8_t[output.total_size * dtype_size(pattern.type)];
+        PatternFill(output.buffer, pattern.buffer, pattern.total_size * dtype_size(pattern.type), output.accumul(0, shapeI.size()));
+        if (output.total_size > 10 || pattern.metalBuffer)
+            output.buildMetalBuffer();
+        return output;
+    }
+    
+    static matrix repeatingGPU(std::initializer_list<size_m> shapeI, const matrix& pattern) {
+        #ifdef SAFE_MODE
+        if (shapeI.size() + dimsI != dims) {
+            std::cerr << "Dimensions Dont Add up, Pattern: " << dimsI << " + Repeat:" << shapeI.size() << " != Total Dim" << dims << "\n";
+            throw std::invalid_argument("Repeating shape dimensions mismatch."); // FIXED
+        }
+        #endif
+        matrix output(pattern.dims + shapeI.size(), pattern.type);
+        matrix patternView(pattern.dims + shapeI.size(), pattern.type);
+
+        pattern.shareBuffer(patternView);
+        memcpy(patternView.shape(), shapeI.begin(), shapeI.size() * sizeof(size_m));
+        memcpy(patternView.shape() + shapeI.size(), pattern.shape(), pattern.dims * sizeof(size_m));
+        memset(patternView.strides(), 0, shapeI.size() * sizeof(size_m));
+        memcpy(patternView.strides() + shapeI.size(), pattern.strides(), pattern.dims * sizeof(size_m));
+        patternView.total_size = patternView.accumul(0, patternView.dims);
+        patternView.metalBuffer = pattern.metalBuffer;
+        patternView.flags |= NON_CONTIGUOUS_FLAG;
+
+        memcpy(output.shape(), patternView.shape(), patternView.dims * sizeof(size_m));
+        output.calcStrides();
+        output.total_size = patternView.total_size;
+        output.buffer = new uint8_t[output.total_size * dtype_size(pattern.type)];
+        output.buildMetalBuffer();
+        
+        copyGPUinplace(output, patternView, 0);
+        return output;
+    }
+    
+    static matrix fromImage(std::string path_str = std::string("/Users/adityadude/Documents/TUSHU.HEIC"), CFDictionaryRef* meta_out = nullptr) {
+        #if !TARGET_OS_IPHONE
+        CFStringRef path = CFStringCreateWithCString(NULL, path_str.c_str(), kCFStringEncodingUTF8);
+        CFURLRef url = CFURLCreateWithFileSystemPath(NULL, path, kCFURLPOSIXPathStyle, false);
+        CGImageSourceRef source;
+        CGImageRef cgImage;
+        for (int i = 0; i < 3; i++) {
+            source = CGImageSourceCreateWithURL(url, NULL);
+            cgImage = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+            if (cgImage) {break;}
+        }
+        CFRelease(url);
+        CFRelease(path);
+        #endif
+
+        #if TARGET_OS_IPHONE
+        UIImage *image = [UIImage imageNamed:@"IMG_1278"];
+        CGImageRef cgImage = image.CGImage;
+        #endif
+
+        if (meta_out && source)
+            *meta_out = CGImageSourceCopyPropertiesAtIndex(source, 0, nullptr);
+        
+        if (!cgImage) {
+            std::cerr << "Failed to create CGImage" << std::endl;
+        }
+        size_t Imgwidth = CGImageGetWidth(cgImage);
+        size_t Imgheight = CGImageGetHeight(cgImage);
+        CGBitmapInfo bitmapInfo = CGImageGetBitmapInfo(cgImage);
+        bool isFloat = (bitmapInfo & kCGBitmapFloatComponents) != 0;
+        if (isFloat) {
+            size_t bytesPerRow = 4 * sizeof(float) * Imgwidth;
+            float* data = static_cast<float*>(malloc(bytesPerRow * Imgheight));
+
+            CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+            CGContextRef ctx = CGBitmapContextCreate(data, Imgwidth, Imgheight, 32, bytesPerRow, space,
+                                                     kCGBitmapFloatComponents | kCGImageAlphaPremultipliedLast);
+            CGColorSpaceRelease(space);
+            CGContextDrawImage(ctx, CGRectMake(0, 0, Imgwidth, Imgheight), cgImage);
+            CGContextRelease(ctx);
+            CGImageRelease(cgImage);
+
+            matrix result(3, dtype::Float);
+            result.buffer = data;
+            result.shape()[0] = Imgheight;
+            result.shape()[1] = Imgwidth;
+            result.shape()[2] = 4;
+            result.calcStrides();
+            result.total_size = Imgwidth * Imgheight * 4;
+            result.buildMetalBuffer();  // MTLPixelFormatRGBA32Float
+            return result;
+        }
+        std::cout << "Img of Width: " <<Imgwidth<<"and Height: " << Imgheight << "Loaded \n";
+        size_t bytesPerRow = 4 * Imgwidth;
+        void *data = malloc(bytesPerRow * Imgheight);
+        CGContextRef context = CGBitmapContextCreate(data, Imgwidth, Imgheight, 8, bytesPerRow,
+                                                     CGImageGetColorSpace(cgImage),
+                                                     kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGContextDrawImage(context, CGRectMake(0, 0, Imgwidth, Imgheight), cgImage);
+        CGContextRelease(context);
+        CGImageRelease(cgImage);
+        
+        uint8_t* pixelData = static_cast<uint8_t*>(data);
+        
+        matrix result(3, dtype::UInt8);
+        result.buffer = pixelData;
+        result.shape()[0] = Imgheight;
+        result.shape()[1] = Imgwidth;
+        result.shape()[2] = 4;
+        result.calcStrides();
+        result.total_size = Imgwidth * Imgheight * 4;
+        result.buildMetalBuffer();
+        return result;
+    }
+
+    matrix slice(std::initializer_list<std::optional<std::pair<size_m, size_m>>> slice_range) {
+        matrix slicedMat = matrix(dims, type);
+        const size_m* src_shape   = this->shape();
+        const size_m* src_strides = this->strides();
+        size_m* dst_shape   = slicedMat.shape();
+        size_m* dst_strides = slicedMat.strides();
+        
+        size_t index = 0;
+        size_t offsets = 0;
+        for (auto i : slice_range) {
+            if (i.has_value()) {
+#ifdef SAFE_MODE
+                if (i->second > src_shape[index]) { std::cerr << "matrix: index "<< i->second << " excedes the shape " << src_shape[index] << "of axis "<< index << "\n"; }
+                if (i->first > src_shape[index]) { std::cerr << "matrix: index "<< i->second << " excedes the shape " << src_shape[index] << "of axis "<< index << "\n"; }
+#endif
+                dst_shape[index] = (i->second - i->first);
+                offsets += i->first * src_strides[index];
+              }
+            else {
+                dst_shape[index] = src_shape[index];
+            }
+            
+            index ++;
+        }
+        if (slice_range.size() < dims) {
+            memcpy(dst_shape + slice_range.size(), src_shape + slice_range.size(),(dims-slice_range.size()) * sizeof(size_m));
+        }
+        memcpy(dst_strides, src_strides, dims * sizeof(size_m));
+        slicedMat.total_size = slicedMat.accumul(0, dims);
+        slicedMat.flags |= NON_OWNERSHIP_FLAG;
+        slicedMat.flags |= NON_CONTIGUOUS_FLAG;
+        slicedMat.buffer = (uint8_t*)buffer + offsets * dtype_size(type);
+        if (slicedMat.total_size > 10) {
+            slicedMat.buildMetalBuffer();
+        }
+        if (refCount) {
+            slicedMat.refCount = refCount;
+            refCount->fetch_add(1);
+        }
+        return slicedMat;
+    }
+    
+    matrix slice(std::initializer_list<R> slice_range) {
+        matrix slicedMat = matrix(dims, type);
+        const size_m* src_shape   = this->shape();
+        const size_m* src_strides = this->strides();
+        size_m* dst_shape   = slicedMat.shape();
+        size_m* dst_strides = slicedMat.strides();
+        
+        size_t index = 0;
+        size_t offsets = 0;
+        for (auto i : slice_range) {
+            if (!i.is_all()) {
+#ifdef SAFE_MODE
+                if (i->end > src_shape[index]) { std::cerr << "matrix: index "<< i->end << " excedes the shape " << src_shape[index] << "of axis "<< index << "\n"; }
+                if (i->start > src_shape[index]) { std::cerr << "matrix: index "<< i->start << " excedes the shape " << src_shape[index] << "of axis "<< index << "\n"; }
+#endif
+                dst_shape[index] = (uint32_t)(i.end - i.start);
+                offsets += i.start * src_strides[index];
+              }
+            else {
+                dst_shape[index] = src_shape[index];
+            }
+            
+            index ++;
+        }
+        if (slice_range.size() < dims) {
+            memcpy(dst_shape + slice_range.size(), src_shape + slice_range.size(),(dims-slice_range.size()) * sizeof(size_m));
+        }
+        memcpy(dst_strides, src_strides, dims * sizeof(size_m));
+        slicedMat.total_size = slicedMat.accumul(0, dims);
+        slicedMat.flags |= NON_OWNERSHIP_FLAG;
+        slicedMat.flags |= NON_CONTIGUOUS_FLAG;
+        slicedMat.buffer = (uint8_t*)buffer + offsets * dtype_size(type);
+        if (slicedMat.total_size > 10) {
+            slicedMat.buildMetalBuffer();
+        }
+        if (refCount) {
+            slicedMat.refCount = refCount;
+            refCount->fetch_add(1);
+        }
+        return slicedMat;
+    }
+    
+    matrix broadcast_to(const size_m* target_shape, int target_dims) const {
+        if (target_dims < dims)
+            throw std::runtime_error("matrix: Cannot broadcast to fewer dimensions.");
+
+        matrix view(target_dims, type);
+        view.tape = tape;
+        view.flags = flags | NON_OWNERSHIP_FLAG | NON_CONTIGUOUS_FLAG;
+        view.buffer = buffer;
+        view.metalBuffer = metalBuffer;
+        
+        
+        // Safely share the data
+        if (refCount) {
+            view.refCount = refCount;
+            view.refCount->fetch_add(1, std::memory_order_relaxed);
+        } else if (!(flags & NON_OWNERSHIP_FLAG)) {
+            const_cast<matrix*>(this)->refCount = new std::atomic<uint32_t>(2);
+            view.refCount = this->refCount;
+        }
+
+        if (view.dims > SBO_MAX_DIMS) {
+            view.array_desc.shared_arr_desc = SharedArrayDescriptor::create(view.dims);
+        }
+
+        // ==========================================
+        // THE BROADCASTING LOGIC (Right-to-Left)
+        // ==========================================
+        int src_d = dims - 1;
+        view.total_size = 1;
+        
+        for (int dst_d = target_dims - 1; dst_d >= 0; --dst_d) {
+            size_m dst_size = target_shape[dst_d];
+            view.shape()[dst_d] = dst_size;
+            view.total_size *= dst_size;
+
+            if (src_d >= 0) {
+                size_m src_size = shape()[src_d];
+                if (src_size == dst_size) {
+                    // Dimension matches perfectly, copy the stride
+                    view.strides()[dst_d] = strides()[src_d];
+                } else if (src_size == 1) {
+                    // Source dimension is 1, stretch it by setting stride to 0!
+                    view.strides()[dst_d] = 0;
+                } else {
+                    throw std::runtime_error("MatrixH: Shapes are not broadcastable.");
+                }
+            } else {
+                // We ran out of source dimensions (e.g. promoting [4] to [10, 4])
+                // Pretend the missing dimension was a 1, so set stride to 0!
+                view.strides()[dst_d] = 0;
+            }
+            src_d--;
+        }
+        
+        return view;
+    }
+    
+    matrix operator[](Range range) {
+        if (dims == 1) {
+            matrix view(1, type);
+            view.type = type;
+            view.tape = tape;
+            view.flags = flags | NON_OWNERSHIP_FLAG;
+            return view;
+        } else {
+            return slice({ range });
+        }
+    }
+    
+    matrix operator[](int i, int j) const {
+    #ifdef SAFE_MODE
+        if (i < 0) {
+            i = shape[0] + i;
+        }
+        if (i >= shape[0]) {
+            throw std::invalid_argument( "Index Out Of range" );
+        }
+        
+        if (j < 0) {
+            j = shape[1] + j;
+        }
+        if (j >= shape[1]) {
+            throw std::invalid_argument( "Index Out Of range" );
+        }
+    #endif
+        matrix slicedMat(dims-2, type);
+        const size_m* curr_stride = strides();
+        
+        slicedMat.buffer = (uint8_t*)buffer + (curr_stride[0] * i + curr_stride[1] * j) * dtype_size(type);
+        
+        int sub_dims = dims - 2;
+        if (sub_dims == 1) {
+            // Highly optimized fast-path for 3D tensors returning a 1D pixel natively
+            slicedMat.strides()[0] = curr_stride[2];
+            slicedMat.shape()[0]   = shape()[2];
+            slicedMat.total_size   = shape()[2];
+        } else {
+            memcpy(slicedMat.strides(), curr_stride + 2, sub_dims * sizeof(size_m));
+            memcpy(slicedMat.shape(), shape() + 2, sub_dims * sizeof(size_m));
+            slicedMat.total_size = accumul(2, dims);
+        }
+        
+        if (slicedMat.total_size > 10) {
+            slicedMat.buildMetalBuffer();
+        }
+        slicedMat.flags |= NON_OWNERSHIP_FLAG;
+        return slicedMat;
+    }
+
+    void CopyToTexture(id<MTLTexture> texture, Execution exec = Execution::EncodeAndExecute) {
+#ifdef SAFE_MODE
+        if (dims < 2) {
+            throw std::runtime_error("Matrix must be at least 2D to blit to a texture.");
+        }
+#endif
+        NSUInteger width  = (NSUInteger)shape()[1];
+        NSUInteger height = (NSUInteger)shape()[0];
+        MTLRegion region  = MTLRegionMake2D(0, 0, width, height);
+        
+        NSUInteger bytesPerRow = strides()[0] * dtype_size(type);
+        size_t source_offset = 0;
+        if (flags & NON_OWNERSHIP_FLAG) {
+            source_offset = (uint8_t*)buffer - (uint8_t*)metalBuffer.contents;
+        }
+        
+        id<MTLCommandBuffer> commandBuffer = [GlobalGPUManager.gCommandQueue commandBuffer];
+
+        id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+        
+        [blitEncoder copyFromBuffer:metalBuffer
+                       sourceOffset:source_offset
+                  sourceBytesPerRow:bytesPerRow
+                sourceBytesPerImage:bytesPerRow * height
+                         sourceSize:region.size
+                          toTexture:texture
+                   destinationSlice:0
+                   destinationLevel:0
+                  destinationOrigin:region.origin];
+        [blitEncoder endEncoding];
+        if (exec == Execution::EncodeAndExecute) {
+            [commandBuffer commit];
+            [commandBuffer waitUntilCompleted];
+        }
+    }
+    
+    id<MTLTexture> ToMTLTexture(Execution exec = Execution::EncodeAndExecute) {
+        id<MTLTexture> resultTexture;
+        MTLTextureDescriptor* drawableDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
+                                                                                                width:(NSUInteger)shape()[1]
+                                                                                               height:(NSUInteger)shape()[0]
+                                                                                            mipmapped:NO];
+        drawableDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        // Use shared storage so the CPU can read the texture data.
+        drawableDesc.storageMode = MTLStorageModeShared;
+    
+    
+        resultTexture = [GlobalGPUManager.metalDevice newTextureWithDescriptor:drawableDesc];
+        
+        CopyToTexture(resultTexture, exec);
+        return resultTexture;
+    }
+    
+void save_as_image(std::string path, ImgType img_type) {
+    int width    = shape()[1];
+    int height   = shape()[0];
+    int channels = shape()[2]; // 3 = RGB, 4 = RGBA
+    uint8_t* src = reinterpret_cast<uint8_t*>(buffer);
+
+    CFStringRef pathStr = CFStringCreateWithCString(kCFAllocatorDefault, path.c_str(), kCFStringEncodingUTF8);
+    CFURLRef url        = CFURLCreateWithFileSystemPath(kCFAllocatorDefault, pathStr, kCFURLPOSIXPathStyle, false);
+    CFRelease(pathStr);
+
+    CFStringRef uti;
+    switch (img_type) {
+        case ImgType::PNG: uti = kUTTypePNG;               break;
+        case ImgType::JPG: uti = kUTTypeJPEG;              break;
+        case ImgType::EXR: uti = CFSTR("com.ilm.openexr-image"); break;
+    }
+
+    CGColorSpaceRef colorSpace = (channels == 1)
+        ? CGColorSpaceCreateDeviceGray()
+        : CGColorSpaceCreateDeviceRGB();
+
+    if (!colorSpace) {
+        fprintf(stderr, "Failed to create color space!\n");
+        CFRelease(url);
+        return;
+    }
+
+    // EXR: upcaste uint8 → float16, write as HDR
+    // PNG/JPG: use uint8 directly
+    void*         bufPtr;
+    CGBitmapInfo  bitmapInfo;
+    size_t        bitsPerComponent;
+    size_t        bytesPerRow;
+    std::vector<uint16_t> half_buf; // owns EXR conversion buffer
+
+    if (img_type == ImgType::EXR) {
+        CGColorSpaceRelease(colorSpace);
+        colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceLinearSRGB);
+
+        size_t n = (size_t)width * height * channels;
+        half_buf.resize(n);
+
+        // uint8 [0,255] → float [0,1] → float16
+        for (size_t i = 0; i < n; i++){
+            half_buf[i] = (__fp16)((float)src[i] / 255.0f);
+            // stored into uint16_t via memcpy to avoid type-punning UB:
+            __fp16 h = (__fp16)((float)src[i] / 255.0f);
+            memcpy(&half_buf[i], &h, sizeof(uint16_t));
+        }
+        bufPtr          = half_buf.data();
+        bitsPerComponent = 16;
+        bytesPerRow      = (size_t)width * channels * sizeof(uint16_t);
+        bitmapInfo       = kCGBitmapByteOrder16Host
+                         | kCGBitmapFloatComponents
+                         | (channels == 4 ? kCGImageAlphaPremultipliedLast : kCGImageAlphaNone);
+    } else {
+        bufPtr           = src;
+        bitsPerComponent = 8;
+        bytesPerRow      = (size_t)width * channels;
+        bitmapInfo       = (channels == 4 ? kCGImageAlphaPremultipliedLast : kCGImageAlphaNone);
+    }
+
+    CGContextRef context = CGBitmapContextCreate(
+        bufPtr,
+        width, height,
+        bitsPerComponent,
+        bytesPerRow,
+        colorSpace,
+        bitmapInfo
+    );
+    if (!context) {
+        fprintf(stderr, "Failed to create bitmap context!\n");
+        CGColorSpaceRelease(colorSpace);
+        CFRelease(url);
+        return;
+    }
+
+    CGImageRef image = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+    CGColorSpaceRelease(colorSpace);
+
+    if (!image) {
+        fprintf(stderr, "Failed to create CGImage!\n");
+        CFRelease(url);
+        return;
+    }
+
+    CGImageDestinationRef dest = CGImageDestinationCreateWithURL(url, uti, 1, NULL);
+    CFRelease(url);
+
+    if (!dest) {
+        fprintf(stderr, "Failed to create image destination!\n");
+        CGImageRelease(image);
+        return;
+    }
+
+    CGImageDestinationAddImage(dest, image, NULL);
+    if (!CGImageDestinationFinalize(dest))
+        fprintf(stderr, "Failed to write: %s\n", path.c_str());
+
+    CGImageRelease(image);
+    CFRelease(dest);
+}
+
+    static void copyGPUinplace( matrix& outMat, const matrix& inMat, int offset, Execution exec = Execution::EncodeAndExecute) {
+#ifdef SAFE_MODE
+        if (inMat.total_size > outMat.total_size) {
+            std::cerr << "MatrixH: CopyInplace operation requires both mats to be of same size." << "\n";
+            throw;
+        }
+        if (inMat.type != outMat.type) {
+            throw std::runtime_error("Type mismatch in copy");
+        }
+#endif
+        if (inMat.type != outMat.type) {
+            copyGPUinplaceTypeCasted(outMat, inMat, offset, exec);
+            return;
+        }
+        size_t elem_size = dtype_size(inMat.type);
+        id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+//        Blit fast path for the GPU. A compute shader (even a 1D one) requires the GPU's ALU execution units to run the copy loop. A Blit command skips the ALUs entirely and uses the GPU's direct memory access (DMA) engines to blast the bytes across VRAM. It is drastically faster.
+        if (!(inMat.flags & NON_CONTIGUOUS_FLAG) && !(outMat.flags & NON_CONTIGUOUS_FLAG)) {
+            id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+            [blitEncoder copyFromBuffer:inMat.metalBuffer
+                           sourceOffset:offset * elem_size
+                               toBuffer:outMat.metalBuffer
+                      destinationOffset:offset * elem_size
+                                   size:inMat.total_size * elem_size];
+            [blitEncoder endEncoding];
+            if (exec == Execution::EncodeAndExecute) {
+                [commandBuffer commit];
+                [commandBuffer waitUntilCompleted];
+                GlobalGPUManager.gCommandBuffer = nil;
+            }
+            return;
+        }
+        uint8_t typeCode = static_cast<int>(inMat.type);
+        
+        auto res = collapse_dims(inMat.shape(), outMat.strides(), inMat.strides(), inMat.dims, INT32_MAX);
+        uint32_t cdims = res.out_dims;
+        
+        
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize =  MTLSizeMake(inMat.total_size, 1, 1);
+        setBufferOrBytes(commandEncoder, outMat, 0);
+        setBufferOrBytes(commandEncoder, inMat, 1);
+        [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:res.stridesB  length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:&offset length:sizeof(int) atIndex:4];
+        if (cdims == 1) {
+            if (!GlobalGPUManager.CopyInplace[typeCode][typeCode][0]) {
+                GlobalGPUManager.initCopyInplace(typeCode, typeCode, 0);
+            }
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CopyInplace_ComputeState[typeCode][typeCode][0]];
+        } else if (cdims == 2) {
+            if (!GlobalGPUManager.CopyInplace[typeCode][typeCode][1]) {
+                GlobalGPUManager.initCopyInplace(typeCode, typeCode, 1);
+            }
+            _dispatchExecutionSize =  MTLSizeMake(res.shape[1], res.shape[0], 1);
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CopyInplace_ComputeState[typeCode][typeCode][1]];
+        } else if (cdims == 3) {
+            if (!GlobalGPUManager.CopyInplace[typeCode][typeCode][2]) {
+                GlobalGPUManager.initCopyInplace(typeCode, typeCode, 2);
+            }
+            _dispatchExecutionSize =  MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CopyInplace_ComputeState[typeCode][typeCode][2]];
+        
+        } else {
+            if (!GlobalGPUManager.CopyInplace[typeCode][typeCode][3]) {
+                GlobalGPUManager.initCopyInplace(typeCode, typeCode, 3);
+            }
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) {acc *= res.shape[i]; }
+            _dispatchExecutionSize =  MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:5];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:6];
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CopyInplace_ComputeState[typeCode][typeCode][3]];
+        }
+        
+        
+        [commandEncoder dispatchThreads:_dispatchExecutionSize
+                  threadsPerThreadgroup:_threadsPerThreadgroup];
+        if (exec == Execution::EncodeAndExecute) {
+            [commandEncoder endEncoding];
+            [commandBuffer commit];
+            [commandBuffer waitUntilCompleted];
+            GlobalGPUManager.gCommandBuffer = nil;
+            GlobalGPUManager.gCommandEncoder=nil;
+        }
+    }
+    
+    static void copyGPUinplaceTypeCasted( matrix& outMat, const matrix& inMat, int offset, Execution exec = Execution::EncodeAndExecute) {
+#ifdef SAFE_MODE
+        if (inMat.total_size > outMat.total_size) {
+            std::cerr << "MatrixH: CopyInplace operation requires both mats to be of same size." << "\n";
+            throw;
+        }
+        if (inMat.type != outMat.type) {
+            throw std::runtime_error("Type mismatch in copy");
+        }
+#endif
+        uint8_t typeCode = static_cast<int>(inMat.type);
+        uint8_t dstTypeCode = static_cast<int>(outMat.type);
+        
+        auto res = collapse_dims(inMat.shape(), outMat.strides(), inMat.strides(), inMat.dims, INT32_MAX);
+        uint32_t cdims = res.out_dims;
+        
+        id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize =  MTLSizeMake(inMat.total_size, 1, 1);
+        setBufferOrBytes(commandEncoder, outMat, 0);
+        setBufferOrBytes(commandEncoder, inMat, 1);
+        [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:res.stridesB  length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:&offset length:sizeof(int) atIndex:4];
+        if (cdims == 1) {
+            if (!GlobalGPUManager.CopyInplace[dstTypeCode][typeCode][0]) {
+                GlobalGPUManager.initCopyInplace(dstTypeCode, typeCode, 0);
+            }
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CopyInplace_ComputeState[dstTypeCode][typeCode][0]];
+        } else if (cdims == 2) {
+            if (!GlobalGPUManager.CopyInplace[dstTypeCode][typeCode][1]) {
+                GlobalGPUManager.initCopyInplace(dstTypeCode, typeCode, 1);
+            }
+            _dispatchExecutionSize =  MTLSizeMake(res.shape[1], res.shape[0], 1);
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CopyInplace_ComputeState[dstTypeCode][typeCode][1]];
+        } else if (cdims == 3) {
+            if (!GlobalGPUManager.CopyInplace[dstTypeCode][typeCode][2]) {
+                GlobalGPUManager.initCopyInplace(dstTypeCode, typeCode, 2);
+            }
+            _dispatchExecutionSize =  MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CopyInplace_ComputeState[dstTypeCode][typeCode][2]];
+        
+        } else {
+            if (!GlobalGPUManager.CopyInplace[dstTypeCode][typeCode][3]) {
+                GlobalGPUManager.initCopyInplace(dstTypeCode, typeCode, 3);
+            }
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) {acc *= res.shape[i]; }
+            _dispatchExecutionSize =  MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:5];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:6];
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CopyInplace_ComputeState[dstTypeCode][typeCode][3]];
+        }
+        
+        
+        [commandEncoder dispatchThreads:_dispatchExecutionSize
+                  threadsPerThreadgroup:_threadsPerThreadgroup];
+        if (exec == Execution::EncodeAndExecute) {
+            [commandEncoder endEncoding];
+            [commandBuffer commit];
+            [commandBuffer waitUntilCompleted];
+            GlobalGPUManager.gCommandBuffer = nil;
+            GlobalGPUManager.gCommandEncoder=nil;
+        }
+    }
+    
+    static void copyCPUinplace( matrix& outMat, const matrix& inMat, int offset) {
+#ifdef SAFE_MODE
+        if (inMat.total_size > outMat.total_size) {
+            std::cerr << "MatrixH: CopyInplace operation requires both mats to be of same size." << "\n";
+            throw;
+        }
+        if (inMat.dims != outMat.dims) {
+            throw std::runtime_error("Type mismatch in copy");
+        }
+#endif
+        if (inMat.type != outMat.type) {
+            copyCPUinplaceTypeCasted(outMat, inMat, offset);
+            return;
+        }
+        size_t elem_size = dtype_size(inMat.type);
+        if (!(inMat.flags & NON_CONTIGUOUS_FLAG) && !(outMat.flags & NON_CONTIGUOUS_FLAG)) {
+            size_t bytes = inMat.total_size * elem_size;
+            // // Native CPU fast-paths skipping dynamic memcpy linkage (Critical for nested loops plotting 32-bit floats or 4-channel uint8!)
+            if (bytes == 4) {
+                *reinterpret_cast<uint32_t*>(outMat.buffer) = *reinterpret_cast<const uint32_t*>(inMat.buffer);
+            } else if (bytes == 1) {
+                *reinterpret_cast<uint8_t*>(outMat.buffer)  = *reinterpret_cast<const uint8_t*>(inMat.buffer);
+            } else if (bytes == 8) {
+                *reinterpret_cast<uint64_t*>(outMat.buffer) = *reinterpret_cast<const uint64_t*>(inMat.buffer);
+            } else {
+                memcpy(outMat.buffer, inMat.buffer, bytes);
+            }
+            return;
+        }
+                
+        auto res = collapse_dims(inMat.shape(), outMat.strides(), inMat.strides(), inMat.dims, INT32_MAX);
+        auto cdims = res.out_dims;
+        dispatch_type(inMat.type, inMat.buffer, [&](auto* in_data) {
+            using T = std::decay_t<decltype(*in_data)>;
+            T* out_data = static_cast<T*>(outMat.buffer);
+            // us stands for unsafe and fast subscripting so it doesnt suppor negative indices and is super fast.
+            if (cdims == 1) {
+                for (uint32_t i = 0; i < inMat.total_size; i++) {
+                    out_data[i * res.stridesA[0]] = in_data[i * res.stridesB[0]];
+                }
+            } else if (cdims == 2) {
+                if (res.stridesA[cdims-1] == 1 && res.stridesB[cdims-1] == 1) {
+                    for (uint32_t i = 0; i < res.shape[0]; i++) { memcpy(out_data + res.stridesA[0] * i, in_data + res.stridesB[0] * i, res.shape[1] * elem_size); }
+                    return;
+                }
+                for (uint32_t i = 0; i < res.shape[0]; i++) {
+                    for (uint32_t j = 0; j < res.shape[1]; j++) {
+                        out_data[i * res.stridesA[0] + j * res.stridesA[1]] = in_data[i * res.stridesB[0] + j * res.stridesB[1]];                }
+                }
+            } else if (cdims == 3) {
+                if (res.stridesA[cdims-1] == 1 && res.stridesB[cdims-1] == 1) {
+                    for (uint32_t i = 0; i < res.shape[0]; i++) {
+                        for (uint32_t j = 0; j < res.shape[1]; j++) { memcpy(out_data + res.stridesA[0] * i + res.stridesA[1] * j, in_data + res.stridesB[0] * i + res.stridesB[1] * j, res.shape[2] * elem_size); }
+                    }
+                    return;
+                }
+                for (uint32_t i = 0; i < res.shape[0]; i++) {
+                    for (uint32_t j = 0; j < res.shape[1]; j++) {
+                        for (uint32_t k = 0; k < res.shape[2]; k++) {
+                            out_data[i * res.stridesA[0] + j * res.stridesA[1] + k * res.stridesA[2]] = in_data[i * res.stridesB[0] + j * res.stridesB[1] + k * res.stridesB[2]];
+                        }
+                    }
+                }
+                
+            } else {
+                uint32_t outer_iterations = 1;
+                for (uint32_t o = 0; o <= cdims - 4; o++) {
+                    outer_iterations *= res.shape[o];
+                }
+                for (uint32_t o = 0; o < outer_iterations; o++) {
+                    uint32_t inMatIndex = 0;
+                    uint32_t outMatIndex = 0;
+                    uint32_t rem = o;
+                    for (int i = cdims-4; i >=0; i--) {
+                        inMatIndex  += (rem % res.shape[i]) * res.stridesB[i];
+                        outMatIndex += (rem % res.shape[i]) * res.stridesA[i];
+                        rem /= res.shape[i];
+                    }
+                    if (res.stridesA[cdims-1] == 1 && res.stridesB[cdims-1] == 1) {
+                        for (uint32_t i = 0; i < res.shape[0]; i++) {
+                            for (uint32_t j = 0; j < res.shape[1]; j++) { memcpy(out_data + res.stridesA[cdims-3] * i + res.stridesA[cdims-2] * j, in_data + res.stridesB[cdims-3] * i + res.stridesB[cdims-2] * j, res.shape[cdims-1] * elem_size); }
+                        }
+                        break;
+                    }
+                    for (uint32_t i = 0; i < res.shape[cdims-3]; i++) {
+                        for (uint32_t j = 0; j < res.shape[cdims-2]; j++) {
+                            for (uint32_t k = 0; k < res.shape[cdims-1]; k++) {
+                                out_data[outMatIndex + i * res.stridesA[cdims-3] + j * res.stridesA[cdims-2] + k * res.stridesA[cdims-1]] = in_data[inMatIndex + i * res.stridesB[cdims-3] + j * res.stridesB[cdims-2] + k * res.stridesB[cdims-1]];
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    
+
+    static void copyCPUinplaceTypeCasted(matrix& outMat, const matrix& inMat, int offset) {
+        auto res = collapse_dims(inMat.shape(), outMat.strides(), inMat.strides(), inMat.dims, INT32_MAX);
+        auto cdims = res.out_dims;
+        dispatch_type(outMat.type, outMat.buffer, [&](auto* out_data) {
+            dispatch_type(inMat.type, inMat.buffer, [&](auto* in_data) {
+                using DstT = std::decay_t<decltype(*out_data)>;
+                // us stands for unsafe and fast subscripting so it doesnt suppor negative indices and is super fast.
+                if (cdims == 1) {
+                    for (uint32_t i = 0; i < inMat.total_size; i++) {
+                        out_data[i * res.stridesA[0]] = static_cast<DstT>( in_data[i * res.stridesB[0]] );
+                    }
+                } else if (cdims == 2) {
+                    for (uint32_t i = 0; i < res.shape[0]; i++) {
+                        for (uint32_t j = 0; j < res.shape[1]; j++) {
+                            out_data[i * res.stridesA[0] + j * res.stridesA[1]] = static_cast<DstT>( in_data[i * res.stridesB[0] + j * res.stridesB[1]] );                }
+                    }
+                } else if (cdims == 3) {
+                    for (uint32_t i = 0; i < res.shape[0]; i++) {
+                        for (uint32_t j = 0; j < res.shape[1]; j++) {
+                            for (uint32_t k = 0; k < res.shape[2]; k++) {
+                                out_data[i * res.stridesA[0] + j * res.stridesA[1] + k * res.stridesA[2]] = static_cast<DstT>( in_data[i * res.stridesB[0] + j * res.stridesB[1] + k * res.stridesB[2]] );
+                            }
+                        }
+                    }
+                    
+                } else {
+                    uint32_t outer_iterations = 1;
+                    for (uint32_t o = 0; o <= cdims - 4; o++) {
+                        outer_iterations *= res.shape[o];
+                    }
+                    for (uint32_t o = 0; o < outer_iterations; o++) {
+                        uint32_t inMatIndex = 0;
+                        uint32_t outMatIndex = 0;
+                        uint32_t rem = o;
+                        for (int i = cdims-4; i >=0; i--) {
+                            inMatIndex  += (rem % res.shape[i]) * res.stridesB[i];
+                            outMatIndex += (rem % res.shape[i]) * res.stridesA[i];
+                            rem /= res.shape[i];
+                        }
+                        for (uint32_t i = 0; i < res.shape[cdims-3]; i++) {
+                            for (uint32_t j = 0; j < res.shape[cdims-2]; j++) {
+                                for (uint32_t k = 0; k < res.shape[cdims-1]; k++) {
+                                    out_data[outMatIndex + i * res.stridesA[cdims-3] + j * res.stridesA[cdims-2] + k * res.stridesA[cdims-1]] =  static_cast<DstT>( in_data[inMatIndex + i * res.stridesB[cdims-3] + j * res.stridesB[cdims-2] + k * res.stridesB[cdims-1]] );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        });
+    }
+    
+    void add(matrix other) {
+//        AdditionPrimitive(*this, other);
+    }
+    
+    void releaseBuffer() {
+        if (refCount) {
+            if (refCount->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                // MUST CAST void* to uint8_t* before deleting!
+                delete[] static_cast<uint8_t*>(buffer);
+                delete refCount;
+            }
+        } else if (flags & NON_OWNERSHIP_FLAG) {
+            return;
+        } else if (buffer) {
+            // MUST CAST void* to uint8_t* before deleting!
+            delete[] static_cast<uint8_t*>(buffer);
+        }
+    }
+    
+    void destroyInstance() {
+        // 1. Clean up Metadata (Descriptor)
+        if (dims > SBO_MAX_DIMS && array_desc.shared_arr_desc) {
+            array_desc.shared_arr_desc->release();
+        }
+        
+        if (refCount) {
+            if (refCount->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                // MUST CAST void* to uint8_t* before deleting!
+                delete[] static_cast<uint8_t*>(buffer);
+                delete refCount;
+            }
+        } else if (flags & NON_OWNERSHIP_FLAG) {
+            return;
+        } else if (buffer) {
+            // MUST CAST void* to uint8_t* before deleting!
+            delete[] static_cast<uint8_t*>(buffer);
+        }
+        
+        
+        // 3. Reset State
+        buffer = nullptr;
+        refCount = nullptr;
+        dims = 0;
+    }
+    
+    template<typename Type, typename = std::enable_if_t<std::is_arithmetic<Type>::value>>
+    matrix& operator=(Type value)  {
+        if (flags & NON_CONTIGUOUS_FLAG) {
+            matrix value_mat_view(dims, 1, type);
+            memcpy(value_mat_view.shape(), shape(), dims * sizeof(size_m));
+            memset(value_mat_view.strides(), 0, (dims) * sizeof(size_m));
+            dispatch_type(type, value_mat_view.buffer, [&](auto* typed_buffer) {
+                // typed_buffer points to the single element in value_mat_view
+                using BufT = std::decay_t<decltype(*typed_buffer)>;
+                *typed_buffer = static_cast<BufT>(value);
+            });
+            value_mat_view.total_size = total_size;
+            value_mat_view.flags |= NON_CONTIGUOUS_FLAG;
+            if (metalBuffer) {
+                copyGPUinplace(*this, value_mat_view, 0);
+            } else {
+                copyCPUinplace(*this, value_mat_view, 0);
+            }
+        } else {
+            dispatch_type(type, buffer, [&](auto* typed_buffer) {
+                // Determine the exact C++ type we are working with
+                using BufT = std::decay_t<decltype(*typed_buffer)>;
+                
+                // Cast the user's value to the buffer's exact type
+                BufT casted_val = static_cast<BufT>(value);
+                
+                TypedPatternFill(typed_buffer, casted_val, (size_m)total_size);
+            });
+            
+        }
+        return *this;
+    }
+    
+    matrix(const matrix& other) {
+#ifdef CopyLog
+        std::cout << "Copied" << "\n";
+#endif
+        dims = other.dims;
+        type = other.type;
+        total_size  = other.total_size;
+        flags       = other.flags;
+        tape        = other.tape;
+
+        if (other.refCount || (flags & NON_OWNERSHIP_FLAG)) {
+            // =======================================================
+            // PATH A: SHALLOW COPY (View Sharing)
+            // We share the data, so we MUST share the exact metadata!
+            // =======================================================
+            buffer      = other.buffer;
+            metalBuffer = other.metalBuffer;
+            
+            if (other.refCount) {
+                refCount    = other.refCount;
+                refCount->fetch_add(1, std::memory_order_relaxed);
+            }
+            
+            if (dims <= SBO_MAX_DIMS) {
+                // Stack copy exact shape & strides
+                memcpy(shape(), other.shape(), dims * sizeof(size_m));
+                memcpy(strides(), other.strides(), dims * sizeof(size_m));
+            } else {
+                // Share the heap descriptor exact shape & strides
+                array_desc.shared_arr_desc = other.array_desc.shared_arr_desc;
+                array_desc.shared_arr_desc->refCount.fetch_add(1, std::memory_order_relaxed);
+            }
+
+        } else {
+            // =======================================================
+            // PATH B: DEEP COPY (Exclusive Ownership)
+            // We allocate fresh data, so we MUST pack it contiguously!
+            // =======================================================
+            buffer = new uint8_t[total_size * dtype_size(type)];
+            buildMetalBuffer();
+            refCount = nullptr;
+            
+            flags &= ~NON_OWNERSHIP_FLAG;
+            flags &= ~NON_CONTIGUOUS_FLAG; // We are officially packing this tightly
+
+            if (dims <= SBO_MAX_DIMS) {
+                memcpy(shape(), other.shape(), dims * sizeof(size_m));
+            } else {
+                // Safely create fresh descriptor (NO fetch_sub needed)
+                array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
+                memcpy(shape(), other.shape(), dims * sizeof(size_m)); // MUST copy shape!
+            }
+            
+            // Calculate fresh, perfectly contiguous strides for our new buffer
+            calcStrides();
+            
+            // Blast the data over
+            if (total_size > 10) {
+                copyGPUinplace(*this, other, 0);
+            } else {
+                copyCPUinplace(*this, other, 0);
+            }
+        }
+    }
+    
+    matrix( matrix&& other) noexcept {
+#ifdef MoveLog
+        std::cout << "Moved" << "\n";
+#endif
+        buffer = other.buffer;
+        metalBuffer = other.metalBuffer;
+        refCount = other.refCount;
+        dims = other.dims;
+        type = other.type;
+        flags = other.flags;
+        
+        total_size = other.total_size;
+        tape = other.tape;
+        
+        if (dims <= SBO_MAX_DIMS) {
+            // Fast path: stack copy (must physically copy the bits for SBO)
+            memcpy(shape(), other.shape(), dims * sizeof(size_m));
+            memcpy(strides(), other.strides(), dims * sizeof(size_m));
+        } else {
+            // Fast path: STEAL the descriptor. DO NOT increment the ref count!
+            array_desc.shared_arr_desc = other.array_desc.shared_arr_desc;
+            // Nullify other's pointer so its destructor doesn't release our memory
+            other.array_desc.shared_arr_desc = nullptr;
+        }
+        
+        other.buffer = nullptr;
+        other.refCount = nil;
+        other.tape = nullptr;
+        
+    }
+    
+    matrix& operator=(matrix&& other) {
+        if (&other == this) { return *this; }
+        if (flags & NON_OWNERSHIP_FLAG) {
+#ifdef CopyLog
+            std::cout << "DONT OWN THE DATA COPYInG INSTEAD \n";
+#endif
+            *this = (const matrix&) other;
+            return *this;
+        }
+#ifdef MoveLog
+        std::cout << "Move Assignment" << "\n";
+#endif
+
+        destroyInstance();
+        
+        buffer = other.buffer;
+        metalBuffer = other.metalBuffer;
+        flags = other.flags;
+        refCount = other.refCount;
+        total_size = other.total_size;
+        tape = other.tape;
+        dims = other.dims;
+        type = other.type;
+        
+        if (dims <= SBO_MAX_DIMS) {
+            // Fast path: stack copy (must physically copy the bits for SBO)
+            memcpy(shape(), other.shape(), dims * sizeof(size_m));
+            memcpy(strides(), other.strides(), dims * sizeof(size_m));
+        } else {
+            // Fast path: STEAL the descriptor. DO NOT increment the ref count!
+            array_desc.shared_arr_desc = other.array_desc.shared_arr_desc;
+            // Nullify other's pointer so its destructor doesn't release our memory
+            other.array_desc.shared_arr_desc = nullptr;
+        }
+        
+
+        other.refCount = nil;
+        other.buffer = nullptr;
+        other.tape = nil;
+        return *this;
+    }
+    
+    // copy assignment
+
+    matrix& operator=(const matrix& other) {
+        #ifdef CopyLog
+                std::cout << "Copy Assignment\n";
+        #endif
+        // 1. SELF-ASSIGNMENT CHECK (Critical!)
+        // If someone does `A = A;`, we must do nothing. If we didn't check this,
+        // we would destroy A's data, and then try to copy from the destroyed A!
+        if (this == &other) {
+            return *this;
+        }
+
+        if (flags & NON_OWNERSHIP_FLAG) {
+            // Copy Assignment if coping data into a view for eg doing Video[1] = frame;
+            // Video[1] is a view in which frame is being copied into
+            if (buffer == other.buffer) {
+            #ifdef CopyLog
+                std::cout << "Ignored redundant self-assignment of views.\n";
+            #endif
+                return *this;
+            }
+            
+            // --- THE BROADCAST UPGRADE ---
+            if (total_size == other.total_size || dims == other.dims) {
+                // Exact match fast-path
+                if (metalBuffer) {
+                    copyGPUinplace(*this, other, 0);
+                } else {
+                    // Inline fast-path: Dodge function jump to `copyCPUinplace` entirely for contiguous pixel buffers!
+                    if (total_size == other.total_size && type == other.type && !(flags & NON_CONTIGUOUS_FLAG) && !(other.flags & NON_CONTIGUOUS_FLAG)) {
+                        size_t bytes = total_size * dtype_size(type);
+                        if (bytes == 4) *reinterpret_cast<uint32_t*>(buffer) = *reinterpret_cast<const uint32_t*>(other.buffer);
+                        else if (bytes == 1) *reinterpret_cast<uint8_t*>(buffer)  = *reinterpret_cast<const uint8_t*>(other.buffer);
+                        else if (bytes == 8) *reinterpret_cast<uint64_t*>(buffer) = *reinterpret_cast<const uint64_t*>(other.buffer);
+                        else memcpy(buffer, other.buffer, bytes);
+                    } else {
+                        copyCPUinplace(*this, other, 0);
+                    }
+                }
+
+            } else {
+                // Create a temporary broadcasted view of 'other' to match 'this'
+                matrix broadcasted_other = other.broadcast_to(shape(), dims);
+                
+                if (metalBuffer) copyGPUinplace(*this, broadcasted_other, 0);
+                else copyCPUinplace(*this, broadcasted_other, 0);
+            }
+            tape = other.tape;
+            return *this;
+                
+        }
+        
+        if (other.refCount) {
+            // =======================================================
+            // PATH A: SHALLOW COPY (View Sharing)
+            // =======================================================
+            destroyInstance();
+            
+            buffer      = other.buffer;
+            metalBuffer = other.metalBuffer;
+            
+            // 3. COPY LOGIC (Exact mirror of your perfect Copy Constructor)
+            dims       = other.dims;
+            type       = other.type;
+            total_size = other.total_size;
+            flags      = other.flags;
+            tape       = other.tape;
+            
+            if (other.refCount) {
+                refCount = other.refCount;
+                refCount->fetch_add(1, std::memory_order_relaxed);
+            }
+            
+            if (dims <= SBO_MAX_DIMS) {
+                memcpy(shape(), other.shape(), dims * sizeof(size_m));
+                memcpy(strides(), other.strides(), dims * sizeof(size_m));
+            } else {
+                array_desc.shared_arr_desc = other.array_desc.shared_arr_desc;
+                array_desc.shared_arr_desc->refCount.fetch_add(1, std::memory_order_relaxed);
+            }
+
+        } else  {
+            // =======================================================
+            // PATH B: DEEP COPY (Exclusive Ownership)
+            // =======================================================
+            if (buffer == other.buffer && effectiveBufferSize() == other.effectiveBufferSize()) {
+            #ifdef CopyLog
+                std::cout << "Ignored redundant self-assignment of views.\n";
+            #endif
+                return *this;
+            }
+            
+            size_t new_byte_size = other.total_size * dtype_size(other.type);
+            size_t old_byte_size = total_size * dtype_size(type);
+            bool can_reuse_memory = (buffer != nullptr && refCount == nullptr &&
+                                             !(flags & NON_OWNERSHIP_FLAG) &&
+                                             old_byte_size == new_byte_size);
+            // see if i am not sharing this data with anyone else and recieving from another sorce off same size why allocate again just copy
+            if (can_reuse_memory) {
+                // Rebuild the shape descriptor
+                if (dims <= SBO_MAX_DIMS) {
+                    memcpy(shape(), other.shape(), dims * sizeof(size_m));
+                } else {
+                    // If we already had a heap descriptor, we can just reuse it too!
+                    if (!array_desc.shared_arr_desc) {
+                        array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
+                    }
+                    memcpy(shape(), other.shape(), dims * sizeof(size_m));
+                }
+
+                // DEEP COPY PATH: Standard fallback
+                if (metalBuffer) {
+                    copyGPUinplace(*this, other, 0);
+                } else {
+                    copyCPUinplace(*this, other, 0);
+                }
+                tape = other.tape;
+                return *this;
+            }
+            destroyInstance();
+            // 3. COPY LOGIC (Exact mirror of your perfect Copy Constructor)
+            dims       = other.dims;
+            type       = other.type;
+            total_size = other.total_size;
+            flags      = other.flags;
+            tape       = other.tape;
+            // 2. CLEANUP EXISTING STATE
+            // We safely release our current buffer and shared descriptors so we don't leak memory.
+            buffer = new uint8_t[new_byte_size];
+            buildMetalBuffer();
+            refCount = nullptr;
+            
+            flags &= ~NON_OWNERSHIP_FLAG;
+            flags &= ~NON_CONTIGUOUS_FLAG;
+
+            if (dims <= SBO_MAX_DIMS) {
+                memcpy(shape(), other.shape(), dims * sizeof(size_m));
+            } else {
+                array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
+                memcpy(shape(), other.shape(), dims * sizeof(size_m));
+            }
+            
+            calcStrides();
+            copyCPUinplace(*this, other, 0);
+        }
+        return *this;
+    }
+    
+    ~matrix() {
+        if (dims > SBO_MAX_DIMS && array_desc.shared_arr_desc) {
+            array_desc.shared_arr_desc->release();
+        }
+        
+        if (!refCount) {
+            if (!(flags & NON_OWNERSHIP_FLAG)) {
+                delete[] static_cast<uint8_t*>(buffer);
+                buffer = nullptr;
+                #ifdef DestructionLog
+                std::cout << "deleted" << "\n";
+                #endif
+            }
+        } else {
+            if (refCount->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                delete[] static_cast<uint8_t*>(buffer);
+                buffer = nullptr;
+                delete refCount;
+                refCount = nullptr;
+                #ifdef DestructionLog
+                std::cout << "deleted" << "\n";
+                #endif
+            }
+        }
+        
+
+    }
+};
+
+
+
+
 
 
 //template <typename Type>
