@@ -518,4 +518,4 @@ public:
 //    return simd_matrix(row0, row1, row2, row3);
 //}
 
-static GPUManager GlobalGPUManager = GPUManager();
+inline GPUManager GlobalGPUManager = GPUManager();

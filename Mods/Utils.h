@@ -46,6 +46,15 @@ enum class ImgType {
     EXR = 2,
 };
 
+enum class EvalType {
+    EVAL_AUTO = 0,
+    EVAL_CPU = 1,
+    EVAL_METAL = 2,
+    BUILD_TRACE = 3,
+    EXEC_TRACE_CPU = 4,
+    EXEC_TRACE_METAL = 5,
+};
+
 enum Flags : unsigned int {
     NON_OWNERSHIP_FLAG = 1u << 0,  // Bit 0
     NON_CONTIGUOUS_FLAG = 1u << 1,  // Bit 1
