@@ -7,10 +7,11 @@
 
 #ifndef Utils_h
 #define Utils_h
-
-@import simd;
 #include <vector>
 #include <iostream>
+//#include <simd/simd.h>
+@import simd;
+
 
 struct Vertex3D {
     simd_float3 position;
@@ -40,25 +41,43 @@ enum class Execution {
     Encode = 1,
 };
 
+enum class ExecutionDevice {
+    CPU = 0,
+    METAL = 1,
+    AUTO = 2,
+};
+
 enum class ImgType {
     PNG = 0,
     JPG = 1,
     EXR = 2,
 };
 
+enum class ConvMode : uint8_t {
+    Full = 0,
+    Valid = 1,
+    Same  = 2  // optional common mode
+};
+
+enum class ConvModeFull : uint8_t {
+    Normal = 0,
+    Extend = 1,
+    Mirror  = 2  // optional common mode
+};
+
+
 enum class EvalType {
     EVAL_AUTO = 0,
-    EVAL_CPU = 1,
-    EVAL_METAL = 2,
-    BUILD_TRACE = 3,
-    EXEC_TRACE_CPU = 4,
-    EXEC_TRACE_METAL = 5,
+    EVAL_INSTANTLY = 1,
+    COMPILE_TRACE = 2,
+    EXEC_TRACE = 3,
 };
 
 enum Flags : unsigned int {
     NON_OWNERSHIP_FLAG = 1u << 0,  // Bit 0
     NON_CONTIGUOUS_FLAG = 1u << 1,  // Bit 1
-    COMPUTE_GRAPH = 1u << 2 // Bit 2
+    COMPUTE_GRAPH = 1u << 2, // Bit 2
+    NON_ROW_CONTIGUOUS_FLAG = 1u << 3
 };
 
 using size_m = uint32_t;
@@ -78,6 +97,14 @@ struct CollapsedDims_2 {
     uint32_t out_dims = 0;
 };
 
+struct CollapsedDims_3 {
+    size_m shape[MAX_TENSOR_DIMS];
+    size_m stridesA[MAX_TENSOR_DIMS];
+    size_m stridesB[MAX_TENSOR_DIMS];
+    size_m stridesC[MAX_TENSOR_DIMS];
+    uint32_t out_dims = 0;
+};
+
 
 simd_float4x4 Identity();
 
@@ -93,8 +120,11 @@ simd::float4x4 Scale(simd::float3 scale);
 
 //std::pair<std::vector<size_m>, std::vector<size_m>> collapse_dims(const size_m shape[], const size_m strides[], const uint32_t dims, const size_t SIZE_CAP);
 
+CollapsedDims_3 collapse_dims(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const size_m stridesC[], const uint32_t dims, const size_t SIZE_CAP);
 CollapsedDims_2 collapse_dims(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const uint32_t dims, const size_t SIZE_CAP);
 CollapsedDims collapse_dims(const size_m shape[], const size_m strides[], const uint32_t dims, const size_t SIZE_CAP);
+CollapsedDims_3 collapse_dims_matmul(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const size_m stridesC[], const uint32_t dims, const size_t SIZE_CAP);
+CollapsedDims_2 collapse_dims_reduce(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const uint32_t dims, const int reduce_axis, const size_t SIZE_CAP, bool keepdims);
 
 template <typename T>
 void TypedPatternFill(T* destination, const T pattern, uint32_t n) {
@@ -116,18 +146,18 @@ void TypedPatternFill(T* destination, const T pattern, uint32_t n) {
 }
 
 struct Range {
-    size_t start;
-    size_t end;
+    long long start;
+    long long end;
 
     // 1. Specific range: R(0, 1)
-    constexpr Range(size_t s, size_t e) : start(s), end(e) {}
+    constexpr Range(long long s, long long e) : start(s), end(e) {}
 
     // 2. Full range: R()  (Represents all elements in this dimension, like ':' in Python)
-    constexpr Range() : start(0), end(SIZE_MAX) {}
+    constexpr Range() : start(0), end(LLONG_MAX) {}
 
     // Helper to check if it's a full range
     constexpr bool is_all() const {
-        return end == SIZE_MAX;
+        return end == LLONG_MAX;
     }
 };
 

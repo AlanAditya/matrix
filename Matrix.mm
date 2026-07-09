@@ -25,6 +25,13 @@
 #include <sstream>
 #include <type_traits>
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#if !TARGET_OS_IPHONE
+    #import <CoreServices/CoreServices.h>
+#else
+    #import <MobileCoreServices/MobileCoreServices.h>
+#endif
 
 using R = Range;
 
@@ -87,6 +94,10 @@ using R = Range;
 //     };
 //     return sizes[static_cast<size_t>(d)];
 // }
+
+dtype promote_types(dtype a, dtype b) {
+    return type_rules[static_cast<int>(a)][static_cast<int>(b)];
+}
 //
 // struct SharedArrayDescriptor {
 //     std::atomic<uint32_t> refCount;
@@ -95,6 +106,10 @@ inline size_m *SharedArrayDescriptor::shape() {
 }
 inline size_m *SharedArrayDescriptor::strides(int dims) {
     return shape() + dims;
+}
+SharedArrayDescriptor* SharedArrayDescriptor::retain() {
+    refCount.fetch_add(1, std::memory_order_relaxed);
+    return this;
 }
 
 //    static SharedArrayDescriptor* create(uint32_t dims) {
@@ -193,41 +208,464 @@ void broadcast_shapes(const array_descriptor &arr_desc1,
     }
 }
 
-template <typename Func>
-inline void dispatch_type(dtype type, void *buffer, Func &&function_to_run) {
-    if (!buffer)
-        return;
+void broadcast_shapes_matmul(const array_descriptor &arr_desc1,
+                             const array_descriptor &arr_desc2,
+                             array_descriptor &out_shape,
+                             BroadcastDescriptor *new_desc1,
+                             BroadcastDescriptor *new_desc2, int dim1, int dim2) {
+    int out_dim = std::max(dim1, dim2);
     
-    // The switch statement happens exactly ONCE here.
-    // It casts the void* to the strict C++ type, and passes it into your lambda.
-    switch (type) {
-        case dtype::Float:
-            function_to_run(static_cast<float *>(buffer));
-            break;
-        case dtype::Float16:
-            // Standard C++ doesn't have a native 16-bit float yet on all compilers.
-            // We cast it to uint16_t for storage/printing purposes.
-            function_to_run(static_cast<uint16_t *>(buffer));
-            break;
-        case dtype::Int32:
-            function_to_run(static_cast<int32_t *>(buffer));
-            break;
-        case dtype::UInt32:
-            function_to_run(static_cast<uint32_t *>(buffer));
-            break;
-        case dtype::UInt8:
-            function_to_run(static_cast<uint8_t *>(buffer));
-            break;
-        case dtype::Int16:
-            function_to_run(static_cast<int16_t *>(buffer));
-            break;
-        case dtype::UInt16:
-            function_to_run(static_cast<uint16_t *>(buffer));
-            break;
-        default:
-            throw std::runtime_error("Unsupported dtype during dispatch");
+    if (out_dim > SBO_MAX_DIMS) {
+        out_shape.shared_arr_desc = SharedArrayDescriptor::create(out_dim);
+    }
+    assert(new_desc1 && "broadcast_shapes: new_desc1 must not be null");
+    assert(new_desc2 && "broadcast_shapes: new_desc2 must not be null");
+    
+    const size_m *shape1 = (dim1 > SBO_MAX_DIMS)
+    ? arr_desc1.shared_arr_desc->shape()
+    : arr_desc1.inline_buffer;
+    const size_m *shape2 = (dim2 > SBO_MAX_DIMS)
+    ? arr_desc2.shared_arr_desc->shape()
+    : arr_desc2.inline_buffer;
+    size_m *shape_out = (out_dim > SBO_MAX_DIMS)
+    ? out_shape.shared_arr_desc->shape()
+    : out_shape.inline_buffer;
+    size_m *strides_out = (out_dim > SBO_MAX_DIMS)
+    ? out_shape.shared_arr_desc->strides(out_dim)
+    : out_shape.inline_buffer + SBO_MAX_DIMS;
+    const size_m *strides1 = (dim1 > SBO_MAX_DIMS)
+    ? arr_desc1.shared_arr_desc->strides(dim1)
+    : arr_desc1.inline_buffer + SBO_MAX_DIMS;
+    const size_m *strides2 = (dim2 > SBO_MAX_DIMS)
+    ? arr_desc2.shared_arr_desc->strides(dim2)
+    : arr_desc2.inline_buffer + SBO_MAX_DIMS;
+    
+//    array_desc1 => [....., M, K]
+//    array_desc2 => [....., N, K] from B.T
+    shape_out[out_dim - 2] = shape1[dim1 - 2]; // M
+    shape_out[out_dim - 1] = shape2[dim2 - 2]; // N
+    
+    memcpy(new_desc1->strides(out_dim) + (out_dim - dim1), strides1,
+           dim1 * sizeof(size_m));
+    memcpy(new_desc2->strides(out_dim) + (out_dim - dim2), strides2,
+           dim2 * sizeof(size_m));
+    memset(new_desc1->strides(out_dim), 0, (out_dim - dim1) * sizeof(size_m));
+    memset(new_desc2->strides(out_dim), 0, (out_dim - dim2) * sizeof(size_m));
+    memcpy(new_desc1->shape() + (out_dim - dim1), shape1, dim1 * sizeof(size_m));
+    memcpy(new_desc2->shape() + (out_dim - dim2), shape2, dim2 * sizeof(size_m));
+    
+    for (int i = 2; i < out_dim; i++) {
+        // dims - i-1 < 0
+        if (dim1 < i + 1) {
+            new_desc1->shape()[out_dim - i - 1] = shape2[dim2 - i - 1];
+            shape_out[out_dim - i - 1] = shape2[dim2 - i - 1];
+        } else if (dim2 < i + 1) {
+            new_desc2->shape()[out_dim - i - 1] = shape1[dim1 - i - 1];
+            shape_out[out_dim - i - 1] = shape1[dim1 - i - 1];
+        } else if (shape1[dim1 - i - 1] != shape2[dim2 - i - 1]) {
+            if (shape1[dim1 - i - 1] == 1) {
+                new_desc1->shape()[out_dim - i - 1] = shape2[dim2 - i - 1];
+                shape_out[out_dim - i - 1] = shape2[dim2 - i - 1];
+                new_desc1->strides(out_dim)[out_dim - i - 1] = 0;
+            } else if (shape2[dim2 - i - 1] == 1) {
+                new_desc2->shape()[out_dim - i - 1] = shape1[dim1 - i - 1];
+                shape_out[out_dim - i - 1] = shape1[dim1 - i - 1];
+                new_desc2->strides(out_dim)[out_dim - i - 1] = 0;
+            } else {
+                throw std::invalid_argument(
+                                            "MatrixH: Incompatible shapes for broadcasting");
+            }
+        } else {
+            shape_out[out_dim - i - 1] = shape1[dim1 - i - 1];
+        }
+    }
+    
+    size_m acc = 1;
+    for (int i = out_dim - 1; i >= 0; i--) {
+        strides_out[i] = acc;
+        acc *= shape_out[i];
     }
 }
+
+
+
+
+matrix matrix::broadcast_to_impl(const size_m* broadcasted_shape, int broadcasted_dim) const {
+    matrix out_mat(broadcasted_dim, type);
+
+    const size_m* src_shape   = shape();
+    const size_m* src_strides = strides();
+    size_m* dst_strides       = out_mat.strides();
+
+    for (int i = 0; i < broadcasted_dim; i++) {
+        int src_i = dims - i - 1;
+        int dst_i = broadcasted_dim - i - 1;
+
+        if (dims < i + 1) {
+            dst_strides[dst_i] = 0;
+        } else if (src_shape[src_i] == broadcasted_shape[dst_i]) {
+            dst_strides[dst_i] = src_strides[src_i];
+        } else if (src_shape[src_i] == 1) {
+            dst_strides[dst_i] = 0;
+        } else {
+            throw std::invalid_argument("matrix: Incompatible shapes for broadcasting");
+        }
+    }
+    memcpy(out_mat.shape(), broadcasted_shape, broadcasted_dim * sizeof(size_m));
+    
+    
+//    if (tape) {
+    out_mat.tape = new BrodcastPrimitive(const_cast<matrix&>(*this), out_mat.array_desc, broadcasted_dim);
+//    }
+    out_mat.total_size = out_mat.accumul(0, broadcasted_dim);
+    out_mat.flags = flags;
+    out_mat.flags |= NON_CONTIGUOUS_FLAG;
+    return out_mat;
+}
+
+matrix matrix::broadcast_toV2(size_m* broadcasted_shape, int broadcasted_dim) const {
+    return broadcast_to_impl(broadcasted_shape, broadcasted_dim);
+}
+
+matrix matrix::broadcast_toV2(std::initializer_list<size_m> shape) const {
+    return broadcast_to_impl(shape.begin(), shape.size());
+}
+template <typename... Args> requires (std::convertible_to<Args, size_m> && ...)
+matrix matrix::reshape(Args... newShape) {
+    constexpr size_t newDims = sizeof...(newShape);
+    matrix output(newDims, type);
+    memcpy(output.shape(), (size_m[]){static_cast<size_m>(newShape)...}, sizeof(size_m) * newDims);
+    output.total_size = output.accumul(0, newDims);
+    if (output.total_size != total_size) {
+        std::cerr << "Matrix: Reshape total size mismatch. Original size: " << total_size << ", New size: " << output.total_size << "\n";
+        throw;
+    }
+    output.calcStrides();
+    output.flags = flags;
+    output.flags &= ~NON_CONTIGUOUS_FLAG;
+    output.flags &= ~NON_OWNERSHIP_FLAG;
+    output.total_size = total_size;
+    output.refCount = refCount;
+
+    bool REQUIRES_NEW_BUFFER = (flags & NON_CONTIGUOUS_FLAG) != 0;
+    output.tape = new ReshapePrimitive(*this, output.array_desc, output.dims, REQUIRES_NEW_BUFFER);
+    return output;
+}
+
+template matrix matrix::reshape(size_m);
+template matrix matrix::reshape(size_m, size_m);
+template matrix matrix::reshape(size_m, size_m, size_m);
+template matrix matrix::reshape(size_m, size_m, size_m, size_m);
+template matrix matrix::reshape(size_m, size_m, size_m, size_m, size_m);
+template matrix matrix::reshape(size_m, size_m, size_m, size_m, size_m, size_m);
+
+template matrix matrix::reshape(int);
+template matrix matrix::reshape(int, int);
+template matrix matrix::reshape(int, int, int);
+template matrix matrix::reshape(int, int, int, int);
+template matrix matrix::reshape(int, int, int, int, int);
+
+void matrix::reshape_eval(matrix& output, array_descriptor reshape_desc, size_t reshape_dims, ExecutionDevice execDev) {
+    if (flags & NON_CONTIGUOUS_FLAG) {
+        // Create a temporary view of output that perfectly matches the input's shape
+        // This is necessary because copyGPUinplace and copyCPUinplace rely on collapse_dims
+        // which assumes the number of dimensions in inMat and outMat match.
+        matrix output_view(dims, type);
+        memcpy(output_view.shape(), shape(), dims * sizeof(size_m));
+        output_view.calcStrides();
+        output_view.buffer = output.buffer;
+        output_view.metalBuffer = output.metalBuffer;
+        output_view.total_size = total_size;
+        output_view.flags = output.flags;
+        
+        if (execDev == ExecutionDevice::AUTO) {
+            execDev = (total_size > 10) ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+        }
+        if (execDev == ExecutionDevice::METAL) {
+            copyGPUinplace(output_view, *this, 0, Execution::Encode);
+        } else {
+            copyCPUinplace(output_view, *this, 0);
+        }
+    }
+}
+
+matrix matrix::reshape(array_descriptor reshape_desc, size_t reshape_dims) {
+    matrix output(reshape_dims, type);
+    output.set_array_desc(reshape_desc, reshape_dims);
+    output.dims = reshape_dims;
+    output.total_size = output.accumul(0, reshape_dims);
+    
+    if (output.total_size != total_size) {
+        throw std::runtime_error(
+            "Matrix: Reshape total size mismatch. Original: " +
+            std::to_string(total_size) + ", New: " +
+            std::to_string(output.total_size)
+        );
+    }
+    
+    output.calcStrides();
+    
+    output.flags = flags;
+    output.flags &= ~NON_CONTIGUOUS_FLAG;
+    output.refCount = refCount;
+
+//    if (!(flags & NON_CONTIGUOUS_FLAG)) {
+//        output.buffer = buffer;
+//        output.metalBuffer = metalBuffer;
+//        if (refCount) {
+//            refCount->fetch_add(1);
+//        }
+//    }
+    bool REQUIRES_NEW_BUFFER = (flags & NON_CONTIGUOUS_FLAG) != 0;
+    output.tape = new ReshapePrimitive(*this, output.array_desc, output.dims, REQUIRES_NEW_BUFFER);
+    
+    return output;
+}
+
+
+matrix matrix::unsqueeze(int axis) const {
+    matrix output(dims+1, type);
+    memcpy(output.shape(), shape(), axis * sizeof(size_m));
+    output.shape()[axis]=1;
+    memcpy(output.shape() + axis + 1, shape() + axis, (dims-axis) * sizeof(size_m));
+    if (flags & NON_CONTIGUOUS_FLAG) {
+        memcpy(output.strides(), strides(), axis * sizeof(size_m));
+        output.strides()[axis] = (axis < dims) ? strides()[axis] : 1; 
+        memcpy(output.strides() + axis + 1, strides() + axis, (dims-axis) * sizeof(size_m));
+        output.flags = flags;
+        output.flags &= ~NON_OWNERSHIP_FLAG;
+    } else {
+        output.calcStrides();
+        output.flags = flags;
+        output.flags &= ~NON_CONTIGUOUS_FLAG;
+        output.flags &= ~NON_OWNERSHIP_FLAG;
+    }
+    output.total_size = total_size;
+//    output.refCount = refCount;
+
+//    if (!(flags & NON_CONTIGUOUS_FLAG)) {
+//        output.buffer = buffer;
+//        output.metalBuffer = metalBuffer;
+//        if (refCount) {
+//            refCount->fetch_add(1);
+//        }
+//    }
+    output.tape = new ReshapePrimitive(const_cast<matrix&>(*this), output.array_desc, output.dims, false);
+    return output;
+}
+
+matrix matrix::squeeze(int axis) const {
+    if (axis < 0) axis += dims;
+    if (shape()[axis] != 1) {
+        matrix output(dims, type);
+        memcpy(output.shape(), shape(), dims * sizeof(size_m));
+        if (flags & NON_CONTIGUOUS_FLAG) {
+            memcpy(output.strides(), strides(), dims * sizeof(size_m));
+            output.flags = flags;
+            output.flags &= ~NON_OWNERSHIP_FLAG;
+        } else {
+            output.calcStrides();
+            output.flags = flags;
+            output.flags &= ~NON_CONTIGUOUS_FLAG;
+            output.flags &= ~NON_OWNERSHIP_FLAG;
+        }
+        output.total_size = total_size;
+        output.tape = new ReshapePrimitive(const_cast<matrix&>(*this), output.array_desc, output.dims, false);
+        return output;
+    }
+    
+    matrix output(dims - 1, type);
+    if (axis > 0) {
+        memcpy(output.shape(), shape(), axis * sizeof(size_m));
+    }
+    if (axis < dims - 1) {
+        memcpy(output.shape() + axis, shape() + axis + 1, (dims - axis - 1) * sizeof(size_m));
+    }
+    if (flags & NON_CONTIGUOUS_FLAG) {
+        if (axis > 0) {
+            memcpy(output.strides(), strides(), axis * sizeof(size_m));
+        }
+        if (axis < dims - 1) {
+            memcpy(output.strides() + axis, strides() + axis + 1, (dims - axis - 1) * sizeof(size_m));
+        }
+        output.flags = flags;
+        output.flags &= ~NON_OWNERSHIP_FLAG;
+    } else {
+        output.calcStrides();
+        output.flags = flags;
+        output.flags &= ~NON_CONTIGUOUS_FLAG;
+        output.flags &= ~NON_OWNERSHIP_FLAG;
+    }
+    output.total_size = total_size;
+    output.tape = new ReshapePrimitive(const_cast<matrix&>(*this), output.array_desc, output.dims, false);
+    return output;
+}
+
+matrix matrix::squeeze() const {
+    int new_dims = 0;
+    for (int i = 0; i < dims; i++) {
+        if (shape()[i] != 1) new_dims++;
+    }
+    if (new_dims == dims) {
+        return *this;
+    }
+    
+    // In edge case where matrix is literally size 1 (e.g. {1,1}) we squeeze to 0D? Or 1D?
+    // Let's assume minimum dimensionality might be allowed as 0D (if supported),
+    // but if not supported, we should at least leave 1 dim.
+    // Assuming 0D is supported in this codebase.
+    matrix output(new_dims, type);
+    int curr = 0;
+    for (int i = 0; i < dims; i++) {
+        if (shape()[i] != 1) {
+            output.shape()[curr] = shape()[i];
+//            if (flags & NON_CONTIGUOUS_FLAG) {
+                output.strides()[curr] = strides()[i];
+//            }
+            curr++;
+        }
+    }
+    
+//    if (flags & NON_CONTIGUOUS_FLAG) {
+        output.flags = flags;
+////        output.flags &= ~NON_OWNERSHIP_FLAG;
+//    } else {
+//        output.calcStrides();
+//        output.flags = flags;
+//        output.flags &= ~NON_CONTIGUOUS_FLAG;
+//        output.flags &= ~NON_OWNERSHIP_FLAG;
+//    }
+    output.total_size = total_size;
+    output.tape = new ReshapePrimitive(const_cast<matrix&>(*this), output.array_desc, output.dims, false);
+    return output;
+}
+
+matrix matrix::flatten(int start_dim, int end_dim) {
+    // Handle negative indexing
+    if (end_dim < 0) end_dim += dims;
+    if (start_dim < 0) start_dim += dims;
+    
+    int new_dims = dims - (end_dim - start_dim);
+    matrix output(new_dims, type);
+    
+    // 1. Copy dimensions before start_dim
+    if (start_dim > 0) {
+        memcpy(output.shape(), shape(), start_dim * sizeof(size_m));
+    }
+    
+    // 2. Collapse the specified range into a single dimension
+    size_m collapsed_size = 1;
+    for (int i = start_dim; i <= end_dim; i++) {
+        collapsed_size *= shape()[i];
+    }
+    output.shape()[start_dim] = collapsed_size;
+    
+    // 3. Copy dimensions after end_dim
+    if (end_dim < dims - 1) {
+        memcpy(output.shape() + start_dim + 1, shape() + end_dim + 1, (dims - 1 - end_dim) * sizeof(size_m));
+    }
+    
+    output.calcStrides();
+    output.flags = flags;
+    output.total_size = total_size;
+    output.flags &= ~NON_CONTIGUOUS_FLAG;
+    output.flags &= ~NON_OWNERSHIP_FLAG;
+    bool REQUIRES_NEW_BUFFER = (flags & NON_CONTIGUOUS_FLAG) != 0;
+    output.tape = new ReshapePrimitive(*this, output.array_desc, output.dims, REQUIRES_NEW_BUFFER);
+    
+    return output;
+}
+
+
+matrix matrix::unsqueeze(uint32_t* axes, uint32_t num_axes) const {
+    // normalize and sort axes (negative axis support optional)
+    uint32_t new_dims = dims + num_axes;
+    
+    // sort axes (need them in order to insert correctly)
+    uint32_t sorted_axes[num_axes];
+    memcpy(sorted_axes, axes, num_axes * sizeof(uint32_t));
+    std::sort(sorted_axes, sorted_axes + num_axes);
+    
+    matrix output(new_dims, type);
+    
+    // build new shape by walking both old shape and insertion points
+    uint32_t old_i = 0;
+    uint32_t new_i = 0;
+    uint32_t ax_i = 0;
+    
+    while (new_i < new_dims) {
+        if (ax_i < num_axes && sorted_axes[ax_i] == new_i) {
+            output.shape()[new_i] = 1;
+            ax_i++;
+        } else {
+            output.shape()[new_i] = shape()[old_i];
+            old_i++;
+        }
+        new_i++;
+    }
+    
+    if (flags & NON_CONTIGUOUS_FLAG) {
+        old_i = 0;
+        new_i = 0;
+        ax_i = 0;
+        while (new_i < new_dims) {
+            if (ax_i < num_axes && sorted_axes[ax_i] == new_i) {
+                output.strides()[new_i] = (old_i < dims) ? strides()[old_i] : 1;
+                ax_i++;
+            } else {
+                output.strides()[new_i] = strides()[old_i];
+                old_i++;
+            }
+            new_i++;
+        }
+        output.flags = flags;
+        output.flags &= ~NON_OWNERSHIP_FLAG;
+    } else {
+        output.calcStrides();
+        output.flags = flags;
+        output.flags &= ~NON_CONTIGUOUS_FLAG;
+        output.flags &= ~NON_OWNERSHIP_FLAG;
+    }
+    output.total_size = total_size;
+    output.tape = new ReshapePrimitive(const_cast<matrix&>(*this), output.array_desc, output.dims, false);
+    return output;
+}
+
+//template <typename Func>
+//inline void dispatch_type(dtype type, void *buffer, Func &&function_to_run) {
+//    if (!buffer)
+//        return;
+//    
+//    // The switch statement happens exactly ONCE here.
+//    // It casts the void* to the strict C++ type, and passes it into your lambda.
+//    switch (type) {
+//        case dtype::Float:
+//            function_to_run(static_cast<float *>(buffer));
+//            break;
+//        case dtype::Float16:
+//            // Standard C++ doesn't have a native 16-bit float yet on all compilers.
+//            // We cast it to uint16_t for storage/printing purposes.
+//            function_to_run(static_cast<uint16_t *>(buffer));
+//            break;
+//        case dtype::Int32:
+//            function_to_run(static_cast<int32_t *>(buffer));
+//            break;
+//        case dtype::UInt32:
+//            function_to_run(static_cast<uint32_t *>(buffer));
+//            break;
+//        case dtype::UInt8:
+//            function_to_run(static_cast<uint8_t *>(buffer));
+//            break;
+//        case dtype::Int16:
+//            function_to_run(static_cast<int16_t *>(buffer));
+//            break;
+//        case dtype::UInt16:
+//            function_to_run(static_cast<uint16_t *>(buffer));
+//            break;
+//        default:
+//            throw std::runtime_error("Unsupported dtype during dispatch");
+//    }
+//}
 
 //// Detect if a type is an initializer_list
 // template <typename T> struct is_init_list : std::false_type {};
@@ -268,13 +706,6 @@ inline void dispatch_type(dtype type, void *buffer, Func &&function_to_run) {
 //     uint8_t flags = 0;
 
 //    template <typename Type>
-//    matrix(std::initializer_list<Type> list) {
-//        total_size = list.size();
-//        shape()[0] = (size_m)list.size();
-//        buffer = new Type[total_size];
-//        memcpy(buffer, list.begin(), sizeof(Type) * list.size());
-//        strides()[0] = 1;
-//        type = dtype_from_type<Type>();
 //        dims = 1;
 //        if (total_size > 10) {
 //            buildMetalBuffer();
@@ -319,69 +750,69 @@ matrix::matrix(uint32_t rank, dtype type_inp) {
 //        setup_from_list<4, Type>(list);
 //    }
 
-// MARK: // --- Unified Initialization Logic ---
-template <int Dims, typename BaseType, typename NestedList>
-void matrix::setup_from_list(const NestedList &list) {
-    this->dims = Dims;
-    
-    type = dtype_from_type<BaseType>();
-    
-    // 2. Trigger SBO logic if dimensions exceed threshold
-    if (this->dims > SBO_MAX_DIMS) {
-        array_desc.shared_arr_desc = SharedArrayDescriptor::create(this->dims);
-    }
-    
-    // 3. Extract the shape dynamically
-    extract_shape(this->shape(), list, 0);
-    
-    // 4. Calculate strides and total size
-    this->total_size = 1;
-    for (int i = 0; i < this->dims; ++i) {
-        this->total_size *= this->shape()[i];
-    }
-    
-    size_m current_stride = 1;
-    for (int i = this->dims - 1; i >= 0; --i) {
-        this->strides()[i] = current_stride;
-        current_stride *= this->shape()[i];
-    }
-    
-    // 5. Allocate raw memory
-    this->buffer = new uint8_t[this->total_size * sizeof(BaseType)];
-    
-    // 6. Flatten and copy data
-    BaseType *raw_ptr = static_cast<BaseType *>(this->buffer);
-    size_m offset = 0;
-    copy_data(raw_ptr, list, offset);
-}
-
-// --- Recursive Helpers (from previous step) ---
-template <typename ListType>
-void matrix::extract_shape(size_m *shape_arr,
-                           const std::initializer_list<ListType> &list,
-                           int current_dim) {
-    shape_arr[current_dim] = static_cast<size_m>(list.size());
-    if constexpr (is_init_list<ListType>::value) {
-        if (list.size() > 0) {
-            extract_shape(shape_arr, *list.begin(), current_dim + 1);
-        }
-    }
-}
-
-template <typename ListType, typename BaseType>
-void matrix::copy_data(BaseType *dest,
-                       const std::initializer_list<ListType> &list,
-                       size_m &offset) {
-    if constexpr (is_init_list<ListType>::value) {
-        for (const auto &sub_list : list) {
-            copy_data(dest, sub_list, offset);
-        }
-    } else {
-        for (const auto &item : list) {
-            dest[offset++] = item;
-        }
-    }
-}
+//// MARK: // --- Unified Initialization Logic ---
+//template <int Dims, typename BaseType, typename NestedList>
+//void matrix::setup_from_list(const NestedList &list) {
+//    this->dims = Dims;
+//    
+//    type = dtype_from_type<BaseType>();
+//    
+//    // 2. Trigger SBO logic if dimensions exceed threshold
+//    if (this->dims > SBO_MAX_DIMS) {
+//        array_desc.shared_arr_desc = SharedArrayDescriptor::create(this->dims);
+//    }
+//    
+//    // 3. Extract the shape dynamically
+//    extract_shape(this->shape(), list, 0);
+//    
+//    // 4. Calculate strides and total size
+//    this->total_size = 1;
+//    for (int i = 0; i < this->dims; ++i) {
+//        this->total_size *= this->shape()[i];
+//    }
+//    
+//    size_m current_stride = 1;
+//    for (int i = this->dims - 1; i >= 0; --i) {
+//        this->strides()[i] = current_stride;
+//        current_stride *= this->shape()[i];
+//    }
+//    
+//    // 5. Allocate raw memory
+//    this->buffer = new uint8_t[this->total_size * sizeof(BaseType)];
+//    
+//    // 6. Flatten and copy data
+//    BaseType *raw_ptr = static_cast<BaseType *>(this->buffer);
+//    size_m offset = 0;
+//    copy_data(raw_ptr, list, offset);
+//}
+//
+//// --- Recursive Helpers (from previous step) ---
+//template <typename ListType>
+//void matrix::extract_shape(size_m *shape_arr,
+//                           const std::initializer_list<ListType> &list,
+//                           int current_dim) {
+//    shape_arr[current_dim] = static_cast<size_m>(list.size());
+//    if constexpr (is_init_list<ListType>::value) {
+//        if (list.size() > 0) {
+//            extract_shape(shape_arr, *list.begin(), current_dim + 1);
+//        }
+//    }
+//}
+//
+//template <typename ListType, typename BaseType>
+//void matrix::copy_data(BaseType *dest,
+//                       const std::initializer_list<ListType> &list,
+//                       size_m &offset) {
+//    if constexpr (is_init_list<ListType>::value) {
+//        for (const auto &sub_list : list) {
+//            copy_data(dest, sub_list, offset);
+//        }
+//    } else {
+//        for (const auto &item : list) {
+//            dest[offset++] = item;
+//        }
+//    }
+//}
 
 inline size_m *matrix::shape() {
     return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer : array_desc.shared_arr_desc->shape();
@@ -414,7 +845,7 @@ inline void matrix::detach_shape() {
         old_desc->release();
     }
 }
-inline void matrix::shareBuffer(matrix &mat) const {
+ void matrix::shareBuffer(matrix &mat) const {
     mat.releaseBuffer();
     if (refCount) {
         mat.refCount = refCount;
@@ -423,14 +854,23 @@ inline void matrix::shareBuffer(matrix &mat) const {
         mat.flags |= NON_OWNERSHIP_FLAG;
     }
     mat.buffer = buffer;
+    mat.metalBuffer = metalBuffer;
+    if (mat.tape) {
+        mat.tape->out_buffer = (uint8_t*)buffer;
+        mat.tape->out_metal_buffer = metalBuffer;
+        mat.tape->out_refcount = refCount;
+    }
 }
 
 inline void matrix::update_from_trace() {
     if (tape && tape->out_buffer != buffer) {
+        releaseBuffer();
         buffer = tape->out_buffer;
         metalBuffer = tape->out_metal_buffer;
         refCount = tape->out_refcount;
-        refCount->fetch_add(1);
+        if (refCount) {
+            refCount->fetch_add(1);
+        }
     }
 }
 inline void matrix::beginReferenceCounting() {
@@ -471,6 +911,412 @@ size_t matrix::effectiveBufferSize() const {
     }
 }
 
+inline void matrix::set_array_desc(const array_descriptor& new_array_desc) {
+    const_cast<array_descriptor&>(new_array_desc).retain(dims);
+    array_desc.release(dims);
+    array_desc = new_array_desc;
+}
+
+inline void matrix::set_array_desc(const array_descriptor& new_array_desc, uint32_t new_dims) {
+    const_cast<array_descriptor&>(new_array_desc).retain(new_dims);
+    array_desc.release(dims);
+    array_desc = new_array_desc;
+}
+
+matrix matrix::transpose(std::initializer_list<size_m> new_axis_order) const {
+    assert(new_axis_order.size() == dims && "matrix: transpose => error: new_axis_order size must match matrix dimensions!");
+    matrix output_view(dims, type);
+    const size_m* input_shape = shape();
+    const size_m* input_strides = strides();
+    size_m* output_shape = output_view.shape();
+    size_m* output_strides = output_view.strides();
+//    shareBuffer(output_view);
+    for (int i = 0; i < dims; i++) {
+        int new_axii = *(new_axis_order.begin() + i);
+        output_shape[i] = input_shape[new_axii];
+        output_strides[i] = input_strides[new_axii];
+    }
+    output_view.total_size = total_size;
+    output_view.flags = flags;
+    output_view.flags |= NON_CONTIGUOUS_FLAG;
+    output_view.tape = new TransposePrimitive(const_cast<matrix&>(*this), output_view.array_desc);
+    return output_view;
+}
+
+matrix matrix::transpose(const std::vector<size_m>& new_axis_order) const {
+    assert(new_axis_order.size() == dims && "matrix: transpose => error: new_axis_order size must match matrix dimensions!");
+    matrix output_view(dims, type);
+    const size_m* input_shape = shape();
+    const size_m* input_strides = strides();
+    size_m* output_shape = output_view.shape();
+    size_m* output_strides = output_view.strides();
+    for (int i = 0; i < dims; i++) {
+        int new_axii = new_axis_order[i];
+        output_shape[i] = input_shape[new_axii];
+        output_strides[i] = input_strides[new_axii];
+    }
+    output_view.total_size = total_size;
+    output_view.flags = flags | NON_CONTIGUOUS_FLAG;
+    output_view.tape = new TransposePrimitive(const_cast<matrix&>(*this), output_view.array_desc);
+    return output_view;
+}
+
+
+matrix matrix::T() const {
+    matrix output_view(dims, type);
+    const size_m* input_shape   = shape();
+    const size_m* input_strides = strides();
+    size_m* output_shape   = output_view.shape();
+    size_m* output_strides = output_view.strides();
+    for (int i = 0; i < dims; i++) {
+        output_shape[i]   = input_shape[dims - 1 - i];
+        output_strides[i] = input_strides[dims - 1 - i];
+    }
+    output_view.total_size = total_size;
+    output_view.flags      = flags;
+    output_view.flags     |= NON_CONTIGUOUS_FLAG;
+    output_view.tape       = new TransposePrimitive(const_cast<matrix&>(*this), output_view.array_desc);
+    return output_view;
+}
+
+matrix matrix::transpose(array_descriptor transpose_desc) const {
+    matrix output_view(dims, type);
+    output_view.set_array_desc(transpose_desc);
+    output_view.total_size = total_size;
+    output_view.flags = flags;
+    output_view.flags |= NON_CONTIGUOUS_FLAG;
+    output_view.tape = new TransposePrimitive(const_cast<matrix&>(*this), output_view.array_desc);
+    return output_view;
+}
+
+std::function<matrix(matrix&)> matrix::jit_gpu(std::function<matrix(matrix&)> func, matrix& sample) {
+    sample.begin_refcount();
+    sample.tape = new SwapLeafPrimitive(sample);
+    matrix output = func(sample);
+    output.compile_metal();
+    sample.releaseBuffer();
+    return [&sample, output](matrix& input) mutable -> matrix {
+        input.shareBuffer(sample);
+        output.execute_metal();
+        uint32_t val = output.refCount->load(std::memory_order_relaxed);
+
+        printf("%u\n", val);
+        matrix returnable_output(output.dims, output.type);
+        returnable_output.set_array_desc(output.array_desc);
+        output.shareBuffer(returnable_output);
+        output.releaseBuffer();
+        output.tape->out_buffer = nullptr;
+        output.tape->out_refcount = nullptr;
+        output.tape->out_metal_buffer = nullptr;
+        output.clear_trace_checks();
+        returnable_output.tape = nullptr;
+        return returnable_output;
+    };
+}
+
+
+
+
+std::function<std::vector<matrix>(const std::vector<matrix>&)> matrix::multi_jit_graph_gpu(std::function<std::vector<matrix>(std::vector<matrix>)> func, const std::vector<matrix>& sample_inputs) {
+    std::vector<matrix> inner_samples = sample_inputs;
+
+    for (auto& sample : inner_samples) {
+        if (sample.tape) {
+            sample.eval_metal();
+        }
+        sample.begin_refcount();
+        sample.tape = new SwapLeafPrimitive(sample);
+    }
+    
+    std::vector<matrix> inner_outputs = func(inner_samples);
+    
+    for (auto& o : inner_outputs) {
+        o.compile_metal();
+    }
+    for (auto& sample : inner_samples) {
+        sample.releaseBuffer();
+    }
+    
+    return [inner_samples, inner_outputs](const std::vector<matrix>& inputs) mutable -> std::vector<matrix> {
+        std::vector<matrix> mutable_inputs = const_cast<std::vector<matrix>&>(inputs);
+        
+        std::vector<matrix> outer_outputs;
+        for (auto& o : inner_outputs) {
+            matrix out(o.dims, o.type);
+            out.set_array_desc(o.array_desc);
+            out.total_size = o.total_size;
+            out.flags = o.flags;
+            outer_outputs.push_back(out);
+        }
+        
+        std::vector<MultiInputCompilePrimitive*> prims;
+        for (size_t i = 0; i < outer_outputs.size(); i++) {
+            prims.push_back(new MultiInputCompilePrimitive(mutable_inputs, inner_samples, inner_outputs, outer_outputs, i));
+        }
+        
+        // Patch the tape pointers on the local outer_outputs and the copies stored inside the primitives
+        for (size_t i = 0; i < outer_outputs.size(); i++) {
+            outer_outputs[i].tape = prims[i];
+            for (auto p : prims) {
+                p->outer_outputs[i].tape = prims[i];
+                p->siblings = prims;
+            }
+        }
+        
+        return outer_outputs;
+    };
+}
+
+
+
+
+std::function<matrix(const matrix&)> matrix::jit_graph_gpu(std::function<matrix(matrix)> func, matrix sample) {
+    if (sample.tape) {
+        sample.eval_metal();
+    }
+    sample.begin_refcount();
+    sample.tape = new SwapLeafPrimitive(sample);
+    matrix output = func(sample);
+    
+    output.compile_metal();
+    sample.releaseBuffer();
+    
+    return [sample, output](const matrix& input) mutable -> matrix {
+        matrix returnable_output(output.dims, output.type);
+        returnable_output.set_array_desc(output.array_desc);
+        returnable_output.total_size = output.total_size;
+        returnable_output.flags = output.flags;
+        matrix& mut_input = const_cast<matrix&>(input);
+        returnable_output.tape = new CompiledNodePrimitive(mut_input, sample, output);
+        return returnable_output;
+    };
+}
+
+
+std::function<matrix(matrix)> matrix::grad_gpu(std::function<matrix(matrix)> func, matrix sample) {
+    sample.begin_refcount();
+    sample.tape = new SwapLeafPrimitive(sample);
+    matrix output = func(sample);
+    matrix grad_output = matrix::build_grad_graph(output, sample);
+    grad_output.compile_metal();
+    sample.releaseBuffer();
+    
+    return [sample, grad_output](matrix input) mutable -> matrix {
+        input.shareBuffer(sample); // Swaps the buffer in SwapLeafPrimitive
+        
+        grad_output.execute_metal();
+        matrix returnable_output(grad_output.dims, grad_output.type);
+        returnable_output.set_array_desc(grad_output.array_desc);
+        returnable_output.shareBuffer(grad_output);
+        grad_output.releaseBuffer();
+        grad_output.tape->out_buffer = nullptr;
+        grad_output.tape->out_refcount = nullptr;
+        grad_output.tape->out_metal_buffer = nullptr;
+        grad_output.clear_trace_checks();
+        returnable_output.tape = nullptr;
+        
+        grad_output.clear_trace_checks();
+        
+        return returnable_output;
+    };
+}
+
+std::function<matrix(matrix)> matrix::grad_graph_gpu(std::function<matrix(matrix)> func, matrix sample) {
+    if (sample.tape) {
+        sample.eval_metal();
+    }
+    sample.begin_refcount();
+    sample.tape = new SwapLeafPrimitive(sample);
+    matrix output = func(sample);
+    
+    matrix grad_output = matrix::build_grad_graph(output, sample);
+    grad_output.compile_metal();
+    sample.releaseBuffer();
+    
+    return [sample, grad_output](matrix input) mutable -> matrix {
+        if (!input.tape) {
+            input.begin_refcount();
+        }
+        matrix returnable_output(grad_output.dims, grad_output.type);
+        returnable_output.set_array_desc(grad_output.array_desc);
+        returnable_output.total_size = grad_output.total_size;
+        returnable_output.flags = grad_output.flags;
+        returnable_output.tape = new CompiledNodePrimitive(input, sample, grad_output);
+        return returnable_output;
+    };
+}
+
+matrix matrix::build_grad_graph(matrix& output_node, matrix& sample_input_node) {
+    std::vector<matrix> topo;
+    std::unordered_set<void*> visited;
+    std::unordered_map<void*, matrix> grads;
+    
+    auto get_id = [](const matrix& m) -> void* {
+        return m.tape ? m.tape : m.buffer;
+    };
+    
+    std::function<void(matrix&)> dfs = [&](matrix& m) {
+        void* uuid = get_id(m);
+        if (visited.count(uuid)) return;
+        visited.insert(uuid);
+        if (m.tape) {
+            for (auto& inp : m.tape->get_inputs()) {
+                dfs(inp);
+            }
+        }
+        topo.push_back(m);
+    };
+    
+    dfs(output_node);
+    
+    grads.insert({get_id(output_node), output_node.ones()});
+    
+    for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
+        matrix& m = *it;
+        if (!m.tape) { continue; }
+        matrix current_grad = grads.at(get_id(m));
+        
+        auto input_grads = m.tape->vjp(current_grad);
+        auto inputs = m.tape->get_inputs();
+        
+        for (int i = 0; i < inputs.size(); i++) {
+            void* in_id = get_id(inputs[i]);
+            auto it = grads.find(in_id);
+            if (it != grads.end()) {
+                // Already exists, accumulate!
+                it->second = it->second + input_grads[i];
+            } else {
+                // Doesn't exist, safely insert it!
+                grads.insert({in_id, input_grads[i]});
+            }
+        }
+    }
+    auto it = grads.find(get_id(sample_input_node));
+    if (it != grads.end()) {
+        return it->second;
+    }
+    return sample_input_node.zeros();
+}
+
+std::vector<matrix> matrix::build_grad_graph(std::vector<matrix>& output_nodes, std::vector<matrix>& sample_input_nodes) {
+    std::vector<matrix> topo;
+    std::unordered_set<void*> visited;
+    std::unordered_map<void*, matrix> grads;
+    
+    auto get_id = [](const matrix& m) -> void* {
+        return m.tape ? m.tape : m.buffer;
+    };
+    
+    std::function<void(matrix&)> dfs = [&](matrix& m) {
+        void* uuid = get_id(m);
+        if (visited.count(uuid)) return;
+        visited.insert(uuid);
+        if (m.tape) {
+            for (auto& inp : m.tape->get_inputs()) {
+                dfs(inp);
+            }
+        }
+        topo.push_back(m);
+    };
+    
+    for (auto& output_node : output_nodes) {
+        dfs(output_node);
+        grads.insert({get_id(output_node), output_node.ones()});
+    }
+    
+    
+    for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
+        matrix& m = *it;
+        if (!m.tape) { continue; }
+        matrix current_grad = grads.at(get_id(m));
+        
+        auto input_grads = m.tape->vjp(current_grad);
+        auto inputs = m.tape->get_inputs();
+        
+        for (int i = 0; i < inputs.size(); i++) {
+            void* in_id = get_id(inputs[i]);
+            auto it = grads.find(in_id);
+            if (it != grads.end()) {
+                // Already exists, accumulate!
+                it->second = it->second + input_grads[i];
+            } else {
+                // Doesn't exist, safely insert it!
+                grads.insert({in_id, input_grads[i]});
+            }
+        }
+    }
+    std::vector<matrix> grad_out;
+    
+    for (auto& sample_input_node: sample_input_nodes) {
+        auto it = grads.find(get_id(sample_input_node));
+        if (it != grads.end()) {
+            grad_out.push_back(it->second);
+        } else {
+            // If it wasn't used in the graph, the gradient is just 0 but was part of the function to be derivated like f(x,y)=x^2 ; y isnt used so not part of graph but part of function
+            grad_out.push_back(sample_input_node.zeros());
+        }
+    }
+    return grad_out;
+}
+
+
+std::function<std::vector<matrix>(const std::vector<matrix>)> matrix::grad_graph_gpu(std::function<std::vector<matrix>(std::vector<matrix>)> func, const std::vector<matrix>& sample_inputs) {
+    
+    std::vector<matrix> inner_samples = sample_inputs;
+
+    for (auto& sample : inner_samples) {
+        if (sample.tape) {
+            sample.eval_metal();
+        }
+        sample.begin_refcount();
+        sample.tape = new SwapLeafPrimitive(sample);
+    }
+    
+    std::vector<matrix> inner_outputs = func(inner_samples);
+    std::vector<matrix> grad_outputs = build_grad_graph(inner_outputs, inner_samples);
+    
+    for (auto& o : grad_outputs) {
+        o.compile_metal();
+    }
+    for (auto& sample : inner_samples) {
+        sample.releaseBuffer();
+    }
+    
+    return [inner_samples, grad_outputs](const std::vector<matrix>& inputs) mutable -> std::vector<matrix> {
+        std::vector<matrix> mutable_inputs = inputs;
+        for (auto& i: mutable_inputs){
+            if (i.buffer) {
+                i.begin_refcount();
+            }
+        }
+        
+        std::vector<matrix> grad_outer_outputs;
+        for (auto& o : grad_outputs) {
+            matrix out(o.dims, o.type);
+            out.set_array_desc(o.array_desc);
+            out.total_size = o.total_size;
+            out.flags = o.flags;
+            grad_outer_outputs.push_back(out);
+        }
+        
+        std::vector<MultiInputCompilePrimitive*> prims;
+        for (size_t i = 0; i < grad_outer_outputs.size(); i++) {
+            prims.push_back(new MultiInputCompilePrimitive(mutable_inputs, inner_samples, grad_outputs, grad_outer_outputs, i));
+        }
+        
+        // Patch the tape pointers on the local outer_outputs and the copies stored inside the primitives
+        for (size_t i = 0; i < grad_outer_outputs.size(); i++) {
+            grad_outer_outputs[i].tape = prims[i];
+            for (auto p : prims) {
+                p->outer_outputs[i].tape = prims[i];
+                p->siblings = prims;
+            }
+        }
+        
+        return grad_outer_outputs;
+    };
+}
+
 //    static matrix matrix::withShape(std::initializer_list<size_m> shape, dtype
 //    type) {
 //        matrix output(shape.size(), type);
@@ -485,35 +1331,103 @@ size_t matrix::effectiveBufferSize() const {
 //    }
 
 void matrix::print()  {
-    update_from_trace();
-    if (!buffer || dims == 0)
+    eval();
+    if (!buffer)
         return;
+    
     
     // The single dispatch call that handles the type erasure
     dispatch_type(this->type, this->buffer, [&](auto *typed_data) {
         // Extract the exact C++ type we are currently working with
         using T = std::decay_t<decltype(*typed_data)>;
-        
-        // 1. PRE-PASS: Find the maximum character width for alignment
-        uint32_t max_width = 0;
-        for (size_t i = 0; i < total_size; ++i) {
-            std::ostringstream oss;
-            // Treat chars as numbers for printing
-            if constexpr (std::is_same_v<T, char> ||
-                          std::is_same_v<T, unsigned char> ||
-                          std::is_same_v<T, int8_t>) {
-                oss << static_cast<int>(typed_data[i]);
-            } else {
-                oss << typed_data[i];
-            }
-            
-            uint32_t current_length = (uint32_t)oss.str().length();
-            if (current_length > max_width)
-                max_width = current_length;
-        }
-        
         const size_m *s = shape();
         const size_m *st = strides();
+        // 1. PRE-PASS: Find the maximum character width for alignment
+        uint32_t max_width = 0;
+        if (!(flags & NON_CONTIGUOUS_FLAG)) {
+            for (size_t i = 0; i < total_size; ++i) {
+                std::ostringstream oss;
+                // Treat chars as numbers for printing
+                if constexpr (std::is_same_v<T, char> ||
+                              std::is_same_v<T, unsigned char> ||
+                              std::is_same_v<T, int8_t>) {
+                    oss << static_cast<int>(typed_data[i]);
+                } else {
+                    oss << typed_data[i];
+                }
+                
+                uint32_t current_length = (uint32_t)oss.str().length();
+                if (current_length > max_width)
+                    max_width = current_length;
+            }
+            
+        } else {
+            
+            if (dims == 1) {
+                for (size_t i = 0; i < s[0]; i++) {
+                    std::ostringstream oss;
+                    if constexpr (std::is_same_v<T, char> ||
+                                  std::is_same_v<T, unsigned char> ||
+                                  std::is_same_v<T, int8_t>) {
+                        oss << static_cast<int>(typed_data[st[0]*i]);
+                    } else {
+                        oss << typed_data[st[0]*i];
+                    }
+                    uint32_t l = (uint32_t)oss.str().length();
+                    if (l > max_width) max_width = l;
+                }
+
+            } else if (dims == 2) {
+                for (size_t i = 0; i < s[0]; i++)
+                for (size_t j = 0; j < s[1]; j++) {
+                    std::ostringstream oss;
+                    if constexpr (std::is_same_v<T, char> ||
+                                  std::is_same_v<T, unsigned char> ||
+                                  std::is_same_v<T, int8_t>) {
+                        oss << static_cast<int>(typed_data[st[0]*i + st[1]*j]);
+                    } else {
+                        oss << typed_data[st[0]*i + st[1]*j];
+                    }
+                    uint32_t l = (uint32_t)oss.str().length();
+                    if (l > max_width) max_width = l;
+                }
+
+            } else if (dims == 3) {
+                for (size_t i = 0; i < s[0]; i++)
+                for (size_t j = 0; j < s[1]; j++)
+                for (size_t k = 0; k < s[2]; k++) {
+                    std::ostringstream oss;
+                    if constexpr (std::is_same_v<T, char> ||
+                                  std::is_same_v<T, unsigned char> ||
+                                  std::is_same_v<T, int8_t>) {
+                        oss << static_cast<int>(typed_data[st[0]*i + st[1]*j + st[2]*k]);
+                    } else {
+                        oss << typed_data[st[0]*i + st[1]*j + st[2]*k];
+                    }
+                    uint32_t l = (uint32_t)oss.str().length();
+                    if (l > max_width) max_width = l;
+                }
+
+            } else if (dims == 4) {
+                for (size_t l = 0; l < s[0]; l++)
+                for (size_t i = 0; i < s[1]; i++)
+                for (size_t j = 0; j < s[2]; j++)
+                for (size_t k = 0; k < s[3]; k++) {
+                    std::ostringstream oss;
+                    if constexpr (std::is_same_v<T, char> ||
+                                  std::is_same_v<T, unsigned char> ||
+                                  std::is_same_v<T, int8_t>) {
+                        oss << static_cast<int>(typed_data[st[0]*l + st[1]*i + st[2]*j + st[3]*k]);
+                    } else {
+                        oss << typed_data[st[0]*l + st[1]*i + st[2]*j + st[3]*k];
+                    }
+                    uint32_t len = (uint32_t)oss.str().length();
+                    if (len > max_width) max_width = len;
+                }
+            }
+        }
+        
+
         
         // Tiny helper to print a single element with correct width and casting
         auto print_elem = [&](size_t flat_index) {
@@ -528,7 +1442,11 @@ void matrix::print()  {
         };
         
         // 2. YOUR HARDCODED LOOPS (Strictly typed, zero branching!)
-        if (dims == 1) {
+        if (dims == 0) {
+            std::cout << "matrix: 0D \n";
+            print_elem(0);
+            std::cout << " \n";
+        } else if (dims == 1) {
             std::cout << "{ ";
             for (size_t i = 0; i < s[0]; i++) {
                 print_elem(st[0] * i);
@@ -568,8 +1486,11 @@ void matrix::print()  {
             }
             std::cout << "\n}\n";
         } else if (dims == 4) {
+            std::cout << "{ \n";
             for (size_t l = 0; l < s[0]; l++) {
+                std::cout << "  { \n";
                 for (size_t i = 0; i < s[1]; i++) {
+                    std::cout << "      { ";
                     for (size_t j = 0; j < s[2]; j++) {
                         std::cout << "{ ";
                         for (size_t k = 0; k < s[3]; k++) {
@@ -578,10 +1499,13 @@ void matrix::print()  {
                         }
                         std::cout << "} ";
                     }
+                    std::cout << "} ";
                     std::cout << "\n";
                 }
-                std::cout << "\n";
+                std::cout << "  } \n";
+                
             }
+            std::cout << "}";
         } else {
             std::cerr << "Printing only supported up to 4D matrices.\n";
         }
@@ -591,7 +1515,8 @@ void matrix::print()  {
 inline void setBufferOrBytes(id<MTLComputeCommandEncoder> commandEncoder,
                              const matrix &tensor, NSUInteger index) {
     if (tensor.metalBuffer) {
-        [commandEncoder setBuffer:tensor.metalBuffer offset:0 atIndex:index];
+        NSUInteger offset = (uint8_t*)tensor.buffer - (uint8_t*)[tensor.metalBuffer contents];
+        [commandEncoder setBuffer:tensor.metalBuffer offset:offset atIndex:index];
     } else {
         [commandEncoder setBytes:tensor.buffer length:tensor.effectiveBufferSize() * dtype_size(tensor.type) atIndex:index];
     }
@@ -639,11 +1564,6 @@ inline void setBufferOrBytes(id<MTLComputeCommandEncoder> commandEncoder,
 
 matrix matrix::ones() const {
     matrix output(dims, type);
-    
-    if (output.dims > SBO_MAX_DIMS) {
-        output.array_desc.shared_arr_desc =
-        SharedArrayDescriptor::create(output.dims);
-    }
     memcpy(output.shape(), shape(), dims * sizeof(size_m));
     output.calcStrides();
     output.total_size = output.accumul(0, dims);
@@ -659,11 +1579,6 @@ matrix matrix::ones() const {
 
 matrix matrix::zeros() const {
     matrix output(dims, type);
-    
-    if (output.dims > SBO_MAX_DIMS) {
-        output.array_desc.shared_arr_desc =
-        SharedArrayDescriptor::create(output.dims);
-    }
     memcpy(output.shape(), shape(), dims * sizeof(size_m));
     output.calcStrides();
     output.total_size = output.accumul(0, dims);
@@ -674,6 +1589,35 @@ matrix matrix::zeros() const {
     memset(output.buffer, 0, output.total_size * dtype_size(type));
     return output;
 }
+
+matrix matrix::eye(uint m, uint n, int k, dtype type ) {
+    matrix output = matrix::zeros({ m, n }, type);
+    uint iteration = MIN(m, n-std::abs(k));
+    dispatch_type(type, output.buffer, [&](auto *outBuff) {
+        
+        if (0 <= k) {
+            for (int i = 0; i < iteration; i++) {
+                // [i, j+k]
+                outBuff[i * output.shape()[1] + i + k] = 1;
+            }
+
+        } else {
+            for (int i = 0; i < iteration; i++) {
+                // [i, i-abs(k)] => same as shifting it down => [i+abs(k), i]
+                // Since k is -ve => [i-k, i]
+                // Moving the Diagnol Left is Same as moving it above as y = (x + k) ==> (y - k) = x
+                outBuff[(i - k) * output.shape()[1] + i] = 1;
+            }
+        }
+    });
+
+    return output;
+}
+
+matrix matrix::eye(uint m, dtype type ) {
+    return matrix::eye(m, m, 0, type);
+}
+
 
 //    static matrix repeating(std::initializer_list<size_m> shapeI, const
 //    matrix& pattern) {
@@ -813,16 +1757,68 @@ matrix matrix::zeros() const {
 //        result.buildMetalBuffer();
 //        return result;
 //    }
-
-matrix
-matrix::slice(std::initializer_list<std::optional<std::pair<size_m, size_m>>>
-              slice_range) {
+matrix matrix::slice(R slice_range, int slice_axis) {
+    update_from_trace();
     matrix slicedMat = matrix(dims, type);
     const size_m *src_shape = this->shape();
     const size_m *src_strides = this->strides();
     size_m *dst_shape = slicedMat.shape();
     size_m *dst_strides = slicedMat.strides();
     
+    
+    size_t index = 0;
+    size_t offsets = 0;
+    memcpy(dst_shape, src_shape, dims * sizeof(size_m));
+    memcpy(dst_strides, src_strides, dims * sizeof(size_m));
+    
+    size_t actual_start = slice_range.start < 0 ? src_shape[slice_axis] + slice_range.start : slice_range.start;
+    size_t actual_end;
+    if (slice_range.is_all()) {
+        actual_start = 0;
+        actual_end = src_shape[slice_axis];
+    } else {
+        actual_end = slice_range.end < 0 ? src_shape[slice_axis] + slice_range.end : slice_range.end;
+    }
+    offsets = actual_start * src_strides[slice_axis];
+    dst_shape[slice_axis] = actual_end - actual_start;
+
+    slicedMat.total_size = slicedMat.accumul(0, dims);
+    slicedMat.flags |= NON_OWNERSHIP_FLAG;
+    slicedMat.flags |= NON_CONTIGUOUS_FLAG;
+    
+    std::vector<size_m> indices(2 * dims, 0);
+    indices[2* slice_axis] = actual_start;
+    indices[2* slice_axis + 1] = actual_end;
+    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, indices, slicedMat.total_size, offsets);
+    
+    return slicedMat;
+}
+
+
+matrix matrix::slice(array_descriptor slice_range, std::vector<size_m>& slice_indices, size_t offset) {
+    update_from_trace();
+    matrix slicedMat = matrix(dims, type);
+
+    slicedMat.array_desc = slice_range;
+    if (dims > SBO_MAX_DIMS) { slicedMat.array_desc.shared_arr_desc->refCount.fetch_add(1); }
+
+    slicedMat.total_size = slicedMat.accumul(0, dims);
+    slicedMat.flags |= NON_OWNERSHIP_FLAG;
+    slicedMat.flags |= NON_CONTIGUOUS_FLAG;
+    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, slice_indices, slicedMat.total_size, offset);
+
+    return slicedMat;
+}
+
+
+matrix matrix::slice(std::initializer_list<std::optional<std::pair<size_m, size_m>>> slice_range) {
+    update_from_trace();
+    matrix slicedMat = matrix(dims, type);
+    const size_m *src_shape = this->shape();
+    const size_m *src_strides = this->strides();
+    size_m *dst_shape = slicedMat.shape();
+    size_m *dst_strides = slicedMat.strides();
+    std::vector<size_m> indices(2 * dims, 0);
     size_t index = 0;
     size_t offsets = 0;
     for (auto i : slice_range) {
@@ -837,12 +1833,15 @@ matrix::slice(std::initializer_list<std::optional<std::pair<size_m, size_m>>>
                 << src_shape[index] << "of axis " << index << "\n";
             }
 #endif
+            indices[2 * index] = i->first;
+            indices[2 * index + 1] = i->second;
             dst_shape[index] = (i->second - i->first);
             offsets += i->first * src_strides[index];
         } else {
             dst_shape[index] = src_shape[index];
+            indices[2 * index + 1] = src_shape[index];
         }
-        
+
         index++;
     }
     if (slice_range.size() < dims) {
@@ -853,43 +1852,45 @@ matrix::slice(std::initializer_list<std::optional<std::pair<size_m, size_m>>>
     slicedMat.total_size = slicedMat.accumul(0, dims);
     slicedMat.flags |= NON_OWNERSHIP_FLAG;
     slicedMat.flags |= NON_CONTIGUOUS_FLAG;
-    slicedMat.buffer = (uint8_t *)buffer + offsets * dtype_size(type);
-    if (slicedMat.total_size > 10) {
-        slicedMat.buildMetalBuffer();
-    }
-    if (refCount) {
-        slicedMat.refCount = refCount;
-        refCount->fetch_add(1);
-    }
+    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, indices, slicedMat.total_size, offsets);
     return slicedMat;
 }
 
 matrix matrix::slice(std::initializer_list<R> slice_range) {
+    update_from_trace();
     matrix slicedMat = matrix(dims, type);
     const size_m *src_shape = this->shape();
     const size_m *src_strides = this->strides();
     size_m *dst_shape = slicedMat.shape();
     size_m *dst_strides = slicedMat.strides();
-    
+    std::vector<size_m> indices(2 * dims, 0);
     size_t index = 0;
     size_t offsets = 0;
     for (auto i : slice_range) {
-        if (!i.is_all()) {
-#ifdef SAFE_MODE
-            if (i->end > src_shape[index]) {
-                std::cerr << "matrix: index " << i->end << " excedes the shape "
-                << src_shape[index] << "of axis " << index << "\n";
-            }
-            if (i->start > src_shape[index]) {
-                std::cerr << "matrix: index " << i->start << " excedes the shape "
-                << src_shape[index] << "of axis " << index << "\n";
-            }
-#endif
-            dst_shape[index] = (uint32_t)(i.end - i.start);
-            offsets += i.start * src_strides[index];
+        size_t actual_start = i.start < 0 ? src_shape[index] + i.start : i.start;
+        size_t actual_end;
+        if (i.is_all()) {
+            actual_start = 0;
+            actual_end = src_shape[index];
         } else {
-            dst_shape[index] = src_shape[index];
+            actual_end = i.end < 0 ? src_shape[index] + i.end : i.end;
         }
+#ifdef SAFE_MODE
+        if (!i.is_all()) {
+            if (actual_end > src_shape[index]) {
+                std::cerr << "matrix: index " << actual_end << " excedes the shape "
+                << src_shape[index] << "of axis " << index << "\n";
+            }
+            if (actual_start > src_shape[index]) {
+                std::cerr << "matrix: index " << actual_start << " excedes the shape "
+                << src_shape[index] << "of axis " << index << "\n";
+            }
+        }
+#endif
+        indices[2 * index] = actual_start;
+        indices[2 * index + 1] = actual_end;
+        dst_shape[index] = (uint32_t)(actual_end - actual_start);
+        offsets += actual_start * src_strides[index];
         
         index++;
     }
@@ -901,15 +1902,242 @@ matrix matrix::slice(std::initializer_list<R> slice_range) {
     slicedMat.total_size = slicedMat.accumul(0, dims);
     slicedMat.flags |= NON_OWNERSHIP_FLAG;
     slicedMat.flags |= NON_CONTIGUOUS_FLAG;
-    slicedMat.buffer = (uint8_t *)buffer + offsets * dtype_size(type);
-    if (slicedMat.total_size > 10) {
-        slicedMat.buildMetalBuffer();
-    }
-    if (refCount) {
-        slicedMat.refCount = refCount;
-        refCount->fetch_add(1);
-    }
+    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, indices, slicedMat.total_size, offsets);
+
     return slicedMat;
+}
+
+matrix matrix::slice_assign(R slice_range, int slice_axis, const matrix& rhs) {
+    update_from_trace();
+    matrix outMat = matrix(dims, type);
+    memcpy(outMat.shape(), this->shape(), dims * sizeof(size_m));
+    memcpy(outMat.strides(), this->strides(), dims * sizeof(size_m));
+    outMat.total_size = this->total_size;
+
+    matrix virtual_slice = this->slice(slice_range, slice_axis);
+    SlicePrimitive* sp = static_cast<SlicePrimitive*>(virtual_slice.tape);
+    outMat.tape = new SliceAssignPrimitive(*this, rhs, virtual_slice.array_desc, sp->slice_indices, virtual_slice.total_size, sp->offset);
+    
+    return outMat;
+}
+
+matrix matrix::slice_assign(array_descriptor slice_range, std::vector<size_m>& slice_indices, size_t offset, const matrix& rhs) {
+    update_from_trace();
+    matrix outMat = matrix(dims, type);
+    memcpy(outMat.shape(), this->shape(), dims * sizeof(size_m));
+    memcpy(outMat.strides(), this->strides(), dims * sizeof(size_m));
+    outMat.total_size = this->total_size;
+
+    matrix virtual_slice = this->slice(slice_range, slice_indices, offset);
+    SlicePrimitive* sp = static_cast<SlicePrimitive*>(virtual_slice.tape);
+    outMat.tape = new SliceAssignPrimitive(*this, rhs, virtual_slice.array_desc, sp->slice_indices, virtual_slice.total_size, sp->offset);
+    
+    return outMat;
+}
+
+matrix matrix::slice_assign(std::initializer_list<std::optional<std::pair<size_m, size_m>>> slice_range, const matrix& rhs) {
+    update_from_trace();
+    matrix outMat = matrix(dims, type);
+    memcpy(outMat.shape(), this->shape(), dims * sizeof(size_m));
+    memcpy(outMat.strides(), this->strides(), dims * sizeof(size_m));
+    outMat.total_size = this->total_size;
+
+    matrix virtual_slice = this->slice(slice_range);
+    SlicePrimitive* sp = static_cast<SlicePrimitive*>(virtual_slice.tape);
+    outMat.tape = new SliceAssignPrimitive(*this, rhs, virtual_slice.array_desc, sp->slice_indices, virtual_slice.total_size, sp->offset);
+    
+    return outMat;
+}
+
+matrix matrix::slice_assign(std::initializer_list<R> slice_range, const matrix& rhs) {
+    update_from_trace();
+    matrix outMat = matrix(dims, type);
+    memcpy(outMat.shape(), this->shape(), dims * sizeof(size_m));
+    memcpy(outMat.strides(), this->strides(), dims * sizeof(size_m));
+    outMat.total_size = this->total_size;
+
+    matrix virtual_slice = this->slice(slice_range);
+    SlicePrimitive* sp = static_cast<SlicePrimitive*>(virtual_slice.tape);
+    outMat.tape = new SliceAssignPrimitive(*this, rhs, virtual_slice.array_desc, sp->slice_indices, virtual_slice.total_size, sp->offset);
+    
+    return outMat;
+}
+
+void matrix::padding(std::initializer_list<std::pair<size_m, size_m>> padding_range, matrix& padded_mat, const matrix& value, EvalType eval_type) {
+    update_from_trace();
+    const size_m *src_shape = this->shape();
+    const size_m *src_strides = this->strides();
+    size_m *dst_shape = padded_mat.shape();
+    size_m *dst_strides = padded_mat.strides();
+    if (eval_type == EvalType::EVAL_AUTO) {
+        for (int i = 0; i < padding_range.size(); i++) {
+            dst_shape[i] = src_shape[i] + (padding_range.begin() + i)->first + (padding_range.begin() + i)->second;
+        }
+        memcpy(dst_shape + padding_range.size(), src_shape + padding_range.size(), (dims - padding_range.size()) * sizeof(size_m));
+        padded_mat.calcStrides();
+        size_t offset = 0;
+        for (int i = 0; i < padding_range.size(); i++) {
+            offset += (padding_range.begin() + i)->first * src_strides[i];
+        }
+        padded_mat.total_size = padded_mat.accumul(0, dims);
+        
+        std::vector<size_m> pad_flat(dims * 2, 0);
+        for (int i = 0; i < dims; i++ ) {
+            pad_flat[2 * i] = (padding_range.begin() + i)->first;
+            pad_flat[2 * i + 1] = (padding_range.begin() + i)->first + src_shape[i];
+        }
+        memcpy(pad_flat.data() + padding_range.size(), src_shape + padding_range.size(), (dims - padding_range.size()) * sizeof(size_m));
+//        memcpy(pad_flat.data(), padding_range.begin(), padding_range.size() * sizeof(std::pair<size_m, size_m>));
+        padded_mat.tape = new PaddingPrimitive(*this, const_cast<matrix&>(value), offset, pad_flat);
+        return;
+    }
+    
+    PaddingPrimitive* prim = (PaddingPrimitive*)padded_mat.tape;
+    
+    
+    size_t elem_size = dtype_size(padded_mat.type);
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+
+    uint8_t typeCode = static_cast<int>(padded_mat.type);
+    
+    uint32_t cdims = padded_mat.dims;
+    
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    
+    auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+    auto _dispatchExecutionSize = MTLSizeMake(padded_mat.total_size, 1, 1);
+    setBufferOrBytes(commandEncoder, padded_mat, 0);
+    setBufferOrBytes(commandEncoder, *this, 1);
+    [commandEncoder setBytes:dst_strides length:cdims * sizeof(size_m) atIndex:2];
+    [commandEncoder setBytes:src_strides length:cdims * sizeof(size_m) atIndex:3];
+    [commandEncoder setBytes:prim->padding_range.data() length: 2 * cdims * sizeof(size_m) atIndex:4];
+    
+    [commandEncoder setBytes:&(prim->offset) length:sizeof(int) atIndex:5];
+    [commandEncoder setBytes:value.buffer length:dtype_size(value.type) atIndex:5];
+    if (cdims == 1) {
+        if (!GlobalGPUManager.CopyInplace[typeCode][0]) {
+            GlobalGPUManager.initPadding(typeCode, 0);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][0]];
+    } else if (cdims == 2) {
+        if (!GlobalGPUManager.CopyInplace[typeCode][1]) {
+            GlobalGPUManager.initPadding(typeCode, 1);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][1]];
+        _dispatchExecutionSize = MTLSizeMake(dst_shape[1], dst_shape[0], 1);
+
+    } else if (cdims == 3) {
+        if (!GlobalGPUManager.CopyInplace[typeCode][2]) {
+            GlobalGPUManager.initPadding(typeCode, 2);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][2]];
+        _dispatchExecutionSize = MTLSizeMake(dst_shape[2], dst_shape[1], dst_shape[0]);
+        
+    } else {
+        if (!GlobalGPUManager.CopyInplace[typeCode][3]) {
+            GlobalGPUManager.initPadding(typeCode, 3);
+        }
+        size_m acc = 1;
+        for (int i = 0; i < cdims - 2; i++) {
+            acc *= dst_shape[i];
+        }
+        _dispatchExecutionSize = MTLSizeMake(dst_shape[cdims - 1], dst_shape[cdims - 2], acc);
+        [commandEncoder setBytes:dst_shape length:cdims * sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:6];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][2]];
+    }
+    
+    [commandEncoder dispatchThreads:_dispatchExecutionSize
+              threadsPerThreadgroup:_threadsPerThreadgroup];
+    
+}
+
+void matrix::padding(std::vector<size_m>& padding_range, matrix& padded_mat, const matrix& value, EvalType eval_type) {
+    update_from_trace();
+    const size_m *src_shape = this->shape();
+    const size_m *src_strides = this->strides();
+    size_m *dst_shape = padded_mat.shape();
+    size_m *dst_strides = padded_mat.strides();
+    if (eval_type == EvalType::EVAL_AUTO) {
+        for (int i = 0; i < padding_range.size(); i+=2) {
+            dst_shape[i] = src_shape[i] + padding_range[i] + padding_range[i+1];
+        }
+        memcpy(dst_shape + padding_range.size(), src_shape + padding_range.size(), (dims - padding_range.size()) * sizeof(size_m));
+        padded_mat.calcStrides();
+        size_t offset = 0;
+        for (int i = 0; i < padding_range.size(); i+=2) {
+            offset += padding_range[i] * src_strides[i];
+        }
+        padded_mat.total_size = padded_mat.accumul(0, dims);
+        padded_mat.tape = new PaddingPrimitive(*this, const_cast<matrix&>(value), offset, padding_range);
+        return;
+    }
+    
+    PaddingPrimitive* prim = (PaddingPrimitive*)padded_mat.tape;
+    
+
+    
+    size_t elem_size = dtype_size(padded_mat.type);
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+
+    uint8_t typeCode = static_cast<int>(padded_mat.type);
+    
+    uint32_t cdims = padded_mat.dims;
+    
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    
+    auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+    auto _dispatchExecutionSize = MTLSizeMake(padded_mat.total_size, 1, 1);
+    setBufferOrBytes(commandEncoder, padded_mat, 0);
+    setBufferOrBytes(commandEncoder, *this, 1);
+    [commandEncoder setBytes:dst_strides length:cdims * sizeof(size_m) atIndex:2];
+    [commandEncoder setBytes:src_strides length:cdims * sizeof(size_m) atIndex:3];
+    [commandEncoder setBytes:prim->padding_range.data() length: 2 * cdims * sizeof(size_m) atIndex:4];
+    
+    [commandEncoder setBytes:&(prim->offset) length:sizeof(int) atIndex:5];
+    [commandEncoder setBytes:value.buffer length:dtype_size(value.type) atIndex:6];
+    if (cdims == 1) {
+        if (!GlobalGPUManager.PaddingInit[typeCode][0]) {
+            GlobalGPUManager.initPadding(typeCode, 0);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][0]];
+    } else if (cdims == 2) {
+        if (!GlobalGPUManager.PaddingInit[typeCode][1]) {
+            GlobalGPUManager.initPadding(typeCode, 1);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][1]];
+        _dispatchExecutionSize = MTLSizeMake(dst_shape[1], dst_shape[0], 1);
+
+    } else if (cdims == 3) {
+        if (!GlobalGPUManager.PaddingInit[typeCode][2]) {
+            GlobalGPUManager.initPadding(typeCode, 2);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][2]];
+        _dispatchExecutionSize = MTLSizeMake(dst_shape[2], dst_shape[1], dst_shape[0]);
+        
+    } else {
+        if (!GlobalGPUManager.PaddingInit[typeCode][3]) {
+            GlobalGPUManager.initPadding(typeCode, 3);
+        }
+        size_m acc = 1;
+        for (int i = 0; i < cdims - 2; i++) {
+            acc *= dst_shape[i];
+        }
+        _dispatchExecutionSize = MTLSizeMake(dst_shape[cdims - 1], dst_shape[cdims - 2], acc);
+        [commandEncoder setBytes:dst_shape length:cdims * sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:6];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][2]];
+    }
+    
+    [commandEncoder dispatchThreads:_dispatchExecutionSize
+              threadsPerThreadgroup:_threadsPerThreadgroup];
+    
+}
+
+matrix matrix::padding(std::vector<size_m>& padding_range, const matrix& value) {
+    matrix padded_mat(dims, type);
+    padding(padding_range, padded_mat, value);
+    return padded_mat;
 }
 
 matrix matrix::broadcast_to(const size_m *target_shape, int target_dims) const {
@@ -918,6 +2146,7 @@ matrix matrix::broadcast_to(const size_m *target_shape, int target_dims) const {
     
     matrix view(target_dims, type);
     view.tape = tape;
+    if (view.tape) view.tape->primitive_refCount.fetch_add(1, std::memory_order_relaxed);
     view.flags = flags | NON_OWNERSHIP_FLAG | NON_CONTIGUOUS_FLAG;
     view.buffer = buffer;
     view.metalBuffer = metalBuffer;
@@ -968,28 +2197,68 @@ matrix matrix::broadcast_to(const size_m *target_shape, int target_dims) const {
     return view;
 }
 
-matrix matrix::operator[](Range range) {
-    if (dims == 1) {
-        matrix view(1, type);
-        view.type = type;
-        view.tape = tape;
-        view.flags = flags | NON_OWNERSHIP_FLAG;
-        return view;
-    } else {
-        return slice({range});
+std::pair<matrix, matrix> matrix::meshgrid(const matrix& x, const matrix& y, bool sparse) {
+    int num = 2;
+    
+    size_m out_shape[num * x.dims];
+//    out_shape = [Y.shape | X.shape]
+    
+    memcpy(out_shape, y.shape(), y.dims * sizeof(size_m));
+    memcpy(out_shape + y.dims, x.shape(), x.dims * sizeof(size_m));
+    
+    matrix X = x.broadcast_toV2(out_shape, num * x.dims);
+    uint32_t axii[x.dims];
+    for (uint32_t i = 0; i < x.dims; i++) {
+        axii[i] = i + y.dims;
     }
+    matrix Y_unsq = y.unsqueeze(axii, x.dims);
+    if (sparse) return {x, Y_unsq};
+    
+    matrix Y = Y_unsq.broadcast_toV2(out_shape, num * x.dims);
+    return {X, Y};
+}
+
+std::tuple<matrix, matrix, matrix> matrix::meshgrid(const matrix& x, const matrix& y, const matrix& z, bool sparse) {
+    int total_dims = x.dims + y.dims + z.dims;
+    
+    size_m out_shape[total_dims];
+    memcpy(out_shape, z.shape(), z.dims * sizeof(size_m));
+    memcpy(out_shape + z.dims, y.shape(), y.dims * sizeof(size_m));
+    memcpy(out_shape + z.dims + y.dims, x.shape(), x.dims * sizeof(size_m));
+    // out_shape = [Z.shape | Y.shape | X.shape]
+
+    
+    // careful: unsqueeze axes are in the NEW tensor's index space
+    // Y starts as (m,), we want (m, 1) so axis = y.dims = 1
+    uint32_t y_axes[x.dims];
+    for (uint32_t i = 0; i < x.dims; i++)
+        y_axes[i] = y.dims + i;          // (m,) → (m, 1)
+    matrix Y_unsq = y.unsqueeze(y_axes, x.dims);
+
+    // Z: append y.dims + x.dims axes
+    uint32_t z_axes[y.dims + x.dims];
+    for (uint32_t i = 0; i < y.dims + x.dims; i++)
+        z_axes[i] = z.dims + i;          // (p,) → (p, 1, 1)
+    matrix Z_unsq = z.unsqueeze(z_axes, y.dims + x.dims);
+
+    if (sparse) return {x, Y_unsq, Z_unsq};
+
+    matrix X_out = x.broadcast_toV2(out_shape, total_dims);
+    matrix Y_out = Y_unsq.broadcast_toV2(out_shape, total_dims);
+    matrix Z_out = Z_unsq.broadcast_toV2(out_shape, total_dims);
+    return {X_out, Y_out, Z_out};
+}
+
+matrix matrix::operator[](Range range) {
+    return slice({range});
 }
 matrix matrix::operator[](Range range1, Range range2) {
-    if (dims == 1) {
-        matrix view(1, type);
-        view.type = type;
-        view.tape = tape;
-        view.flags = flags | NON_OWNERSHIP_FLAG;
-        return view;
-    } else {
-        return slice({range1, range2});
-    }
+    return slice({range1, range2});
 }
+matrix matrix::operator[](Range range1, Range range2, Range range3) {
+    return slice({range1, range2, range3});
+}
+
 matrix matrix::operator[](int i, int j) const {
 #ifdef SAFE_MODE
     if (i < 0) {
@@ -1049,9 +2318,8 @@ void matrix::CopyToTexture(id<MTLTexture> texture, Execution exec) {
         source_offset = (uint8_t *)buffer - (uint8_t *)metalBuffer.contents;
     }
     
-    id<MTLCommandBuffer> commandBuffer =
-    [GlobalGPUManager.gCommandQueue commandBuffer];
-    
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    GlobalGPUManager.endCommandEncoding();
     id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
     
     [blitEncoder copyFromBuffer:metalBuffer
@@ -1067,6 +2335,7 @@ void matrix::CopyToTexture(id<MTLTexture> texture, Execution exec) {
     if (exec == Execution::EncodeAndExecute) {
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
+        GlobalGPUManager.gCommandBuffer = nil;
     }
 }
 
@@ -1081,8 +2350,7 @@ id<MTLTexture> matrix::ToMTLTexture(Execution exec) {
     // Use shared storage so the CPU can read the texture data.
     drawableDesc.storageMode = MTLStorageModeShared;
     
-    resultTexture =
-    [GlobalGPUManager.metalDevice newTextureWithDescriptor:drawableDesc];
+    resultTexture = [GlobalGPUManager.metalDevice newTextureWithDescriptor:drawableDesc];
     
     CopyToTexture(resultTexture, exec);
     return resultTexture;
@@ -1578,6 +2846,1833 @@ void matrix::begin_refcount() {
         return;
     refCount = new std::atomic<uint32_t>(1);
 }
+void matrix::stack(const std::vector<matrix>& mats, matrix& output, int axis, EvalType eval_type, ExecutionDevice exec_device) {
+#ifdef SAFE_MODE
+    if (output.dims != mats[0].dims + 1) {
+        throw std::invalid_argument("matrix::stack: output dims must be input dims + 1");
+    }
+    for (size_t i = 1; i < mats.size(); i++) {
+        if (mats[i].dims != mats[0].dims) {
+            throw std::invalid_argument("matrix::stack: all input matrices must have same dims");
+        }
+        if (mats[i].type != mats[0].type) {
+            throw std::invalid_argument("matrix::stack: all input matrices must have same type");
+        }
+        for (uint32_t d = 0; d < mats[0].dims; d++) {
+            if (mats[i].shape()[d] != mats[0].shape()[d]) {
+                throw std::invalid_argument("matrix::stack: all input matrices must have same shape");
+            }
+        }
+    }
+    if (axis < 0 || (uint32_t)axis > mats[0].dims) {
+        throw std::invalid_argument("matrix::stack: axis out of range");
+    }
+#endif
+    
+    size_m* out_shape = output.shape();
+    if (eval_type == EvalType::EVAL_AUTO) {
+        memcpy(out_shape, mats[0].shape(), axis * sizeof(size_m));
+        memcpy(out_shape + (axis + 1), mats[0].shape() + (axis), (mats[0].dims - axis) * sizeof(size_m));
+        out_shape[axis] = (size_m)mats.size();
+        output.total_size = mats[0].total_size * mats.size();
+        output.calcStrides();
+        
+        output.tape = new StackPrimitive(mats, axis);
+        
+        return;
+    }
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = output.total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    if (!output.buffer) {
+        // strides are the property of buffer and should be calculated with its total size in mind;
+        // Fix for garbage point clouds: newBufferWithBytesNoCopy requires page-aligned memory.
+        size_t sizeBytes = mats[0].total_size * mats.size() * dtype_size(output.type);
+        size_t pageSize = sysconf(_SC_PAGESIZE);
+        // Round up to full page size for safety (though just alignment is strictly required for address)
+        size_t alignedSize = (sizeBytes + pageSize - 1) & ~(pageSize - 1);
+        
+        void* raw_mem = nullptr;
+        if (posix_memalign(&raw_mem, pageSize, alignedSize) != 0) {
+            std::cerr << "MatrixH: Failed to allocate aligned memory" << "\n";
+            throw std::bad_alloc();
+        }
+        
+        output.buffer = raw_mem;
+        output.total_size = mats[0].total_size * mats.size();
+        output.flags |= NON_OWNERSHIP_FLAG;
+        
+        output.metalBuffer = [GlobalGPUManager.metalDevice newBufferWithBytesNoCopy:raw_mem
+                                                                             length:alignedSize
+                                                                            options:MTLResourceStorageModeShared
+                                                                        deallocator:^(void * _Nonnull pointer, NSUInteger length) {
+            free(pointer);
+        }];
+    }
+    if (eval_type == EvalType::COMPILE_TRACE) { return; }
+    
+    output.flags |= NON_CONTIGUOUS_FLAG;
+    out_shape[axis] = 1;
+    output.total_size = mats[0].total_size;
+    
+    matrix View(output.dims, output.type);
+    memcpy(View.shape(), out_shape, (output.dims+1) * sizeof(size_m));
+    View.shape()[axis] = 1;
+    View.calcStrides();
+    View.total_size = mats[0].total_size;
+    View.flags |= NON_OWNERSHIP_FLAG;
+    
+    size_m offset = output.strides()[axis];
+    if (exec_device == ExecutionDevice::METAL) {
+        for (int i = 0; i < mats.size(); i++) {
+            View.buffer = mats[i].buffer;
+            View.metalBuffer = mats[i].metalBuffer;
+            copyGPUinplace(output, View, i * offset, Execution::Encode);
+        }
+    } else {
+        for (int i = 0; i < mats.size(); i++) {
+            View.buffer = mats[i].buffer;
+            View.metalBuffer = mats[i].metalBuffer;
+            copyCPUinplace(output, View, i * offset);
+        }
+    }
+    
+    output.shape()[axis] = (size_m)mats.size();
+    output.total_size = mats[0].total_size * mats.size();
+    output.flags &= ~NON_CONTIGUOUS_FLAG;
+}
+
+matrix matrix::stackGPU(const std::vector<matrix>& mats, int axis, EvalType eval_type) {
+    matrix output(mats[0].dims+1, mats[0].type);
+    stack(mats, output, axis, eval_type, ExecutionDevice::METAL);
+    return output;
+}
+matrix matrix::stackCPU(const std::vector<matrix>& mats, int axis, EvalType eval_type) {
+    matrix output(mats[0].dims+1, mats[0].type);
+    stack(mats, output, axis, eval_type, ExecutionDevice::CPU);
+    return output;
+}
+
+matrix matrix::concat(const std::vector<matrix>& mats, int axis) {
+    matrix output(mats[0].dims, mats[0].type);
+    memcpy(output.shape(), mats[0].shape(), sizeof(size_m) * output.dims);
+    for (int i = 1; i < mats.size(); i++) {
+        output.shape()[axis] += mats[i].shape()[axis];
+    }
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+    output.tape = new ConcatPrimitive(mats, axis);
+    return output;
+}
+
+void matrix::concat(const std::vector<matrix>& mats, matrix& output, int axis, ExecutionDevice exec_device) {
+#ifdef SAFE_MODE
+    assert(mats.size() > 0 && "concat: empty input vector");
+    assert(axis >= 0 && axis < mats[0].dims && "concat: axis out of bounds");
+    
+    for (int i = 1; i < mats.size(); i++) {
+        assert(mats[i].dims == mats[0].dims && "concat: all inputs must have same ndim");
+        assert(mats[i].type == mats[0].type && "concat: all inputs must have same dtype");
+        for (int d = 0; d < mats[0].dims; d++) {
+            if (d == axis) continue;
+            assert(mats[i].shape()[d] == mats[0].shape()[d] && "concat: shape mismatch on non-axis dim");
+        }
+    }
+#endif
+    
+    
+    matrix View(output.dims, output.type);
+    View.flags |= NON_OWNERSHIP_FLAG;
+    View.flags |= NON_CONTIGUOUS_FLAG;
+    View.flags |= NON_CONTIGUOUS_FLAG;
+    size_m prev_outaxis_shape = output.shape()[axis];
+    size_m prev_out_size = output.total_size;
+    size_m offset = 0;
+    if (exec_device == ExecutionDevice::METAL) {
+        for (int i = 0; i < mats.size(); i++) {
+            View.set_array_desc(mats[i].array_desc);
+            View.total_size = mats[i].total_size;
+            View.buffer = mats[i].buffer;
+            View.metalBuffer = mats[i].metalBuffer;
+            output.shape()[axis] = View.shape()[axis];
+            output.total_size = View.total_size;
+            copyGPUinplace(output, View, offset, Execution::Encode);
+            offset += View.accumul(axis, output.dims);
+        }
+    } else {
+        for (int i = 0; i < mats.size(); i++) {
+            View.set_array_desc(mats[i].array_desc);
+            View.total_size = mats[i].total_size;
+            View.buffer = mats[i].buffer;
+            View.metalBuffer = mats[i].metalBuffer;
+            output.shape()[axis] = View.shape()[axis];
+            output.total_size = View.total_size;
+            copyCPUinplace(output, View, offset);
+            offset += View.accumul(axis, output.dims);
+        }
+    }
+    
+    output.shape()[axis] = prev_outaxis_shape;
+    output.total_size = prev_out_size;
+    output.flags &= ~NON_CONTIGUOUS_FLAG;
+}
+
+void matrix::SumNoRed(matrix& output, int axis, EvalType eval_type) {
+    if (dims == 0) {
+        if (eval_type == EvalType::EVAL_AUTO) {
+            output.total_size = 1;
+            // Reusing SumPrimitive is perfect here so the autograd tape still connects
+            output.tape = new SumPrimitive(*this, axis, true);
+        } else {
+            // The mathematical sum of a scalar is just the scalar itself.
+            // Copy the single element natively on the GPU without a sum kernel.
+            copyGPUinplace(output, *this, 0, Execution::Encode);
+        }
+        return;
+    }
+    if (eval_type == EvalType::EVAL_AUTO) {
+        if (axis < 0){
+            axis += dims;
+        }
+        if ((dims-1 < axis)) {
+            std::cerr << "MatrixH: Axis should not excede Dims of " << dims << "\n";
+            throw;
+        }
+        
+        
+        if (!GlobalGPUManager.SumInit[(int)type]) {
+            GlobalGPUManager.initSum_All((int)type);
+        }
+        
+        memcpy(output.shape(), shape(), dims * sizeof(size_m));
+        output.shape()[axis] = 1;
+        output.total_size = output.accumul(0, dims);
+        output.calcStrides();
+        output.tape = new SumPrimitive(*this, axis, true);
+        return;
+    }
+        
+    size_m ElStride = accumul(axis+1, dims);
+
+    size_m noOfOpp = shape()[axis];
+    
+    size_m axisStride;
+    if (axis != dims-1) {
+        axisStride = 1;
+    }
+    else {
+        axisStride = shape()[axis];
+    }
+    
+
+//    std::cout << "AxStride: " << axisStride << " ElStride: " << ElStride << " noOfOpp: " << noOfOpp << "\n";
+//    printArray(inputStrides, dims-1);
+//    printArray(maskedStrides, dims-1);
+
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+
+    auto _threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+    auto _dispatchExecutionSize =  MTLSizeMake(output.total_size, 1, 1);
+
+    size_t outputDims = dims -1;
+    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, *this, 1);
+    
+    [commandEncoder setBytes:&axisStride length: sizeof(size_m) atIndex:2];
+    [commandEncoder setBytes:&ElStride length: sizeof(size_m) atIndex:3];
+    [commandEncoder setBytes:&noOfOpp length: sizeof(size_m) atIndex:4];
+    if (dims > 1) {
+        size_m inputStrides[dims-1];
+        size_t acc = 1;
+        for (int i = dims-2; i >= 0; i--) {
+            inputStrides[i] = acc;
+            acc *= output.shape()[i];
+        }
+
+        size_m maskedStrides[dims-1];
+        memcpy(maskedStrides, inputStrides, sizeof(size_m) * (dims-1));
+
+        acc = 1;
+        for (int i = 0; i < axis; i++) {
+            maskedStrides[i] *= shape()[axis];
+        }
+        [commandEncoder setBytes:&inputStrides length: (dims-1) * sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:&maskedStrides length: (dims-1)* sizeof(size_m) atIndex:6];
+    } else {
+        size_m inpandmaskedStrides = 1;
+        [commandEncoder setBytes:&inpandmaskedStrides length: sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:&inpandmaskedStrides length:sizeof(size_m) atIndex:6];
+    }
+    [commandEncoder setBytes:&outputDims length:  sizeof(size_m) atIndex:7];
+    [commandEncoder setComputePipelineState:GlobalGPUManager.SumComputeState[(int)type]];
+    [commandEncoder dispatchThreads:_dispatchExecutionSize
+              threadsPerThreadgroup:_threadsPerThreadgroup];
+
+}
+
+void matrix::sum_legacy(matrix& output, int axis, bool keepdims, EvalType eval_type) {
+    if (!GlobalGPUManager.SumInit[(int)type]) {
+        GlobalGPUManager.initSum_All((int)type);
+    }
+    
+    if (dims == 0) {
+        if (eval_type == EvalType::EVAL_AUTO) {
+            output.total_size = 1;
+            // Reusing SumPrimitive is perfect here so the autograd tape still connects
+            output.tape = new SumPrimitive(*this, axis, keepdims);
+        } else {
+            // The mathematical sum of a scalar is just the scalar itself.
+            // Copy the single element natively on the GPU without a sum kernel.
+            copyGPUinplace(output, *this, 0, Execution::Encode);
+        }
+        return;
+    }
+    
+    if (eval_type == EvalType::EVAL_AUTO) {
+        if (axis < 0){
+            axis += dims;
+        }
+        if ((dims-1 < axis)) {
+            std::cerr << "MatrixH: Axis should not excede Dims of " << dims << "\n";
+            throw;
+        }
+        
+        
+
+        if (!keepdims) {
+            memcpy(output.shape(), shape(), axis * sizeof(size_m));
+            memcpy(output.shape() + axis, shape() + axis + 1, (dims-axis) * sizeof(size_m));
+            output.total_size = output.accumul(0, dims-1);
+        } else {
+            memcpy(output.shape(), shape(), dims * sizeof(size_m));
+            output.shape()[axis] = 1;
+            output.total_size = output.accumul(0, dims);
+        }
+        output.calcStrides();
+        output.tape = new SumPrimitive(*this, axis, false);
+        return;
+    }
+    
+    size_m ElStride = (size_m)accumul(axis+1, dims);
+
+    size_m noOfOpp = shape()[axis];
+    size_m axisStride;
+    if (axis != dims-1) {
+        axisStride = 1;
+    }
+    else {
+        axisStride = shape()[axis];
+    }
+
+
+//    std::cout << "AxStride: " << axisStride << " ElStride: " << ElStride << " noOfOpp: " << noOfOpp << "\n";
+//    printArray(inputStrides, dims-1);
+//    printArray(maskedStrides, dims-1);
+
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+
+    auto _threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+    auto _dispatchExecutionSize =  MTLSizeMake(output.total_size, 1, 1);
+
+    size_t outputDims = dims - 1;
+    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, *this, 1);
+    
+    [commandEncoder setBytes:&axisStride length: sizeof(size_m) atIndex:2];
+    [commandEncoder setBytes:&ElStride length: sizeof(size_m) atIndex:3];
+    [commandEncoder setBytes:&noOfOpp length: sizeof(size_m) atIndex:4];
+    if (dims > 1) {
+        size_m inputStrides[dims-1];
+        size_t acc = 1;
+        for (int i = dims-2; i >= 0; i--) {
+            inputStrides[i] = acc;
+            acc *= output.shape()[i];
+        }
+
+        size_m maskedStrides[dims-1];
+        memcpy(maskedStrides, inputStrides, sizeof(size_m) * (dims-1));
+
+        acc = 1;
+        for (int i = 0; i < axis; i++) {
+            maskedStrides[i] *= shape()[axis];
+        }
+        [commandEncoder setBytes:&inputStrides length: (dims-1) * sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:&maskedStrides length: (dims-1)* sizeof(size_m) atIndex:6];
+    } else {
+        size_m inpandmaskedStrides = 1;
+        [commandEncoder setBytes:&inpandmaskedStrides length: sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:&inpandmaskedStrides length:sizeof(size_m) atIndex:6];
+    }
+    [commandEncoder setBytes:&outputDims length:  sizeof(size_m) atIndex:7];
+    [commandEncoder setComputePipelineState:GlobalGPUManager.SumComputeState[(int)type]];
+    [commandEncoder dispatchThreads:_dispatchExecutionSize
+              threadsPerThreadgroup:_threadsPerThreadgroup];
+
+}
+
+matrix matrix::sum_legacy(int axis, bool keepdims) {
+    if (dims == 0) {
+        matrix output(0, type); // Summing a scalar yields a scalar
+        sum_legacy(output, axis, keepdims);
+        return output;
+    }
+    int outputDims = keepdims ? dims : dims-1;
+    matrix output(outputDims, type);
+    sum_legacy(output, axis, keepdims);
+    return output;
+}
+
+matrix matrix::unbroadcast_shape(const size_m* target_shape, int target_dims) const {
+    matrix result = *this;
+    int rank_diff = dims - target_dims;
+    
+    if (rank_diff > 0) {
+        result = result.sum(0, rank_diff - 1, false);
+    }
+    
+    for (int i = 0; i < target_dims; i++) {
+        if (target_shape[i] == 1 && result.shape()[i] != 1) {
+            matrix summed(result.dims, result.type);
+            result.SumNoRed(summed, i);
+            result = summed;
+        }
+    }
+    
+    return result;
+}
+
+
+matrix matrix::conv1d(const matrix& input, const matrix& kernel, int padding, int stride, int dilation, int groups) {
+    // input shape [batch, X, channels]
+    // kernel shape [out_channel, x, in_channel]
+    // output shape [batch, X' , out_channel]
+    // in_channel = channels/groups
+    matrix output(input.dims, input.type);
+    output.shape()[0] = input.shape()[0];
+    output.shape()[1] = (input.shape()[1] + 2 * padding - dilation * (kernel.shape()[1] - 1) - 1) / stride + 1;
+    output.shape()[2] = kernel.shape()[0];
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+    output.tape = new ConvolvePrimitive(input, kernel, {padding}, {stride}, {dilation}, groups);
+    return output;
+}
+
+matrix matrix::conv2d(const matrix& input, const matrix& kernel, int pad_h, int pad_w, int stride_h, int stride_w, int dilation_h, int dilation_w, int groups) {
+    // input shape [batch, H, W, channels]
+    // kernel shape [out_channel, h, w, in_channel]
+    // output shape [batch, H', W', out_channel]
+    // in_channel = channels/groups
+    matrix output(input.dims, input.type);
+    output.shape()[0] = input.shape()[0];
+    output.shape()[1] = (input.shape()[1] + 2 * pad_h - dilation_h * (kernel.shape()[1] - 1) - 1) / stride_h + 1;
+    output.shape()[2] = (input.shape()[2] + 2 * pad_w - dilation_w * (kernel.shape()[2] - 1) - 1) / stride_w + 1;
+    output.shape()[3] = kernel.shape()[0];
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+    output.tape = new ConvolvePrimitive(input, kernel, {pad_h, pad_w}, {stride_h, stride_w}, {dilation_h, dilation_w}, groups);
+    return output;
+}
+
+matrix matrix::conv3d(const matrix& input, const matrix& kernel, int pad_d, int pad_h, int pad_w, int stride_d, int stride_h, int stride_w, int dilation_d, int dilation_h, int dilation_w, int groups) {
+    // input shape [batch, D, H, W, channels]
+    // kernel shape [out_channel, d, h, w, in_channel]
+    // output shape [batch, D', H', W', out_channel]
+    // in_channel = channels/groups
+    matrix output(input.dims, input.type);
+    output.shape()[0] = input.shape()[0];
+    output.shape()[1] = (input.shape()[1] + 2 * pad_d - dilation_d * (kernel.shape()[1] - 1) - 1) / stride_d + 1;
+    output.shape()[2] = (input.shape()[2] + 2 * pad_h - dilation_h * (kernel.shape()[2] - 1) - 1) / stride_h + 1;
+    output.shape()[3] = (input.shape()[3] + 2 * pad_w - dilation_w * (kernel.shape()[3] - 1) - 1) / stride_w + 1;
+    output.shape()[4] = kernel.shape()[0];
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+    output.tape = new ConvolvePrimitive(input, kernel, {pad_d, pad_h, pad_w}, {stride_d, stride_h, stride_w}, {dilation_d, dilation_h, dilation_w}, groups);
+    return output;
+}
+
+void matrix::conv1d_gpu(const matrix& kernel, matrix& output) {
+    
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    
+    int typeCode = (int)type;
+    if (!GlobalGPUManager.Conv1dInit[typeCode]) {
+        GlobalGPUManager.initConv1d(typeCode);
+    }
+    [commandEncoder setComputePipelineState:GlobalGPUManager.Conv1dComputeState[typeCode]];
+    
+    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, *this, 1);
+    setBufferOrBytes(commandEncoder, kernel, 2);
+    
+    [commandEncoder setBytes:this->shape() length:this->dims * sizeof(size_m) atIndex:3];
+    [commandEncoder setBytes:kernel.shape() length:kernel.dims * sizeof(size_m) atIndex:4];
+    [commandEncoder setBytes:output.shape() length:output.dims * sizeof(size_m) atIndex:5];
+    
+    ConvolvePrimitive* prim = (ConvolvePrimitive*)output.tape;
+    [commandEncoder setBytes:prim->padding.data() length:prim->padding.size() * sizeof(int) atIndex:6];
+    [commandEncoder setBytes:prim->stride.data() length:prim->stride.size() * sizeof(int) atIndex:7];
+    [commandEncoder setBytes:prim->dilation.data() length:prim->dilation.size() * sizeof(int) atIndex:8];
+    [commandEncoder setBytes:&prim->groups length:sizeof(int) atIndex:9];
+    
+    [commandEncoder setBytes:this->strides() length:this->dims * sizeof(size_m) atIndex:10];
+    [commandEncoder setBytes:kernel.strides() length:kernel.dims * sizeof(size_m) atIndex:11];
+    [commandEncoder setBytes:output.strides() length:output.dims * sizeof(size_m) atIndex:12];
+    
+    auto max_threads = [GlobalGPUManager.Conv1dComputeState[typeCode] maxTotalThreadsPerThreadgroup];
+    NSUInteger w = MIN(16, max_threads);
+    NSUInteger h = MIN(16, max_threads / w);
+    auto _dispatchExecutionSize = MTLSizeMake(output.shape()[2], output.shape()[1], output.shape()[0]);
+    auto _threadsPerThreadgroup = MTLSizeMake(w, h, 1);
+    
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+}
+
+void matrix::conv2d_gpu(const matrix& kernel, matrix& output) {
+    
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    
+    int typeCode = (int)type;
+    if (!GlobalGPUManager.Conv2dInit[typeCode]) {
+        GlobalGPUManager.initConv2d(typeCode);
+    }
+    [commandEncoder setComputePipelineState:GlobalGPUManager.Conv2dComputeState[typeCode]];
+    
+    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, *this, 1);
+    setBufferOrBytes(commandEncoder, kernel, 2);
+    
+    [commandEncoder setBytes:this->shape() length:this->dims * sizeof(size_m) atIndex:3];
+    [commandEncoder setBytes:kernel.shape() length:kernel.dims * sizeof(size_m) atIndex:4];
+    [commandEncoder setBytes:output.shape() length:output.dims * sizeof(size_m) atIndex:5];
+    
+    ConvolvePrimitive* prim = (ConvolvePrimitive*)output.tape;
+    [commandEncoder setBytes:prim->padding.data() length:prim->padding.size() * sizeof(int) atIndex:6];
+    [commandEncoder setBytes:prim->stride.data() length:prim->stride.size() * sizeof(int) atIndex:7];
+    [commandEncoder setBytes:prim->dilation.data() length:prim->dilation.size() * sizeof(int) atIndex:8];
+    [commandEncoder setBytes:&prim->groups length:sizeof(int) atIndex:9];
+    
+    [commandEncoder setBytes:this->strides() length:this->dims * sizeof(size_m) atIndex:10];
+    [commandEncoder setBytes:kernel.strides() length:kernel.dims * sizeof(size_m) atIndex:11];
+    [commandEncoder setBytes:output.strides() length:output.dims * sizeof(size_m) atIndex:12];
+    
+    auto max_threads = [GlobalGPUManager.Conv2dComputeState[typeCode] maxTotalThreadsPerThreadgroup];
+    NSUInteger w = MIN(16, max_threads);
+    NSUInteger h = MIN(16, max_threads / w);
+    auto _dispatchExecutionSize = MTLSizeMake(output.shape()[3], output.shape()[2], output.shape()[1] * output.shape()[0]);
+    auto _threadsPerThreadgroup = MTLSizeMake(w, h, 1);
+    
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+}
+
+void matrix::conv3d_gpu(const matrix& kernel, matrix& output) {
+    
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    
+    int typeCode = (int)type;
+    if (!GlobalGPUManager.Conv3dInit[typeCode]) {
+        GlobalGPUManager.initConv3d(typeCode);
+    }
+    [commandEncoder setComputePipelineState:GlobalGPUManager.Conv3dComputeState[typeCode]];
+    
+    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, *this, 1);
+    setBufferOrBytes(commandEncoder, kernel, 2);
+    
+    [commandEncoder setBytes:this->shape() length:this->dims * sizeof(size_m) atIndex:3];
+    [commandEncoder setBytes:kernel.shape() length:kernel.dims * sizeof(size_m) atIndex:4];
+    [commandEncoder setBytes:output.shape() length:output.dims * sizeof(size_m) atIndex:5];
+    
+    ConvolvePrimitive* prim = (ConvolvePrimitive*)output.tape;
+    [commandEncoder setBytes:prim->padding.data() length:prim->padding.size() * sizeof(int) atIndex:6];
+    [commandEncoder setBytes:prim->stride.data() length:prim->stride.size() * sizeof(int) atIndex:7];
+    [commandEncoder setBytes:prim->dilation.data() length:prim->dilation.size() * sizeof(int) atIndex:8];
+    [commandEncoder setBytes:&prim->groups length:sizeof(int) atIndex:9];
+    
+    [commandEncoder setBytes:this->strides() length:this->dims * sizeof(size_m) atIndex:10];
+    [commandEncoder setBytes:kernel.strides() length:kernel.dims * sizeof(size_m) atIndex:11];
+    [commandEncoder setBytes:output.strides() length:output.dims * sizeof(size_m) atIndex:12];
+    
+    auto max_threads = [GlobalGPUManager.Conv3dComputeState[typeCode] maxTotalThreadsPerThreadgroup];
+    auto _dispatchExecutionSize = MTLSizeMake(output.total_size, 1, 1);
+    auto _threadsPerThreadgroup = MTLSizeMake(max_threads, 1, 1);
+    
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+}
+
+void matrix::unbrodcast(matrix& output, matrix& target) {
+    output = unbroadcast_shape(target.shape(), target.dims);
+}
+
+matrix matrix::clamp(double min_val, double max_val) const {
+    dtype out_type = this->type;
+    matrix output(this->dims, out_type);
+    memcpy(output.shape(), this->shape(), this->dims * sizeof(size_m));
+    output.total_size = this->total_size;
+    output.calcStrides();
+    
+    auto res = collapse_dims(this->shape(), output.strides(), this->strides(), this->dims, INT32_MAX);
+    ClampPrimitive* prim = new ClampPrimitive(*this, min_val, max_val);
+    prim->collapsed_dims = res;
+    output.tape = prim;
+    return output;
+}
+
+void matrix::clamp(matrix& output, double min_val, double max_val, ExecutionDevice exec_device) const {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    ClampPrimitive* primit = static_cast<ClampPrimitive*>(output.tape);
+    auto res = primit->collapsed_dims;
+    uint32_t cdims = res.out_dims;
+
+    if (exec_device == ExecutionDevice::METAL) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)type;
+        int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+
+        if (!GlobalGPUManager.ClampInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initClamp_nd(typeCode, kernel_code);
+        }
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        if (cdims == 0) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.ClampComputeState_nd[typeCode][0]];
+            size_m one = 1;
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
+            if (type == dtype::Float) {
+                float min_val_f = (float)min_val;
+                float max_val_f = (float)max_val;
+                [commandEncoder setBytes:&min_val_f length:sizeof(float) atIndex:4];
+                [commandEncoder setBytes:&max_val_f length:sizeof(float) atIndex:5];
+            } else if (type == dtype::Int32) {
+                int min_val_i = (int)min_val;
+                int max_val_i = (int)max_val;
+                [commandEncoder setBytes:&min_val_i length:sizeof(int) atIndex:4];
+                [commandEncoder setBytes:&max_val_i length:sizeof(int) atIndex:5];
+            }
+            _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        } else if (cdims == 1) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.ClampComputeState_nd[typeCode][0]];
+            [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.ClampComputeState_nd[typeCode][1]];
+            [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.ClampComputeState_nd[typeCode][2]];
+            [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        } else {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.ClampComputeState_nd[typeCode][3]];
+            [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:5];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= res.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+        }
+        
+        dispatch_type(this->type, (void*)1, [&](auto* dummy) {
+            using T = std::decay_t<decltype(*dummy)>;
+            T min_t = static_cast<T>(min_val);
+            T max_t = static_cast<T>(max_val);
+            [commandEncoder setBytes:&min_t length:sizeof(T) atIndex:6];
+            [commandEncoder setBytes:&max_t length:sizeof(T) atIndex:7];
+        });
+
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        dispatch_type(this->type, output.buffer, [&](auto* out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            T* in_data = (T*)this->buffer;
+            T min_t = static_cast<T>(min_val);
+            T max_t = static_cast<T>(max_val);
+
+            if (cdims == 1) {
+                for (size_m i = 0; i < res.shape[0]; ++i) {
+                    T val = in_data[i * res.stridesB[0]];
+                    out_data[i * res.stridesA[0]] = std::max(min_t, std::min(val, max_t));
+                }
+            } else if (cdims == 2) {
+                for (size_m i = 0; i < res.shape[0]; ++i) {
+                    for (size_m j = 0; j < res.shape[1]; ++j) {
+                        T val = in_data[i * res.stridesB[0] + j * res.stridesB[1]];
+                        out_data[i * res.stridesA[0] + j * res.stridesA[1]] = std::max(min_t, std::min(val, max_t));
+                    }
+                }
+            } else if (cdims == 3) {
+                for (size_m i = 0; i < res.shape[0]; ++i) {
+                    for (size_m j = 0; j < res.shape[1]; ++j) {
+                        for (size_m k = 0; k < res.shape[2]; ++k) {
+                            T val = in_data[i * res.stridesB[0] + j * res.stridesB[1] + k * res.stridesB[2]];
+                            out_data[i * res.stridesA[0] + j * res.stridesA[1] + k * res.stridesA[2]] = std::max(min_t, std::min(val, max_t));
+                        }
+                    }
+                }
+            } else {
+                size_m* coords = new size_m[cdims];
+                std::fill(coords, coords + cdims, 0);
+
+                for (size_m i = 0; i < output.total_size; ++i) {
+                    size_m in_idx = 0;
+                    size_m out_idx = 0;
+                    for (int d = 0; d < cdims; ++d) {
+                        in_idx += coords[d] * res.stridesB[d];
+                        out_idx += coords[d] * res.stridesA[d];
+                    }
+                    
+                    T val = in_data[in_idx];
+                    out_data[out_idx] = std::max(min_t, std::min(val, max_t));
+
+                    for (int d = cdims - 1; d >= 0; --d) {
+                        coords[d]++;
+                        if (coords[d] < res.shape[d]) {
+                            break;
+                        }
+                        coords[d] = 0;
+                    }
+                }
+                delete[] coords;
+            }
+        });
+    }
+}
+
+matrix matrix::abs(const matrix& input) {
+    if (input.type == dtype::UInt8 || input.type == dtype::UInt16 || input.type == dtype::UInt32) {
+        return input;
+    }
+
+    dtype out_type = input.type;
+    matrix output(input.dims, out_type);
+    memcpy(output.shape(), input.shape(), input.dims * sizeof(size_m));
+    output.total_size = input.total_size;
+    output.calcStrides();
+    auto res = collapse_dims(input.shape(), output.strides(), input.strides(), input.dims, INT32_MAX);
+    AbsPrimitive* prim = new AbsPrimitive(input);
+    prim->collapsed_dims = res;
+    output.tape = prim;
+    return output;
+}
+
+matrix matrix::log(const matrix& input) {
+    dtype out_type = promote_types(input.type, dtype::Float16);
+    matrix promoted = (input.type != out_type) ? input.astype(out_type, true) : input;
+    matrix output(promoted.dims, promoted.type);
+    memcpy(output.shape(), promoted.shape(), promoted.dims * sizeof(size_m));
+    output.total_size = promoted.total_size;
+    output.calcStrides();
+    
+    auto res = collapse_dims(promoted.shape(), output.strides(), promoted.strides(), promoted.dims, INT32_MAX);
+    LogPrimitive* prim = new LogPrimitive(promoted);
+    prim->collapsed_dims = res;
+    output.tape = prim;
+    return output;
+}
+
+void matrix::log(matrix& output, ExecutionDevice exec_device) {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    LogPrimitive* primit = static_cast<LogPrimitive*>(output.tape);
+    auto res = primit->collapsed_dims;
+    uint32_t cdims = res.out_dims;
+
+    if (exec_device == ExecutionDevice::METAL) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)type;
+        int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+
+        if (!GlobalGPUManager.LogInit[typeCode][kernel_code]) {
+            GlobalGPUManager.initLog(typeCode, kernel_code);
+        }
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        if (cdims == 0) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.LogComputeState[typeCode][0]];
+            size_m one = 1;
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        } else if (cdims == 1) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.LogComputeState[typeCode][0]];
+            [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.LogComputeState[typeCode][1]];
+            [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.LogComputeState[typeCode][2]];
+            [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        } else {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.LogComputeState[typeCode][3]];
+            [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:5];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= res.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+        }
+
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        // CPU fallback mapping
+        dispatch_type(type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+                T* in_data = (T*)buffer;
+                if (cdims == 0) {
+                    out_data[0] = std::log(in_data[0]);
+                } else if (cdims == 1) {
+                    size_m out_stride = res.stridesA[0];
+                    size_m in_stride = res.stridesB[0];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        out_data[i * out_stride] = std::log(in_data[i * in_stride]);
+                    }
+                } else if (cdims == 2) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            out_data[i * out_stride0 + j * out_stride1] = std::log(in_data[i * in_stride0 + j * in_stride1]);
+                        }
+                    }
+                } else if (cdims == 3) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m out_stride2 = res.stridesA[2];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    size_m in_stride2 = res.stridesB[2];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            for (size_m k = 0; k < res.shape[2]; k++) {
+                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = std::log(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
+                            }
+                        }
+                    }
+                } else {
+                    for (size_m gid = 0; gid < total_size; gid++) {
+                        size_m src_idx = 0;
+                        size_m dst_idx = 0;
+                        size_m rem = gid;
+                        for (int i = cdims - 1; i >= 0; i--) {
+                            size_m idx = rem % res.shape[i];
+                            src_idx += idx * res.stridesB[i];
+                            dst_idx += idx * res.stridesA[i];
+                            rem /= res.shape[i];
+                        }
+                        out_data[dst_idx] = std::log(in_data[src_idx]);
+                    }
+                }
+        });
+    }
+}
+void matrix::abs(matrix& output, ExecutionDevice exec_device) {
+    // only for eval_type = execution
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    AbsPrimitive* primit = static_cast<AbsPrimitive*>(output.tape);
+    auto res = primit->collapsed_dims;
+    uint32_t cdims = res.out_dims;
+
+    if (exec_device == ExecutionDevice::METAL) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)type;
+        int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+
+        if (!GlobalGPUManager.AbsInit[typeCode][kernel_code]) {
+            GlobalGPUManager.initAbs(typeCode, kernel_code);
+        }
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        if (cdims == 0) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.AbsComputeState[typeCode][0]];
+            size_m one = 1;
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        } else if (cdims == 1) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.AbsComputeState[typeCode][0]];
+            [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.AbsComputeState[typeCode][1]];
+            [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.AbsComputeState[typeCode][2]];
+            [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        } else {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.AbsComputeState[typeCode][3]];
+            [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:5];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= res.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+        }
+
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        // CPU fallback mapping
+//        dispatch_type(type, output.buffer, [&](auto *out_data) {
+//            using T = std::decay_t<decltype(*out_data)>;
+//                T* in_data = (T*)buffer;
+//                if (cdims == 1) {
+//                    size_m out_stride = res.stridesA[0];
+//                    size_m in_stride = res.stridesB[0];
+//                    for (size_m i = 0; i < res.shape[0]; i++) {
+//                        out_data[i * out_stride] = std::abs(in_data[i * in_stride]);
+//                    }
+//                } else if (cdims == 2) {
+//                    size_m out_stride0 = res.stridesA[0];
+//                    size_m out_stride1 = res.stridesA[1];
+//                    size_m in_stride0 = res.stridesB[0];
+//                    size_m in_stride1 = res.stridesB[1];
+//                    for (size_m i = 0; i < res.shape[0]; i++) {
+//                        for (size_m j = 0; j < res.shape[1]; j++) {
+//                            out_data[i * out_stride0 + j * out_stride1] = std::abs(in_data[i * in_stride0 + j * in_stride1]);
+//                        }
+//                    }
+//                } else if (cdims == 3) {
+//                    size_m out_stride0 = res.stridesA[0];
+//                    size_m out_stride1 = res.stridesA[1];
+//                    size_m out_stride2 = res.stridesA[2];
+//                    size_m in_stride0 = res.stridesB[0];
+//                    size_m in_stride1 = res.stridesB[1];
+//                    size_m in_stride2 = res.stridesB[2];
+//                    for (size_m i = 0; i < res.shape[0]; i++) {
+//                        for (size_m j = 0; j < res.shape[1]; j++) {
+//                            for (size_m k = 0; k < res.shape[2]; k++) {
+//                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = std::abs(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
+//                            }
+//                        }
+//                    }
+//                } else {
+//                    for (size_m gid = 0; gid < total_size; gid++) {
+//                        size_m src_idx = 0;
+//                        size_m dst_idx = 0;
+//                        size_m rem = gid;
+//                        for (int i = cdims - 1; i >= 0; i--) {
+//                            size_m idx = rem % res.shape[i];
+//                            src_idx += idx * res.stridesB[i];
+//                            dst_idx += idx * res.stridesA[i];
+//                            rem /= res.shape[i];
+//                        }
+//                        out_data[dst_idx] = std::abs(in_data[src_idx]);
+//                    }
+//                }
+//        });
+    }
+}
+
+
+matrix matrix::sin(const matrix& input) {
+    dtype out_type = promote_types(input.type, dtype::Float16);
+    matrix promoted = (input.type != out_type) ? input.astype(out_type, true) : input;
+    matrix output(promoted.dims, promoted.type);
+    memcpy(output.shape(), promoted.shape(), promoted.dims * sizeof(size_m));
+    output.total_size = promoted.total_size;
+    output.calcStrides();
+    
+    auto res = collapse_dims(promoted.shape(), output.strides(), promoted.strides(), promoted.dims, INT32_MAX);
+    SinPrimitive* prim = new SinPrimitive(promoted);
+    prim->collapsed_dims = res;
+    output.tape = prim;
+    return output;
+}
+
+void matrix::sin(matrix& output, ExecutionDevice exec_device) {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    SinPrimitive* primit = static_cast<SinPrimitive*>(output.tape);
+    auto res = primit->collapsed_dims;
+    uint32_t cdims = res.out_dims;
+
+    if (exec_device == ExecutionDevice::METAL) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)type;
+        int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+
+        if (!GlobalGPUManager.SinInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initSin_nd(typeCode, kernel_code);
+        }
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        if (cdims == 0) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.SinComputeState_nd[typeCode][0]];
+            size_m one = 1;
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        } else if (cdims == 1) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.SinComputeState_nd[typeCode][0]];
+            [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.SinComputeState_nd[typeCode][1]];
+            [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.SinComputeState_nd[typeCode][2]];
+            [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        } else {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.SinComputeState_nd[typeCode][3]];
+            [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:5];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= res.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+        }
+
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        // CPU fallback mapping
+        dispatch_type(type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+                T* in_data = (T*)buffer;
+                if (cdims == 0) {
+                    out_data[0] = std::sin(in_data[0]);
+                } else if (cdims == 1) {
+                    size_m out_stride = res.stridesA[0];
+                    size_m in_stride = res.stridesB[0];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        out_data[i * out_stride] = std::sin(in_data[i * in_stride]);
+                    }
+                } else if (cdims == 2) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            out_data[i * out_stride0 + j * out_stride1] = std::sin(in_data[i * in_stride0 + j * in_stride1]);
+                        }
+                    }
+                } else if (cdims == 3) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m out_stride2 = res.stridesA[2];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    size_m in_stride2 = res.stridesB[2];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            for (size_m k = 0; k < res.shape[2]; k++) {
+                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = std::sin(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
+                            }
+                        }
+                    }
+                } else {
+                    for (size_m gid = 0; gid < total_size; gid++) {
+                        size_m src_idx = 0;
+                        size_m dst_idx = 0;
+                        size_m rem = gid;
+                        for (int i = cdims - 1; i >= 0; i--) {
+                            size_m idx = rem % res.shape[i];
+                            src_idx += idx * res.stridesB[i];
+                            dst_idx += idx * res.stridesA[i];
+                            rem /= res.shape[i];
+                        }
+                        out_data[dst_idx] = std::sin(in_data[src_idx]);
+                    }
+                }
+        });
+    }
+}
+
+matrix matrix::cos(const matrix& input) {
+    dtype out_type = promote_types(input.type, dtype::Float16);
+    matrix promoted = (input.type != out_type) ? input.astype(out_type, true) : input;
+    matrix output(promoted.dims, promoted.type);
+    memcpy(output.shape(), promoted.shape(), promoted.dims * sizeof(size_m));
+    output.total_size = promoted.total_size;
+    output.calcStrides();
+    
+    auto res = collapse_dims(promoted.shape(), output.strides(), promoted.strides(), promoted.dims, INT32_MAX);
+    CosPrimitive* prim = new CosPrimitive(promoted);
+    prim->collapsed_dims = res;
+    output.tape = prim;
+    return output;
+}
+
+void matrix::cos(matrix& output, ExecutionDevice exec_device) {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    CosPrimitive* primit = static_cast<CosPrimitive*>(output.tape);
+    auto res = primit->collapsed_dims;
+    uint32_t cdims = res.out_dims;
+
+    if (exec_device == ExecutionDevice::METAL) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)type;
+        int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+
+        if (!GlobalGPUManager.CosInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initCos_nd(typeCode, kernel_code);
+        }
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        if (cdims == 0) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CosComputeState_nd[typeCode][0]];
+            size_m one = 1;
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        } else if (cdims == 1) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CosComputeState_nd[typeCode][0]];
+            [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CosComputeState_nd[typeCode][1]];
+            [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CosComputeState_nd[typeCode][2]];
+            [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        } else {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.CosComputeState_nd[typeCode][3]];
+            [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:5];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= res.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+        }
+
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        // CPU fallback mapping
+        dispatch_type(type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+                T* in_data = (T*)buffer;
+                if (cdims == 0) {
+                    out_data[0] = std::cos(in_data[0]);
+                } else if (cdims == 1) {
+                    size_m out_stride = res.stridesA[0];
+                    size_m in_stride = res.stridesB[0];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        out_data[i * out_stride] = std::cos(in_data[i * in_stride]);
+                    }
+                } else if (cdims == 2) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            out_data[i * out_stride0 + j * out_stride1] = std::cos(in_data[i * in_stride0 + j * in_stride1]);
+                        }
+                    }
+                } else if (cdims == 3) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m out_stride2 = res.stridesA[2];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    size_m in_stride2 = res.stridesB[2];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            for (size_m k = 0; k < res.shape[2]; k++) {
+                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = std::cos(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
+                            }
+                        }
+                    }
+                } else {
+                    for (size_m gid = 0; gid < total_size; gid++) {
+                        size_m src_idx = 0;
+                        size_m dst_idx = 0;
+                        size_m rem = gid;
+                        for (int i = cdims - 1; i >= 0; i--) {
+                            size_m idx = rem % res.shape[i];
+                            src_idx += idx * res.stridesB[i];
+                            dst_idx += idx * res.stridesA[i];
+                            rem /= res.shape[i];
+                        }
+                        out_data[dst_idx] = std::cos(in_data[src_idx]);
+                    }
+                }
+        });
+    }
+}
+
+matrix matrix::tan(const matrix& input) {
+    dtype out_type = promote_types(input.type, dtype::Float16);
+    matrix promoted = (input.type != out_type) ? input.astype(out_type, true) : input;
+    matrix output(promoted.dims, promoted.type);
+    memcpy(output.shape(), promoted.shape(), promoted.dims * sizeof(size_m));
+    output.total_size = promoted.total_size;
+    output.calcStrides();
+    
+    auto res = collapse_dims(promoted.shape(), output.strides(), promoted.strides(), promoted.dims, INT32_MAX);
+    TanPrimitive* prim = new TanPrimitive(promoted);
+    prim->collapsed_dims = res;
+    output.tape = prim;
+    return output;
+}
+
+void matrix::tan(matrix& output, ExecutionDevice exec_device) {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    TanPrimitive* primit = static_cast<TanPrimitive*>(output.tape);
+    auto res = primit->collapsed_dims;
+    uint32_t cdims = res.out_dims;
+
+    if (exec_device == ExecutionDevice::METAL) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)type;
+        int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+
+        if (!GlobalGPUManager.TanInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initTan_nd(typeCode, kernel_code);
+        }
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        if (cdims == 0) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.TanComputeState_nd[typeCode][0]];
+            size_m one = 1;
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        } else if (cdims == 1) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.TanComputeState_nd[typeCode][0]];
+            [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.TanComputeState_nd[typeCode][1]];
+            [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.TanComputeState_nd[typeCode][2]];
+            [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        } else {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.TanComputeState_nd[typeCode][3]];
+            [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:5];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= res.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+        }
+
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        // CPU fallback mapping
+        dispatch_type(type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+                T* in_data = (T*)buffer;
+                if (cdims == 0) {
+                    out_data[0] = std::tan(in_data[0]);
+                } else if (cdims == 1) {
+                    size_m out_stride = res.stridesA[0];
+                    size_m in_stride = res.stridesB[0];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        out_data[i * out_stride] = std::tan(in_data[i * in_stride]);
+                    }
+                } else if (cdims == 2) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            out_data[i * out_stride0 + j * out_stride1] = std::tan(in_data[i * in_stride0 + j * in_stride1]);
+                        }
+                    }
+                } else if (cdims == 3) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m out_stride2 = res.stridesA[2];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    size_m in_stride2 = res.stridesB[2];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            for (size_m k = 0; k < res.shape[2]; k++) {
+                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = std::tan(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
+                            }
+                        }
+                    }
+                } else {
+                    for (size_m gid = 0; gid < total_size; gid++) {
+                        size_m src_idx = 0;
+                        size_m dst_idx = 0;
+                        size_m rem = gid;
+                        for (int i = cdims - 1; i >= 0; i--) {
+                            size_m idx = rem % res.shape[i];
+                            src_idx += idx * res.stridesB[i];
+                            dst_idx += idx * res.stridesA[i];
+                            rem /= res.shape[i];
+                        }
+                        out_data[dst_idx] = std::tan(in_data[src_idx]);
+                    }
+                }
+        });
+    }
+}
+
+matrix matrix::sqrt(const matrix& input) {
+    dtype out_type = promote_types(input.type, dtype::Float16);
+    matrix promoted = (input.type != out_type) ? input.astype(out_type, true) : input;
+    matrix output(promoted.dims, promoted.type);
+    memcpy(output.shape(), promoted.shape(), promoted.dims * sizeof(size_m));
+    output.total_size = promoted.total_size;
+    output.calcStrides();
+    
+    auto res = collapse_dims(promoted.shape(), output.strides(), promoted.strides(), promoted.dims, INT32_MAX);
+    SqrtPrimitive* prim = new SqrtPrimitive(promoted);
+    prim->collapsed_dims = res;
+    output.tape = prim;
+    return output;
+}
+
+void matrix::sqrt(matrix& output, ExecutionDevice exec_device) {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    SqrtPrimitive* primit = static_cast<SqrtPrimitive*>(output.tape);
+    auto res = primit->collapsed_dims;
+    uint32_t cdims = res.out_dims;
+
+    if (exec_device == ExecutionDevice::METAL) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)type;
+        int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+
+        if (!GlobalGPUManager.SqrtInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initSqrt_nd(typeCode, kernel_code);
+        }
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        if (cdims == 0) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.SqrtComputeState_nd[typeCode][0]];
+            size_m one = 1;
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        } else if (cdims == 1) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.SqrtComputeState_nd[typeCode][0]];
+            [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.SqrtComputeState_nd[typeCode][1]];
+            [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.SqrtComputeState_nd[typeCode][2]];
+            [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        } else {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.SqrtComputeState_nd[typeCode][3]];
+            [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:5];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= res.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+        }
+
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        // CPU fallback mapping
+        dispatch_type(type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+                T* in_data = (T*)buffer;
+                if (cdims == 0) {
+                    out_data[0] = std::sqrt(in_data[0]);
+                } else if (cdims == 1) {
+                    size_m out_stride = res.stridesA[0];
+                    size_m in_stride = res.stridesB[0];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        out_data[i * out_stride] = std::sqrt(in_data[i * in_stride]);
+                    }
+                } else if (cdims == 2) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            out_data[i * out_stride0 + j * out_stride1] = std::sqrt(in_data[i * in_stride0 + j * in_stride1]);
+                        }
+                    }
+                } else if (cdims == 3) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m out_stride2 = res.stridesA[2];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    size_m in_stride2 = res.stridesB[2];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            for (size_m k = 0; k < res.shape[2]; k++) {
+                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = std::sqrt(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
+                            }
+                        }
+                    }
+                } else {
+                    for (size_m gid = 0; gid < total_size; gid++) {
+                        size_m src_idx = 0;
+                        size_m dst_idx = 0;
+                        size_m rem = gid;
+                        for (int i = cdims - 1; i >= 0; i--) {
+                            size_m idx = rem % res.shape[i];
+                            src_idx += idx * res.stridesB[i];
+                            dst_idx += idx * res.stridesA[i];
+                            rem /= res.shape[i];
+                        }
+                        out_data[dst_idx] = std::sqrt(in_data[src_idx]);
+                    }
+                }
+        });
+    }
+}
+
+matrix matrix::exp(const matrix& input) {
+    dtype out_type = promote_types(input.type, dtype::Float16);
+    matrix promoted = (input.type != out_type) ? input.astype(out_type, true) : input;
+    matrix output(promoted.dims, promoted.type);
+    memcpy(output.shape(), promoted.shape(), promoted.dims * sizeof(size_m));
+    output.total_size = promoted.total_size;
+    output.calcStrides();
+    
+    auto res = collapse_dims(promoted.shape(), output.strides(), promoted.strides(), promoted.dims, INT32_MAX);
+    ExpPrimitive* prim = new ExpPrimitive(promoted);
+    prim->collapsed_dims = res;
+    output.tape = prim;
+    return output;
+}
+
+void matrix::exp(matrix& output, ExecutionDevice exec_device) {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    ExpPrimitive* primit = static_cast<ExpPrimitive*>(output.tape);
+    auto res = primit->collapsed_dims;
+    uint32_t cdims = res.out_dims;
+
+    if (exec_device == ExecutionDevice::METAL) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)type;
+        int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+
+        if (!GlobalGPUManager.ExpInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initExp_nd(typeCode, kernel_code);
+        }
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        if (cdims == 0) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.ExpComputeState_nd[typeCode][0]];
+            size_m one = 1;
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        } else if (cdims == 1) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.ExpComputeState_nd[typeCode][0]];
+            [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.ExpComputeState_nd[typeCode][1]];
+            [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.ExpComputeState_nd[typeCode][2]];
+            [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        } else {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.ExpComputeState_nd[typeCode][3]];
+            [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:5];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= res.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+        }
+
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        // CPU fallback mapping
+        dispatch_type(type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+                T* in_data = (T*)buffer;
+                if (cdims == 0) {
+                    out_data[0] = std::exp(in_data[0]);
+                } else if (cdims == 1) {
+                    size_m out_stride = res.stridesA[0];
+                    size_m in_stride = res.stridesB[0];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        out_data[i * out_stride] = std::exp(in_data[i * in_stride]);
+                    }
+                } else if (cdims == 2) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            out_data[i * out_stride0 + j * out_stride1] = std::exp(in_data[i * in_stride0 + j * in_stride1]);
+                        }
+                    }
+                } else if (cdims == 3) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m out_stride2 = res.stridesA[2];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    size_m in_stride2 = res.stridesB[2];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            for (size_m k = 0; k < res.shape[2]; k++) {
+                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = std::exp(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
+                            }
+                        }
+                    }
+                } else {
+                    for (size_m gid = 0; gid < total_size; gid++) {
+                        size_m src_idx = 0;
+                        size_m dst_idx = 0;
+                        size_m rem = gid;
+                        for (int i = cdims - 1; i >= 0; i--) {
+                            size_m idx = rem % res.shape[i];
+                            src_idx += idx * res.stridesB[i];
+                            dst_idx += idx * res.stridesA[i];
+                            rem /= res.shape[i];
+                        }
+                        out_data[dst_idx] = std::exp(in_data[src_idx]);
+                    }
+                }
+        });
+    }
+}
+
+
+matrix matrix::dot(const matrix& b, bool transposeB) {
+    // 1. Graph Level Cache-Locality Optimization
+    // The backend wants B transposed so it can read it linearly.
+    // If the user didn't transpose B, we add a .transpose() node to the DAG!
+    matrix b_optimized(b.dims, b.type);
+    if (transposeB) {
+        b_optimized = b;
+    } else {
+        std::vector<size_m> axes(b.dims);
+        int stop_idx = b.dims >= 2 ? b.dims - 2 : b.dims;
+        for (int i = 0; i < stop_idx; ++i) axes[i] = i;
+        if (b.dims >= 2) {
+            axes[b.dims - 2] = b.dims - 1;
+            axes[b.dims - 1] = b.dims - 2;
+        }
+        b_optimized = b.transpose(axes);
+    }
+    b_optimized = (b_optimized.flags & NON_CONTIGUOUS_FLAG) ? b_optimized.astype(b_optimized.type, true) : b_optimized;
+    matrix result(std::max(dims, b_optimized.dims), type);
+    auto primit = new DotPrimitive(*this, b_optimized);
+
+    primit->desc_a = BroadcastDescriptor::create(result.dims);
+    primit->desc_b = BroadcastDescriptor::create(result.dims);
+    broadcast_shapes_matmul(array_desc, b_optimized.array_desc, result.array_desc,
+                         primit->desc_a, primit->desc_b, dims, b_optimized.dims);
+    primit->collapsed_dims_3 = collapse_dims_matmul(
+            result.shape(),
+            primit->desc_a->strides(result.dims),
+            primit->desc_b->strides(result.dims),
+            result.strides(), result.dims, INT32_MAX);
+    // We pass b_optimized to the Primitive.
+    result.total_size = result.accumul(0, result.dims);
+    result.tape = primit;
+    return result;
+}
+
+void matrix::dot_cpu(matrix& b_transposed, matrix& result) {
+    if (this->dims > 2 || b_transposed.dims > 2) {
+        this->batched_dot_cpu(b_transposed, result);
+        return;
+    }
+    // Both 'this' (A) and 'b_transposed' (B) have their inner dimension K contiguous in memory!
+    
+    int M = this->shape()[0];
+    int K = this->shape()[1];
+    int N = b_transposed.shape()[0];
+    
+    dispatch_type(type, result.buffer, [&](auto *C_ptr) {
+        using T = std::decay_t<decltype(*C_ptr)>;
+        
+        T* A_ptr = (T*)this->buffer;
+        T* B_ptr = (T*)b_transposed.buffer;
+
+        
+        for (int m = 0; m < M; m++) {
+            for (int n = 0; n < N; n++) {
+                T sum = 0.0f;
+                for (int k = 0; k < K; k++) {
+                    // High cache hit rate!
+                    sum += A_ptr[m * K + k] * B_ptr[n * K + k];
+                }
+                C_ptr[m * N + n] = sum;
+            }
+        }
+    });
+}
+
+void matrix::batched_dot_cpu(matrix& b_transposed, matrix& result) {
+    DotPrimitive* primit = (DotPrimitive*)result.tape;
+    CollapsedDims_3& collapsed_desc = primit->collapsed_dims_3;
+    
+    int out_dims = collapsed_desc.out_dims;
+    size_m* shapeR = collapsed_desc.shape;
+    size_m* strideA = collapsed_desc.stridesA;
+    size_m* strideB = collapsed_desc.stridesB;
+    size_m* strideR = collapsed_desc.stridesC;
+    
+    size_m K = this->shape()[this->dims - 1];
+    size_m M = shapeR[out_dims - 2];
+    size_m N = shapeR[out_dims - 1];
+    
+    size_m matmul_size = M * N;
+    size_m total_batches = result.total_size / matmul_size;
+    
+    dispatch_type(type, result.buffer, [&](auto *C_ptr) {
+        using T = std::decay_t<decltype(*C_ptr)>;
+        T* A_ptr = (T*)this->buffer;
+        T* B_ptr = (T*)b_transposed.buffer;
+        
+        for (size_m batch_idx = 0; batch_idx < total_batches; batch_idx++) {
+            size_m GindexA = 0;
+            size_m GindexB = 0;
+            size_m GindexR = 0;
+            
+            if (out_dims == 3) {
+                GindexA = batch_idx * strideA[0];
+                GindexB = batch_idx * strideB[0];
+                GindexR = batch_idx * strideR[0];
+            } else {
+                size_m rem = batch_idx;
+                for (int i = out_dims - 3; i >= 0; i--) {
+                    size_m dim_index = rem % shapeR[i];
+                    GindexA += dim_index * strideA[i];
+                    GindexB += dim_index * strideB[i];
+                    GindexR += dim_index * strideR[i];
+                    rem /= shapeR[i];
+                }
+            }
+            
+            for (size_m m = 0; m < M; m++) {
+                for (size_m n = 0; n < N; n++) {
+                    size_m idxA = GindexA + m * strideA[out_dims - 2];
+                    size_m idxB = GindexB + n * strideB[out_dims - 2];
+                    size_m idxR = GindexR + m * strideR[out_dims - 2] + n * strideR[out_dims - 1];
+                    
+                    T sum = 0.0f;
+                    for (size_m k = 0; k < K; k++) {
+                        sum += A_ptr[idxA + k] * B_ptr[idxB + k];
+                    }
+                    C_ptr[idxR] = sum;
+                }
+            }
+        }
+    });
+}
+
+void matrix::dot_gpu(matrix& b_transposed, matrix& result) {
+    if (this->dims > 2 || b_transposed.dims > 2) {
+        this->batched_dot_gpu(b_transposed, result);
+        return;
+    }
+    
+    uint8_t typeCode = static_cast<uint8_t>(type);
+    
+    if (!GlobalGPUManager.GEMMAInit[typeCode]) {
+        GlobalGPUManager.initGEMMA_All(typeCode);
+    }
+    
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    
+    auto _threadsPerThreadgroup = MTLSizeMake(1, 1, 1); // Tune this for your tiles later
+    auto _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+    
+    // Bind Buffers
+    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+    [commandEncoder setBuffer:this->metalBuffer offset:0 atIndex:1];
+    [commandEncoder setBuffer:b_transposed.metalBuffer offset:0 atIndex:2];
+    
+    // Bind Shapes
+    [commandEncoder setBytes:this->shape() length:this->dims * sizeof(size_m) atIndex:3];
+    
+    // CRITICAL: The shader expects the *original* shape of B [K, N] in buffer 4,
+    // but b_transposed.shape is physically [N, K]. We construct [K, N] to satisfy the shader.
+    size_m original_shapeB[2] = { b_transposed.shape()[1], b_transposed.shape()[0] };
+    [commandEncoder setBytes:original_shapeB length:2 * sizeof(size_m) atIndex:4];
+    
+    // Use your string lookup or switch statement for the pipeline state here
+    [commandEncoder setComputePipelineState:GlobalGPUManager.GEMMAComputeState[typeCode]];
+    
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+}
+
+void matrix::batched_dot_gpu(matrix& b_transposed, matrix& result) {
+    uint8_t typeCode = static_cast<uint8_t>(type);
+    
+    // We expect result.tape to hold the DotPrimitive which already contains collapsed_dims_3
+    DotPrimitive* primit = (DotPrimitive*)result.tape;
+    CollapsedDims_3& collapsed_desc = primit->collapsed_dims_3;
+    
+    // Choose Pipeline: 3D if fully collapsed (batch=1 dim, + M, N), otherwise ND
+    int spec_idx = (collapsed_desc.out_dims == 3) ? 0 : 1;
+    if (!GlobalGPUManager.BatchedMatMulInit[typeCode][spec_idx]) {
+        GlobalGPUManager.initBatchedMatMul(typeCode, spec_idx);
+    }
+    
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    [commandEncoder setComputePipelineState:GlobalGPUManager.BatchedMatMulComputeState[typeCode][spec_idx]];
+    
+    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+    [commandEncoder setBuffer:this->metalBuffer offset:0 atIndex:1];
+    [commandEncoder setBuffer:b_transposed.metalBuffer offset:0 atIndex:2];
+    
+    size_t array_len = sizeof(size_m) * collapsed_desc.out_dims;
+    [commandEncoder setBytes:collapsed_desc.stridesA length:array_len atIndex:3];
+    [commandEncoder setBytes:collapsed_desc.stridesB length:array_len atIndex:4];
+    [commandEncoder setBytes:collapsed_desc.stridesC length:array_len atIndex:5];
+    
+    // K is the innermost dimension of the dot product itself
+    size_m k_val = this->shape()[this->dims - 1];
+    
+    if (spec_idx == 0) { // 3Dgg
+        [commandEncoder setBytes:&k_val length:sizeof(size_m) atIndex:6];
+    } else { // NDgg
+        [commandEncoder setBytes:collapsed_desc.shape length:array_len atIndex:6];
+        [commandEncoder setBytes:&k_val length:sizeof(size_m) atIndex:7];
+        
+        int ndims_val = collapsed_desc.out_dims;
+        [commandEncoder setBytes:&ndims_val length:sizeof(int) atIndex:8];
+    }
+    
+    // Calculate Grid: z -> batch, y -> M (row), x -> N (col)
+    size_m N_val = collapsed_desc.shape[collapsed_desc.out_dims - 1];
+    size_m M_val = collapsed_desc.shape[collapsed_desc.out_dims - 2];
+    
+    size_m batch_size = 1;
+    for (int i = 0; i < collapsed_desc.out_dims - 2; ++i) {
+        batch_size *= collapsed_desc.shape[i];
+    }
+    
+    auto _threadsPerThreadgroup = MTLSizeMake(1, 1, 1); 
+    auto _dispatchExecutionSize = MTLSizeMake(N_val, M_val, batch_size);
+    
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+}
+
+
 
 // for adding same on cpu
 void matrix::add( matrix &other, matrix &result, EvalType evalType) {
@@ -1596,50 +4691,50 @@ void matrix::add( matrix &other, matrix &result, EvalType evalType) {
         result.tape = primit;
         return;
     }
-    
+
     // FOR PATH BUILD_TRACE AND EVAL_CPU
     // for situations where c = a+b; d= c+c
     // c is an unmaterialised temp so it has no buffer thus both c's where treated differently or for that matter reusing temp nodes recalcuated and allocated everything cause we didnt know they were the same thing but same nodes shared same primitive so we stored some of the properties in the primitive so we can identify if somwhere else memory for c has been allocated then we use the same
-    if (result.tape->out_buffer && !result.buffer) {
-        result.buffer = result.tape->out_buffer;
-        result.metalBuffer = result.tape->out_metal_buffer;
-        result.refCount = result.tape->out_refcount;
-        result.refCount->fetch_add(1);
-        if (evalType == EvalType::BUILD_TRACE) { return; }
-    } else {
-        result.buffer = new uint8_t[result.effectiveBufferSize() * dtype_size(type)];
-        result.begin_refcount();
-        result.buildMetalBuffer();
-        
-        result.tape->out_buffer = (uint8_t*)result.buffer;
-        result.tape->out_metal_buffer = result.metalBuffer;
-        result.tape->out_refcount = result.refCount;
-    }
-    
+//    if (result.tape->out_buffer && !result.buffer) {
+//        result.buffer = result.tape->out_buffer;
+//        result.metalBuffer = result.tape->out_metal_buffer;
+//        result.refCount = result.tape->out_refcount;
+//        result.refCount->fetch_add(1);
+//        if (evalType == EvalType::COMPILE_TRACE) { return; }
+//    } else {
+//        result.buffer = new uint8_t[result.effectiveBufferSize() * dtype_size(type)];
+//        result.begin_refcount();
+//        result.buildMetalBuffer();
+//
+//        result.tape->out_buffer = (uint8_t*)result.buffer;
+//        result.tape->out_metal_buffer = result.metalBuffer;
+//        result.tape->out_refcount = result.refCount;
+//    }
+
     // addition logic
-    
+
     update_from_trace();
     other.update_from_trace();
-    
+
     // EXECUTION PATH : FOR EVAL_CPU AND EXEC_TRACE_CPU
     if (result.dims != fmax(dims, other.dims)) {
         throw std::invalid_argument("Incompatible dims of the result mat");
     }
-    
+
     size_m *strideA = ((AdditionPrimitive *)result.tape)->desc_a->strides(result.dims);
     size_m *strideB = ((AdditionPrimitive *)result.tape)->desc_b->strides(result.dims);
-    
+
     dispatch_type(type, result.buffer, [&](auto *out_data) {
         using T = std::decay_t<decltype(*out_data)>;
         for (int gid = 0; gid < result.total_size; gid++) {
             // globalIndex for A and B
             size_t GindexA = 0;
             size_t GindexB = 0;
-            
+
             // axis Index for Result like temp storage for i, j, k, l ... along each
             // axis for result
             size_t indexR = 0;
-            
+
             int rem = gid;
             for (int i = 0; i < result.dims; i++) {
                 indexR = rem / result.strides()[i];
@@ -1647,7 +4742,7 @@ void matrix::add( matrix &other, matrix &result, EvalType evalType) {
                 GindexB += indexR * strideB[i];
                 rem %= result.strides()[i];
             }
-            
+
             out_data[gid] = static_cast<T *>(buffer)[GindexA] +
             static_cast<T *>(other.buffer)[GindexB];
         }
@@ -1708,6 +4803,8 @@ void matrix::add_cpu_brodcasted(matrix& other, matrix &result, EvalType evalType
         primit->desc_b = BroadcastDescriptor::create(result.dims);
         broadcast_shapes(array_desc, other.array_desc, result.array_desc,
                          primit->desc_a, primit->desc_b, dims, other.dims);
+        primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+        primit->dims_collapsed = true;
         result.total_size = result.accumul(0, result.dims);
         result.tape = primit;
         return;
@@ -1737,13 +4834,24 @@ void matrix::add_cpu_brodcasted(matrix& other, matrix &result, EvalType evalType
     update_from_trace();
     other.update_from_trace();
     
+    
+    if (result.dims == 0) {
+        // scalar - scalar, no broadcasting needed
+        dispatch_type(type, result.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            out_data[0] = static_cast<T*>(buffer)[0] + static_cast<T*>(other.buffer)[0];
+        });
+        return;
+    }
+    
     // EXECUTION PATH : FOR EVAL_CPU AND EXEC_TRACE_CPU
     if (result.dims != fmax(dims, other.dims)) {
         throw std::invalid_argument("Incompatible dims of the result mat");
     }
-    
-    size_m *strideA = ((AdditionPrimitive *)result.tape)->desc_a->strides(result.dims);
-    size_m *strideB = ((AdditionPrimitive *)result.tape)->desc_b->strides(result.dims);
+    int cdims = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.out_dims;
+    size_m* strideA = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.stridesA;
+    size_m* strideB = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.stridesB;
+    size_m* strideR = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.stridesC;
     
     dispatch_type(type, result.buffer, [&](auto *out_data) {
         using T = std::decay_t<decltype(*out_data)>;
@@ -1757,29 +4865,219 @@ void matrix::add_cpu_brodcasted(matrix& other, matrix &result, EvalType evalType
             size_t indexR = 0;
             
             int rem = gid;
-            for (int i = 0; i < result.dims; i++) {
-                indexR = rem / result.strides()[i];
+            for (int i = 0; i < cdims; i++) {
+                indexR = rem / strideR[i];
                 GindexA += indexR * strideA[i];
                 GindexB += indexR * strideB[i];
-                rem %= result.strides()[i];
+                rem %= strideR[i];
             }
             
-            out_data[gid] = static_cast<T *>(buffer)[GindexA] +
-            static_cast<T *>(other.buffer)[GindexB];
+            out_data[gid] = static_cast<T *>(buffer)[GindexA] + static_cast<T *>(other.buffer)[GindexB];
         }
     });
 }
 
 
-void matrix::multiply_cpu_brodcasted(const matrix &other, matrix &result, EvalType evalType) const {}
-void matrix::subtract_cpu_brodcasted(const matrix &other, matrix &result, EvalType evalType) const {}
-void matrix::divide_cpu_brodcasted(const matrix &other, matrix &result, EvalType evalType) const {}
+void matrix::multiply_cpu_brodcasted(matrix &other, matrix &result, EvalType evalType) {
+    if (evalType == EvalType::EVAL_AUTO) {
+        // lazy evaluation so auto is the default one so
+        // when u type a+b it gets called with auto so it
+        // just calculates the shape strides and stores
+        // them in the primitive
+        auto primit = new MultiplicationPrimitive(*this, other);
+        primit->desc_a = BroadcastDescriptor::create(result.dims);
+        primit->desc_b = BroadcastDescriptor::create(result.dims);
+        broadcast_shapes(array_desc, other.array_desc, result.array_desc,
+                         primit->desc_a, primit->desc_b, dims, other.dims);
+        primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+        primit->dims_collapsed = true;
+        result.total_size = result.accumul(0, result.dims);
+        result.tape = primit;
+        return;
+    }
+    
+    // multiplicatiion logic
+    
+    update_from_trace();
+    other.update_from_trace();
+    
+    // EXECUTION PATH : FOR EVAL_CPU AND EXEC_TRACE_CPU
+    if (result.dims != fmax(dims, other.dims)) {
+        throw std::invalid_argument("Incompatible dims of the result mat");
+    }
+    if (result.dims == 0) {
+        // scalar - scalar, no broadcasting needed
+        dispatch_type(type, result.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            out_data[0] = static_cast<T*>(buffer)[0]
+                        * static_cast<T*>(other.buffer)[0];
+        });
+        return;
+    }
+    
+    int cdims = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.out_dims;
+    size_m* strideA = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.stridesA;
+    size_m* strideB = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.stridesB;
+    size_m* strideR = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.stridesC;
+    
+    dispatch_type(type, result.buffer, [&](auto *out_data) {
+        using T = std::decay_t<decltype(*out_data)>;
+        for (int gid = 0; gid < result.total_size; gid++) {
+            // globalIndex for A and B
+            size_t GindexA = 0;
+            size_t GindexB = 0;
+            
+            // axis Index for Result like temp storage for i, j, k, l ... along each
+            // axis for result
+            size_t indexR = 0;
+            
+            int rem = gid;
+            for (int i = 0; i < cdims; i++) {
+                indexR = rem / strideR[i];
+                GindexA += indexR * strideA[i];
+                GindexB += indexR * strideB[i];
+                rem %= strideR[i];
+            }
+            
+            out_data[gid] = static_cast<T *>(buffer)[GindexA] * static_cast<T *>(other.buffer)[GindexB];
+        }
+    });
+}
+void matrix::subtract_cpu_brodcasted( matrix &other, matrix &result, EvalType evalType)  {
+    if (evalType == EvalType::EVAL_AUTO) {
+        // lazy evaluation so auto is the default one so
+        // when u type a+b it gets called with auto so it
+        // just calculates the shape strides and stores
+        // them in the primitive
+        auto primit = new SubtractionPrimitive(*this, other);
+        primit->desc_a = BroadcastDescriptor::create(result.dims);
+        primit->desc_b = BroadcastDescriptor::create(result.dims);
+        broadcast_shapes(array_desc, other.array_desc, result.array_desc,
+                         primit->desc_a, primit->desc_b, dims, other.dims);
+        primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(),result.dims, INT32_MAX);
+        primit->dims_collapsed = true;
+        result.total_size = result.accumul(0, result.dims);
+        result.tape = primit;
+        return;
+    }
+    
+    update_from_trace();
+    other.update_from_trace();
+    
+    // EXECUTION PATH : FOR EVAL_CPU AND EXEC_TRACE_CPU
+    if (result.dims != fmax(dims, other.dims)) {
+        throw std::invalid_argument("Incompatible dims of the result mat");
+    }
+    // Before the stride extraction and loop:
+    if (result.dims == 0) {
+        // scalar - scalar, no broadcasting needed
+        dispatch_type(type, result.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            out_data[0] = static_cast<T*>(buffer)[0]
+                        - static_cast<T*>(other.buffer)[0];
+        });
+        return;
+    }
+    
+    int cdims = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.out_dims;
+    size_m* strideA = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.stridesA;
+    size_m* strideB = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.stridesB;
+    size_m* strideR = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.stridesC;
+    
+    dispatch_type(type, result.buffer, [&](auto *out_data) {
+        using T = std::decay_t<decltype(*out_data)>;
+        for (int gid = 0; gid < result.total_size; gid++) {
+            // globalIndex for A and B
+            size_t GindexA = 0;
+            size_t GindexB = 0;
+            
+            // axis Index for Result like temp storage for i, j, k, l ... along each
+            // axis for result
+            size_t indexR = 0;
+            
+            int rem = gid;
+            for (int i = 0; i < cdims; i++) {
+                indexR = rem / strideR[i];
+                GindexA += indexR * strideA[i];
+                GindexB += indexR * strideB[i];
+                rem %= strideR[i];
+            }
+            
+            out_data[gid] = static_cast<T *>(buffer)[GindexA] - static_cast<T *>(other.buffer)[GindexB];
+        }
+    });
+}
+void matrix::divide_cpu_brodcasted( matrix &other, matrix &result, EvalType evalType)  {
+    if (evalType == EvalType::EVAL_AUTO) {
+        // lazy evaluation so auto is the default one so
+        // when u type a+b it gets called with auto so it
+        // just calculates the shape strides and stores
+        // them in the primitive
+        auto primit = new DivisionPrimitive(*this, other);
+        primit->desc_a = BroadcastDescriptor::create(result.dims);
+        primit->desc_b = BroadcastDescriptor::create(result.dims);
+        broadcast_shapes(array_desc, other.array_desc, result.array_desc,
+                         primit->desc_a, primit->desc_b, dims, other.dims);
+        primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+        primit->dims_collapsed = true;
+        result.total_size = result.accumul(0, result.dims);
+        result.tape = primit;
+        return;
+    }
+    
+    // division logic
+    
+    update_from_trace();
+    other.update_from_trace();
+    
+    if (result.dims == 0) {
+        // scalar - scalar, no broadcasting needed
+        dispatch_type(type, result.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            out_data[0] = static_cast<T*>(buffer)[0] / static_cast<T*>(other.buffer)[0];
+        });
+        return;
+    }
+    
+    // EXECUTION PATH : FOR EVAL_CPU AND EXEC_TRACE_CPU
+    if (result.dims != fmax(dims, other.dims)) {
+        throw std::invalid_argument("Incompatible dims of the result mat");
+    }
+    
+    int cdims = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.out_dims;
+    size_m* strideA = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.stridesA;
+    size_m* strideB = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.stridesB;
+    size_m* strideR = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.stridesC;
+    
+    dispatch_type(type, result.buffer, [&](auto *out_data) {
+        using T = std::decay_t<decltype(*out_data)>;
+        for (int gid = 0; gid < result.total_size; gid++) {
+            // globalIndex for A and B
+            size_t GindexA = 0;
+            size_t GindexB = 0;
+            
+            // axis Index for Result like temp storage for i, j, k, l ... along each
+            // axis for result
+            size_t indexR = 0;
+            
+            int rem = gid;
+            for (int i = 0; i < cdims; i++) {
+                indexR = rem / strideR[i];
+                GindexA += indexR * strideA[i];
+                GindexB += indexR * strideB[i];
+                rem %= strideR[i];
+            }
+            
+            out_data[gid] = static_cast<T *>(buffer)[GindexA] / static_cast<T *>(other.buffer)[GindexB];
+        }
+    });
+}
 
 void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType)  {
     
-    if (evalType == EvalType::EXEC_TRACE_METAL) {
-        return;
-    }
+//    if (evalType == EvalType::EXEC_TRACE) {
+//        return;
+//    }
     
     if (evalType == EvalType::EVAL_AUTO) {
         // lazy evaluation so auto is the default one so
@@ -1794,6 +5092,8 @@ void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType
         primit->desc_b = BroadcastDescriptor::create(result.dims);
         broadcast_shapes(array_desc, other.array_desc, result.array_desc,
                          primit->desc_a, primit->desc_b, dims, other.dims);
+        primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_a->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+        primit->dims_collapsed = true;
         result.total_size = result.accumul(0, result.dims);
         result.tape = primit;
         return;
@@ -1815,21 +5115,21 @@ void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType
 //    }
     // for situations where c = a+b; d= c+c
     // c is an unmaterialised temp so it has no buffer thus both c's where treated differently or for that matter reusing temp nodes recalcuated and allocated everything cause we didnt know they were the same thing but same nodes shared same primitive so we stored some of the properties in the primitive so we can identify if somwhere else memory for c has been allocated then we use the same
-    if (result.tape->out_buffer && !result.buffer) {
-        result.buffer = result.tape->out_buffer;
-        result.metalBuffer = result.tape->out_metal_buffer;
-        result.refCount = result.tape->out_refcount;
-        result.refCount->fetch_add(1);
-        return;
-    } else {
-        result.buffer = new uint8_t[result.effectiveBufferSize() * dtype_size(type)];
-        result.begin_refcount();
-        result.buildMetalBuffer();
-        
-        result.tape->out_buffer = (uint8_t*)result.buffer;
-        result.tape->out_metal_buffer = result.metalBuffer;
-        result.tape->out_refcount = result.refCount;
-    }
+//    if (result.tape->out_buffer && !result.buffer) {
+//        result.buffer = result.tape->out_buffer;
+//        result.metalBuffer = result.tape->out_metal_buffer;
+//        result.refCount = result.tape->out_refcount;
+//        result.refCount->fetch_add(1);
+//        return;
+//    } else {
+//        result.buffer = new uint8_t[result.effectiveBufferSize() * dtype_size(type)];
+//        result.begin_refcount();
+//        result.buildMetalBuffer();
+//        
+//        result.tape->out_buffer = (uint8_t*)result.buffer;
+//        result.tape->out_metal_buffer = result.metalBuffer;
+//        result.tape->out_refcount = result.refCount;
+//    }
     
     id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
     id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
@@ -1846,10 +5146,17 @@ void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType
     update_from_trace();
     other.update_from_trace();
     
-    int result_dims = result.dims;
-    size_m *strideA = ((AdditionPrimitive *)result.tape)->desc_a->strides(result.dims);
-    size_m *strideB = ((AdditionPrimitive *)result.tape)->desc_b->strides(result.dims);
-    auto _threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+    
+    size_m* strideA = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.stridesA;
+    size_m* strideB = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.stridesB;
+    size_m* strideR = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.stridesC;
+    
+    size_m* result_shape = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.shape;
+    
+    int cdims = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.out_dims;
+    
+    
+
     auto _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
     
     [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
@@ -1857,19 +5164,31 @@ void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType
     setBufferOrBytes(commandEncoder, other, 2);
     
     int typeCode = (int)type;
-    
-    if (result.dims == 1) {
+    NSUInteger max_threads;
+    if (cdims == 0) {
+        if (!GlobalGPUManager.BrodcastedAddInit[typeCode][0]) {
+            GlobalGPUManager.initBrodcastedAddInit(typeCode, 0);
+        }
+        size_m one = 1;
+        [commandEncoder setBytes:&one length: sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedAddComputeState[typeCode][0]];
+        _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+        max_threads = [GlobalGPUManager.BrodcastedAddComputeState[typeCode][0] maxTotalThreadsPerThreadgroup];
+    } else if (cdims == 1) {
         // 1D specialisation
         if (!GlobalGPUManager.BrodcastedAddInit[typeCode][0]) {
             GlobalGPUManager.initBrodcastedAddInit(typeCode, 0);
         }
-        [commandEncoder setBytes:result.strides() length:result.dims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
         [commandEncoder setBytes:strideA length:sizeof(size_m) atIndex:4];
         [commandEncoder setBytes:strideB length:sizeof(size_m) atIndex:5];
         [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedAddComputeState[typeCode][0]];
         _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+        max_threads = [GlobalGPUManager.BrodcastedAddComputeState[typeCode][0] maxTotalThreadsPerThreadgroup];
         
-    } else if (result.dims == 2) {
+    } else if (cdims == 2) {
         // 2D specialisation
         if (!GlobalGPUManager.BrodcastedAddInit[typeCode][1]) {
             GlobalGPUManager.initBrodcastedAddInit(typeCode, 1);
@@ -1879,8 +5198,9 @@ void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType
         [commandEncoder setBytes:strideB length:result.dims * sizeof(size_m) atIndex:5];
         [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedAddComputeState[typeCode][1]];
         _dispatchExecutionSize = MTLSizeMake(result.shape()[1], result.shape()[0], 1);
+        max_threads = [GlobalGPUManager.BrodcastedAddComputeState[typeCode][1] maxTotalThreadsPerThreadgroup];
         
-    } else if (result.dims == 3) {
+    } else if (cdims == 3) {
         // 3D specialisation
         if (!GlobalGPUManager.BrodcastedAddInit[typeCode][2]) {
             GlobalGPUManager.initBrodcastedAddInit(typeCode, 2);
@@ -1890,23 +5210,26 @@ void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType
         [commandEncoder setBytes:strideB length:result.dims * sizeof(size_m) atIndex:5];
         [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedAddComputeState[typeCode][2]];
         _dispatchExecutionSize = MTLSizeMake(result.shape()[2], result.shape()[1], result.shape()[0]);
+        max_threads = [GlobalGPUManager.BrodcastedAddComputeState[typeCode][2] maxTotalThreadsPerThreadgroup];
         
     } else {
         // ND specialisation
         if (!GlobalGPUManager.BrodcastedAddInit[typeCode][3]) {
             GlobalGPUManager.initBrodcastedAddInit(typeCode, 3);
         }
-        [commandEncoder setBytes:result.strides() length:result.dims * sizeof(size_m) atIndex:3];
-        [commandEncoder setBytes:strideA length:result.dims * sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:strideB length:result.dims * sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:result.strides() length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
         [commandEncoder setBytes:result.shape() length:result.dims * sizeof(size_m) atIndex:6];
-        [commandEncoder setBytes:&result_dims length:sizeof(int) atIndex:7];
+        [commandEncoder setBytes:&cdims length:sizeof(int) atIndex:7];
         [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedAddComputeState[typeCode][3]];
         _dispatchExecutionSize = MTLSizeMake(result.shape()[result.dims - 1],
                                              result.shape()[result.dims - 2],
                                              result.accumul(0, result.dims - 2));
+        max_threads = [GlobalGPUManager.BrodcastedAddComputeState[typeCode][3] maxTotalThreadsPerThreadgroup];
     }
     
+    auto _threadsPerThreadgroup = MTLSizeMake(max_threads, 1, 1);
     [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
     
 //    [commandEncoder endEncoding];
@@ -1925,9 +5248,359 @@ void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType
 }
 
 
-void matrix::multiply_gpu_brodcasted(const matrix &other, matrix &result, EvalType evalType) const {}
-void matrix::subtract_gpu_brodcasted(const matrix &other, matrix &result, EvalType evalType) const {}
-void matrix::divide_gpu_brodcasted(const matrix &other, matrix &result, EvalType evalType) const {}
+void matrix::multiply_gpu_brodcasted( matrix &other, matrix &result, EvalType evalType) {
+//    if (evalType == EvalType::EXEC_TRACE) {
+//        return;
+//    }
+    
+    if (evalType == EvalType::EVAL_AUTO) {
+        // lazy evaluation so auto is the default one so
+        // when u type a+b it gets called with auto so it
+        // just calculates the shape strides and stores
+        // them in the primitive
+        if (result.dims != fmax(dims, other.dims)) {
+            throw std::invalid_argument("Incompatible dims of the result mat");
+        }
+        auto primit = new MultiplicationPrimitive(*this, other);
+        primit->desc_a = BroadcastDescriptor::create(result.dims);
+        primit->desc_b = BroadcastDescriptor::create(result.dims);
+        broadcast_shapes(array_desc, other.array_desc, result.array_desc,
+                         primit->desc_a, primit->desc_b, dims, other.dims);
+        primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+        primit->dims_collapsed = true;
+        result.total_size = result.accumul(0, result.dims);
+        result.tape = primit;
+        return;
+    }
+    
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    update_from_trace();
+    other.update_from_trace();
+    
+    int result_dims = result.dims;
+    size_m* strideA = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.stridesA;
+    size_m* strideB = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.stridesB;
+    size_m* strideR = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.stridesC;
+    
+    size_m* result_shape = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.shape;
+    int cdims = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.out_dims;
+    
+    
+    auto _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+    
+    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, *this, 1);
+    setBufferOrBytes(commandEncoder, other, 2);
+    
+    int typeCode = (int)type;
+    NSUInteger max_threads;
+    
+    if (cdims == 0) {
+        if (!GlobalGPUManager.BrodcastedMulInit[typeCode][0]) {
+            GlobalGPUManager.initBrodcastedMulInit(typeCode, 0);
+        }
+        size_m one = 1;
+        [commandEncoder setBytes:&one length: sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedMulComputeState[typeCode][0]];
+        _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+        max_threads = [GlobalGPUManager.BrodcastedMulComputeState[typeCode][0] maxTotalThreadsPerThreadgroup];
+    } else if (cdims == 1) {
+        // 1D specialisation
+        if (!GlobalGPUManager.BrodcastedMulInit[typeCode][0]) {
+            GlobalGPUManager.initBrodcastedMulInit(typeCode, 0);
+        }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedMulComputeState[typeCode][0]];
+        _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+        max_threads = [GlobalGPUManager.BrodcastedMulComputeState[typeCode][0] maxTotalThreadsPerThreadgroup];
+
+        
+    } else if (cdims == 2) {
+        // 2D specialisation
+        if (!GlobalGPUManager.BrodcastedMulInit[typeCode][1]) {
+            GlobalGPUManager.initBrodcastedMulInit(typeCode, 1);
+        }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedMulComputeState[typeCode][1]];
+        _dispatchExecutionSize = MTLSizeMake(result_shape[1], result_shape[0], 1);
+        max_threads = [GlobalGPUManager.BrodcastedMulComputeState[typeCode][1] maxTotalThreadsPerThreadgroup];
+
+        
+    } else if (cdims == 3) {
+        // 3D specialisation
+        if (!GlobalGPUManager.BrodcastedMulInit[typeCode][2]) {
+            GlobalGPUManager.initBrodcastedMulInit(typeCode, 2);
+        }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedMulComputeState[typeCode][2]];
+        _dispatchExecutionSize = MTLSizeMake(result_shape[2], result_shape[1], result_shape[0]);
+        max_threads = [GlobalGPUManager.BrodcastedMulComputeState[typeCode][2] maxTotalThreadsPerThreadgroup];
+
+        
+    } else {
+        // ND specialisation
+        if (!GlobalGPUManager.BrodcastedMulInit[typeCode][3]) {
+            GlobalGPUManager.initBrodcastedMulInit(typeCode, 3);
+        }
+        size_t bulk = 1;
+        for (int i = 0; i < cdims-2; i++) { bulk *= result_shape[i]; }
+        [commandEncoder setBytes:result.strides() length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:result_shape length:cdims * sizeof(size_m) atIndex:6];
+        [commandEncoder setBytes:&cdims length:sizeof(int) atIndex:7];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedMulComputeState[typeCode][3]];
+        _dispatchExecutionSize = MTLSizeMake(result_shape[cdims - 1],
+                                             result_shape[cdims - 2],
+                                             bulk);
+        max_threads = [GlobalGPUManager.BrodcastedMulComputeState[typeCode][3] maxTotalThreadsPerThreadgroup];
+
+    }
+    auto _threadsPerThreadgroup = MTLSizeMake(max_threads, 1, 1);
+    
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    
+}
+void matrix::subtract_gpu_brodcasted( matrix &other, matrix &result, EvalType evalType) {
+//    if (evalType == EvalType::EXEC_TRACE) {
+//        return;
+//    }
+    
+    if (evalType == EvalType::EVAL_AUTO) {
+        // lazy evaluation so auto is the default one so
+        // when u type a+b it gets called with auto so it
+        // just calculates the shape strides and stores
+        // them in the primitive
+        if (result.dims != fmax(dims, other.dims)) {
+            throw std::invalid_argument("Incompatible dims of the result mat");
+        }
+        auto primit = new SubtractionPrimitive(*this, other);
+        primit->desc_a = BroadcastDescriptor::create(result.dims);
+        primit->desc_b = BroadcastDescriptor::create(result.dims);
+        broadcast_shapes(array_desc, other.array_desc, result.array_desc,
+                         primit->desc_a, primit->desc_b, dims, other.dims);
+        primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+        primit->dims_collapsed = true;
+        result.total_size = result.accumul(0, result.dims);
+        result.tape = primit;
+        return;
+    }
+    
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    update_from_trace();
+    other.update_from_trace();
+    
+    
+    size_m* strideA = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.stridesA;
+    size_m* strideB = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.stridesB;
+    size_m* strideR = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.stridesC;
+    
+    size_m* result_shape = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.shape;
+    int cdims = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.out_dims;
+    auto _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+    
+    
+    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, *this, 1);
+    setBufferOrBytes(commandEncoder, other, 2);
+    
+    int typeCode = (int)type;
+    NSUInteger max_threads;
+    
+    if (cdims == 0) {
+        if (!GlobalGPUManager.BrodcastedSubInit[typeCode][0]) {
+            GlobalGPUManager.initBrodcastedSubInit(typeCode, 0);
+        }
+        size_m one = 1;
+        [commandEncoder setBytes:&one length: sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedSubComputeState[typeCode][0]];
+        _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+        max_threads = [GlobalGPUManager.BrodcastedSubComputeState[typeCode][0] maxTotalThreadsPerThreadgroup];
+    } else if (cdims == 1) {
+        // 1D specialisation
+        if (!GlobalGPUManager.BrodcastedSubInit[typeCode][0]) {
+            GlobalGPUManager.initBrodcastedSubInit(typeCode, 0);
+        }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedSubComputeState[typeCode][0]];
+        _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+        max_threads = [GlobalGPUManager.BrodcastedSubComputeState[typeCode][0] maxTotalThreadsPerThreadgroup];
+        
+    } else if (cdims == 2) {
+        // 2D specialisation
+        if (!GlobalGPUManager.BrodcastedSubInit[typeCode][1]) {
+            GlobalGPUManager.initBrodcastedSubInit(typeCode, 1);
+        }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedSubComputeState[typeCode][1]];
+        _dispatchExecutionSize = MTLSizeMake(result_shape[1], result_shape[0], 1);
+        max_threads = [GlobalGPUManager.BrodcastedSubComputeState[typeCode][1] maxTotalThreadsPerThreadgroup];
+        
+    } else if (cdims == 3) {
+        // 3D specialisation
+        if (!GlobalGPUManager.BrodcastedSubInit[typeCode][2]) {
+            GlobalGPUManager.initBrodcastedSubInit(typeCode, 2);
+        }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedSubComputeState[typeCode][2]];
+        _dispatchExecutionSize = MTLSizeMake(result_shape[2], result_shape[1], result_shape[0]);
+        max_threads = [GlobalGPUManager.BrodcastedSubComputeState[typeCode][2] maxTotalThreadsPerThreadgroup];
+        
+    } else {
+        // ND specialisation
+        if (!GlobalGPUManager.BrodcastedSubInit[typeCode][3]) {
+            GlobalGPUManager.initBrodcastedSubInit(typeCode, 3);
+        }
+        size_t bulk = 1;
+        for (int i = 0; i < cdims-2; i++) { bulk *= result_shape[i]; }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:result_shape length:cdims * sizeof(size_m) atIndex:6];
+        [commandEncoder setBytes:&cdims length:sizeof(int) atIndex:7];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedSubComputeState[typeCode][3]];
+        _dispatchExecutionSize = MTLSizeMake(result_shape[cdims - 1],
+                                             result_shape[cdims - 2],
+                                             bulk);
+        max_threads = [GlobalGPUManager.BrodcastedSubComputeState[typeCode][3] maxTotalThreadsPerThreadgroup];
+    }
+    auto _threadsPerThreadgroup = MTLSizeMake(max_threads, 1, 1);
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+}
+
+void matrix::divide_gpu_brodcasted( matrix &other, matrix &result, EvalType evalType) {
+//    if (evalType == EvalType::EXEC_TRACE) {
+//        return;
+//    }
+    
+    if (evalType == EvalType::EVAL_AUTO) {
+        // lazy evaluation so auto is the default one so
+        // when u type a+b it gets called with auto so it
+        // just calculates the shape strides and stores
+        // them in the primitive
+        if (result.dims != fmax(dims, other.dims)) {
+            throw std::invalid_argument("Incompatible dims of the result mat");
+        }
+        auto primit = new DivisionPrimitive(*this, other);
+        primit->desc_a = BroadcastDescriptor::create(result.dims);
+        primit->desc_b = BroadcastDescriptor::create(result.dims);
+        broadcast_shapes(array_desc, other.array_desc, result.array_desc,
+                         primit->desc_a, primit->desc_b, dims, other.dims);
+        primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+        primit->dims_collapsed = true;
+        result.total_size = result.accumul(0, result.dims);
+        result.tape = primit;
+        return;
+    }
+    
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    update_from_trace();
+    other.update_from_trace();
+    
+    
+    size_m* strideA = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.stridesA;
+    size_m* strideB = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.stridesB;
+    size_m* strideR = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.stridesC;
+    
+    size_m* result_shape = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.shape;
+    int cdims = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.out_dims;
+    
+    auto _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+    
+    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, *this, 1);
+    setBufferOrBytes(commandEncoder, other, 2);
+    
+    int typeCode = (int)type;
+    NSUInteger max_threads;
+    
+    if (cdims == 0) {
+        if (!GlobalGPUManager.BrodcastedDivInit[typeCode][0]) {
+            GlobalGPUManager.initBrodcastedDivInit(typeCode, 0);
+        }
+        size_m one = 1;
+        [commandEncoder setBytes:&one length: sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedDivComputeState[typeCode][0]];
+        _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+        max_threads = [GlobalGPUManager.BrodcastedDivComputeState[typeCode][0] maxTotalThreadsPerThreadgroup];
+    } else if (cdims == 1) {
+        // 1D specialisation
+        if (!GlobalGPUManager.BrodcastedDivInit[typeCode][0]) {
+            GlobalGPUManager.initBrodcastedDivInit(typeCode, 0);
+        }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedDivComputeState[typeCode][0]];
+        _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
+        max_threads = [GlobalGPUManager.BrodcastedDivComputeState[typeCode][0] maxTotalThreadsPerThreadgroup];
+        
+    } else if (cdims == 2) {
+        // 2D specialisation
+        if (!GlobalGPUManager.BrodcastedDivInit[typeCode][1]) {
+            GlobalGPUManager.initBrodcastedDivInit(typeCode, 1);
+        }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedDivComputeState[typeCode][1]];
+        _dispatchExecutionSize = MTLSizeMake(result_shape[1], result_shape[0], 1);
+        max_threads = [GlobalGPUManager.BrodcastedDivComputeState[typeCode][1] maxTotalThreadsPerThreadgroup];
+        
+    } else if (cdims == 3) {
+        // 3D specialisation
+        if (!GlobalGPUManager.BrodcastedDivInit[typeCode][2]) {
+            GlobalGPUManager.initBrodcastedDivInit(typeCode, 2);
+        }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedDivComputeState[typeCode][2]];
+        _dispatchExecutionSize = MTLSizeMake(result_shape[2], result_shape[1], result_shape[0]);
+        max_threads = [GlobalGPUManager.BrodcastedDivComputeState[typeCode][2] maxTotalThreadsPerThreadgroup];
+        
+    } else {
+        // ND specialisation
+        if (!GlobalGPUManager.BrodcastedDivInit[typeCode][3]) {
+            GlobalGPUManager.initBrodcastedDivInit(typeCode, 3);
+        }
+        size_t bulk = 1;
+        for (int i = 0; i < cdims-2; i++) { bulk *= result_shape[i]; }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:result_shape length:cdims * sizeof(size_m) atIndex:6];
+        [commandEncoder setBytes:&cdims length:sizeof(int) atIndex:7];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedDivComputeState[typeCode][3]];
+        _dispatchExecutionSize = MTLSizeMake(result_shape[cdims - 1],
+                                             result_shape[cdims - 2],
+                                             bulk);
+        max_threads = [GlobalGPUManager.BrodcastedDivComputeState[typeCode][3] maxTotalThreadsPerThreadgroup];
+    }
+    auto _threadsPerThreadgroup = MTLSizeMake(max_threads, 1, 1);
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+}
 
 void matrix::add_cpu( matrix &other, matrix &result, EvalType evalType) {
 //    if (evalType == EvalType::EVAL_AUTO) {
@@ -1985,92 +5658,203 @@ void matrix::add_cpu( matrix &other, matrix &result, EvalType evalType) {
         }
     });
 }
-void matrix::multiply_cpu(const matrix &other, matrix &result,
-                          EvalType evalType) const {}
-void matrix::subtract_cpu(const matrix &other, matrix &result,
-                          EvalType evalType) const {}
-void matrix::divide_cpu(const matrix &other, matrix &result,
-                        EvalType evalType) const {}
+void matrix::multiply_cpu( matrix &other, matrix &result,
+                          EvalType evalType)  {}
+void matrix::subtract_cpu( matrix &other, matrix &result,
+                          EvalType evalType)  {}
+void matrix::divide_cpu( matrix &other, matrix &result,
+                        EvalType evalType)  {}
 
-void matrix::add_gpu(const matrix &other, matrix &result,
-                     EvalType evalType) const {}
-void matrix::multiply_gpu(const matrix &other, matrix &result,
-                          EvalType evalType) const {}
-void matrix::subtract_gpu(const matrix &other, matrix &result,
-                          EvalType evalType) const {}
-void matrix::divide_gpu(const matrix &other, matrix &result,
-                        EvalType evalType) const {}
+void matrix::add_gpu( matrix &other, matrix &result,
+                     EvalType evalType)  {}
+void matrix::multiply_gpu( matrix &other, matrix &result,
+                          EvalType evalType)  {}
+void matrix::subtract_gpu( matrix &other, matrix &result,
+                          EvalType evalType)  {}
+void matrix::divide_gpu( matrix &other, matrix &result,
+                        EvalType evalType)  {}
 
 matrix operator+(const matrix& a, const matrix& b) {
-    if (a.type != b.type)
-        throw std::invalid_argument("matrix: type mismatch");
-    matrix result(std::lcm(a.dims, b.dims), a.type);
-    auto primit = new AdditionPrimitive(a, b);
+    dtype common = promote_types(a.type, b.type);
+    const matrix& lhs = (a.type == common) ? a : a.astype(common);
+    const matrix& rhs = (b.type == common) ? b : b.astype(common);
+    matrix result(std::max(lhs.dims, rhs.dims), common);
+    auto primit = new AdditionPrimitive(lhs, rhs);
     primit->desc_a = BroadcastDescriptor::create(result.dims);
     primit->desc_b = BroadcastDescriptor::create(result.dims);
-    broadcast_shapes(a.array_desc, b.array_desc, result.array_desc,
-                     primit->desc_a, primit->desc_b, a.dims, b.dims);
+    broadcast_shapes(lhs.array_desc, rhs.array_desc, result.array_desc,
+                     primit->desc_a, primit->desc_b, lhs.dims, rhs.dims);
+    primit->collapsed_dims_3 = collapse_dims(
+        primit->desc_a->shape(),
+        primit->desc_a->strides(result.dims),
+        primit->desc_b->strides(result.dims),
+        result.strides(), result.dims, INT32_MAX);
+    primit->dims_collapsed = true;
     result.total_size = result.accumul(0, result.dims);
-    result.tape = primit;                                                                                                       
+    result.tape = primit;
     return result;
 }
 
-matrix operator-(const matrix &a, const matrix &b) {
-    if (a.type != b.type)
-        throw std::invalid_argument("matrix: type mismatch");
-    matrix result(std::lcm(a.dims, b.dims), a.type);
-    result.begin_refcount();
-    // tape.node = +1
+matrix operator-(const matrix& a, const matrix& b) {
+    dtype common = promote_types(a.type, b.type);
+    const matrix& lhs = (a.type == common) ? a : a.astype(common);
+    const matrix& rhs = (b.type == common) ? b : b.astype(common);
+    matrix result(std::max(lhs.dims, rhs.dims), common);
+    auto primit = new SubtractionPrimitive(lhs, rhs);
+    primit->desc_a = BroadcastDescriptor::create(result.dims);
+    primit->desc_b = BroadcastDescriptor::create(result.dims);
+    broadcast_shapes(lhs.array_desc, rhs.array_desc, result.array_desc,
+                     primit->desc_a, primit->desc_b, lhs.dims, rhs.dims);
+    primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+    primit->dims_collapsed = true;
+    result.total_size = result.accumul(0, result.dims);
+    result.tape = primit;
     return result;
 }
 
-matrix operator*(const matrix &a, const matrix &b) {
-    if (a.type != b.type)
-        throw std::invalid_argument("matrix: type mismatch");
-    
-    matrix result(std::lcm(a.dims, b.dims), a.type);
-    // tape.node = +1
-    a.multiply(b, result);
+matrix operator*(const matrix& a, const matrix& b) {
+    dtype common = promote_types(a.type, b.type);
+    const matrix& lhs = (a.type == common) ? a : a.astype(common);
+    const matrix& rhs = (b.type == common) ? b : b.astype(common);
+    matrix result(std::max(lhs.dims, rhs.dims), common);
+    auto primit = new MultiplicationPrimitive(lhs, rhs);
+    primit->desc_a = BroadcastDescriptor::create(result.dims);
+    primit->desc_b = BroadcastDescriptor::create(result.dims);
+    broadcast_shapes(lhs.array_desc, rhs.array_desc, result.array_desc,
+                     primit->desc_a, primit->desc_b, lhs.dims, rhs.dims);
+    primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+    primit->dims_collapsed = true;
+    result.total_size = result.accumul(0, result.dims);
+    result.tape = primit;
     return result;
 }
 
-matrix operator/(const matrix &a, const matrix &b) {
-    if (a.type != b.type)
-        throw std::invalid_argument("matrix: type mismatch");
-    matrix result(std::lcm(a.dims, b.dims), a.type);
-    // tape.node = +1
-    a.divide(b, result);
+matrix operator/(const matrix& a, const matrix& b) {
+    dtype common = promote_types(a.type, b.type);
+    const matrix& lhs = (a.type == common) ? a : a.astype(common);
+    const matrix& rhs = (b.type == common) ? b : b.astype(common);
+    matrix result(std::max(lhs.dims, rhs.dims), common);
+    auto primit = new DivisionPrimitive(lhs, rhs);
+    primit->desc_a = BroadcastDescriptor::create(result.dims);
+    primit->desc_b = BroadcastDescriptor::create(result.dims);
+    broadcast_shapes(lhs.array_desc, rhs.array_desc, result.array_desc,
+                     primit->desc_a, primit->desc_b, lhs.dims, rhs.dims);
+    primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+    primit->dims_collapsed = true;
+    result.total_size = result.accumul(0, result.dims);
+    result.tape = primit;
     return result;
+}
+
+matrix matrix::astype(dtype new_type, bool make_contig) const {
+    matrix output(dims, new_type);
+    memcpy(output.shape(), shape(), dims * sizeof(size_m));
+    if (make_contig) {
+        output.calcStrides();
+    } else {
+        memcpy(output.strides(), strides(), dims * sizeof(size_m));
+        output.flags = flags;
+        output.flags &= ~NON_OWNERSHIP_FLAG;
+    }
+    output.total_size = total_size;
+    output.tape = new AsTypePrimitive(*this, new_type);
+    return output;
+}
+
+// intrinsic
+void matrix::astype(matrix output, dtype type, EvalType eval_type, ExecutionDevice exec_device) const {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = (total_size > 10) ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    if (exec_device == ExecutionDevice::METAL) {
+        if (eval_type == EvalType::EXEC_TRACE || eval_type == EvalType::EVAL_INSTANTLY) {
+            copyGPUinplaceTypeCasted(output, *this, 0, Execution::Encode);
+        }
+    } else {
+        if (eval_type == EvalType::EXEC_TRACE || eval_type == EvalType::EVAL_INSTANTLY) {
+            copyCPUinplaceTypeCasted(output, *this, 0);
+        }
+    }
+}
+
+void matrix::ensure_evaluated() const {
+    if (tape && !tape->evaluated) {
+        const_cast<matrix*>(this)->eval();
+    }
+}
+
+void matrix::eval() {
+    if (tape) {
+        if (total_size > GPU_EXECUTION_THRESHOLD) {
+            eval_metal();
+        } else {
+            eval_cpu();
+        }
+    }
 }
 
 void matrix::eval_cpu() {
-    tape->eval_cpu(*this);
+    tape->eval_cpu(*this, EvalType::EVAL_INSTANTLY);
 }
 void matrix::eval_metal() {
-    tape->eval_metal(*this);
-    [GlobalGPUManager.gCommandEncoder endEncoding];
-    [GlobalGPUManager.gCommandBuffer commit];
-    [GlobalGPUManager.gCommandBuffer waitUntilCompleted];
+    if (!tape) return;
+    tape->eval_metal(*this, EvalType::EVAL_INSTANTLY);
+    
+    if (GlobalGPUManager.gCommandBuffer) {
+        GlobalGPUManager.endCommandEncoding();
+        [GlobalGPUManager.gCommandBuffer commit];
+        [GlobalGPUManager.gCommandBuffer waitUntilCompleted];
+        GlobalGPUManager.gCommandBuffer = nil;
+    }
 }
 void matrix::compile_cpu() {
-    tape->build_trace_cpu(*this);
+    if (tape) tape->eval_cpu(*this, EvalType::COMPILE_TRACE);
 }
 void matrix::compile_metal() {
-    tape->build_trace_metal(*this);
+    if (tape) tape->eval_metal(*this, EvalType::COMPILE_TRACE);
 }
 void matrix::execute_cpu() {
-    tape->execute_trace_cpu(*this);
+    if (tape) tape->eval_cpu(*this, EvalType::EXEC_TRACE);
 }
 void matrix::execute_metal() {
-    tape->execute_trace_metal(*this);
-    [GlobalGPUManager.gCommandEncoder endEncoding];
-    [GlobalGPUManager.gCommandBuffer commit];
-    [GlobalGPUManager.gCommandBuffer waitUntilCompleted];
+    if (!tape) return;
+    tape->eval_metal(*this, EvalType::EXEC_TRACE);
+    
+    if (GlobalGPUManager.gCommandBuffer) {
+        GlobalGPUManager.endCommandEncoding();
+        [GlobalGPUManager.gCommandBuffer commit];
+        [GlobalGPUManager.gCommandBuffer waitUntilCompleted];
+        GlobalGPUManager.gCommandBuffer = nil;
+    }
 }
 void matrix::clear_trace_checks() {
     if (tape) {
         tape->clear_trace_checks();
     }
+}
+
+matrix matrix::linespace(const matrix& a, const matrix& b, size_t no_of_points) {
+    matrix t = matrix::linespace(0.0f, 1.0f, no_of_points, a.type);
+    if (a.dims > 0) {
+        uint32_t axes[a.dims];
+        for (uint32_t i = 0; i < a.dims; i++) {
+            axes[i] = i + 1;
+        }
+        t = t.unsqueeze(axes, a.dims);
+    }
+    return (b - a) * t + a;
+}
+
+matrix matrix::insert_break(std::function<void(matrix&)> lambda, ExecutionDevice exec_device) const {
+    matrix output(dims, type);
+    memcpy(output.shape(), shape(), dims * sizeof(size_m));
+    output.calcStrides();
+    output.total_size = total_size;
+    
+    ExecutionBoundaryPrimitive* prim = new ExecutionBoundaryPrimitive(*const_cast<matrix*>(this), lambda, exec_device);
+    output.tape = prim;
+    
+    return output;
 }
 
 void matrix::releaseBuffer() {
@@ -2085,6 +5869,18 @@ void matrix::releaseBuffer() {
     } else if (buffer) {
         // MUST CAST void* to uint8_t* before deleting!
         delete[] static_cast<uint8_t *>(buffer);
+    }
+    refCount = nullptr;
+    buffer = nullptr;
+    metalBuffer = nullptr;
+}
+
+void matrix::releaseTape() {
+    if (tape) {
+        if (tape->primitive_refCount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            delete tape;
+        }
+        tape = nullptr;
     }
 }
 
@@ -2101,6 +5897,7 @@ void matrix::destroyInstance() {
             delete refCount;
         }
     } else if (flags & NON_OWNERSHIP_FLAG) {
+        releaseTape();
         return;
     } else if (buffer) {
         // MUST CAST void* to uint8_t* before deleting!
@@ -2111,9 +5908,11 @@ void matrix::destroyInstance() {
     buffer = nullptr;
     refCount = nullptr;
     dims = 0;
+    releaseTape();
 }
 
-template <typename Type, typename> matrix &matrix::operator=(Type value) {
+template <typename Type, typename>
+matrix &matrix::operator=(Type value) {
     if (flags & NON_CONTIGUOUS_FLAG) {
         matrix value_mat_view(dims, 1, type);
         memcpy(value_mat_view.shape(), shape(), dims * sizeof(size_m));
@@ -2153,8 +5952,9 @@ matrix::matrix(const matrix &other) {
     total_size = other.total_size;
     flags = other.flags;
     tape = other.tape;
+    if (tape) tape->primitive_refCount.fetch_add(1, std::memory_order_relaxed);
     
-    if (other.refCount || (flags & NON_OWNERSHIP_FLAG)) {
+    if (other.refCount || (flags & NON_OWNERSHIP_FLAG) || other.tape) {
         // =======================================================
         // PATH A: SHALLOW COPY (View Sharing)
         // We share the data, so we MUST share the exact metadata!
@@ -2199,6 +5999,7 @@ matrix::matrix(const matrix &other) {
         // Calculate fresh, perfectly contiguous strides for our new buffer
         calcStrides();
         tape = other.tape;
+        if (tape) tape->primitive_refCount.fetch_add(1, std::memory_order_relaxed);
         
         if (!other.buffer) {return;}
         buffer = new uint8_t[total_size * dtype_size(type)];
@@ -2242,6 +6043,7 @@ matrix::matrix(matrix &&other) noexcept {
     other.buffer = nullptr;
     other.refCount = nil;
     other.tape = nullptr;
+    other.metalBuffer = nil;
 }
 
 matrix &matrix::operator=(matrix &&other) {
@@ -2284,179 +6086,275 @@ matrix &matrix::operator=(matrix &&other) {
     other.refCount = nil;
     other.buffer = nullptr;
     other.tape = nil;
+    other.metalBuffer = nil;
     return *this;
 }
 
 // copy assignment
-
 matrix &matrix::operator=(const matrix &other) {
-#ifdef CopyLog
-    std::cout << "Copy Assignment\n";
-#endif
-    // 1. SELF-ASSIGNMENT CHECK (Critical!)
-    // If someone does `A = A;`, we must do nothing. If we didn't check this,
-    // we would destroy A's data, and then try to copy from the destroyed A!
+
     if (this == &other) {
         return *this;
     }
-    
+    const_cast<matrix&>(other).update_from_trace();
+    // for coping ito views
+    // Copy Assignment if coping data into a view for eg doing Video[1] = frame;
+    // Video[1] is a view in which frame is being copied into
     if (flags & NON_OWNERSHIP_FLAG) {
-        // Copy Assignment if coping data into a view for eg doing Video[1] = frame;
-        // Video[1] is a view in which frame is being copied into
-        if (buffer == other.buffer) {
-#ifdef CopyLog
-            std::cout << "Ignored redundant self-assignment of views.\n";
-#endif
-            return *this;
-        }
-        
-        // --- THE BROADCAST UPGRADE ---
-        if (total_size == other.total_size || dims == other.dims) {
-            // Exact match fast-path
-            if (metalBuffer) {
+        if (total_size == other.total_size && dims == other.dims) {
+            if (total_size > 10) {
+//                eval_metal();
+//                const_cast<matrix&>(other).eval_metal();
                 copyGPUinplace(*this, other, 0);
             } else {
-                // Inline fast-path: Dodge function jump to `copyCPUinplace` entirely
-                // for contiguous pixel buffers!
-                if (total_size == other.total_size && type == other.type &&
-                    !(flags & NON_CONTIGUOUS_FLAG) &&
-                    !(other.flags & NON_CONTIGUOUS_FLAG)) {
-                    size_t bytes = total_size * dtype_size(type);
-                    if (bytes == 4)
-                        *reinterpret_cast<uint32_t *>(buffer) =
-                        *reinterpret_cast<const uint32_t *>(other.buffer);
-                    else if (bytes == 1)
-                        *reinterpret_cast<uint8_t *>(buffer) =
-                        *reinterpret_cast<const uint8_t *>(other.buffer);
-                    else if (bytes == 8)
-                        *reinterpret_cast<uint64_t *>(buffer) =
-                        *reinterpret_cast<const uint64_t *>(other.buffer);
-                    else
-                        memcpy(buffer, other.buffer, bytes);
-                } else {
-                    copyCPUinplace(*this, other, 0);
-                }
-            }
-            
-        } else {
-            // Create a temporary broadcasted view of 'other' to match 'this'
-            matrix broadcasted_other = other.broadcast_to(shape(), dims);
-            
-            if (metalBuffer)
-                copyGPUinplace(*this, broadcasted_other, 0);
-            else
-                copyCPUinplace(*this, broadcasted_other, 0);
-        }
-        tape = other.tape;
-        return *this;
-    }
-    
-    if (other.refCount) {
-        // =======================================================
-        // PATH A: SHALLOW COPY (View Sharing)
-        // =======================================================
-        destroyInstance();
-        
-        buffer = other.buffer;
-        metalBuffer = other.metalBuffer;
-        
-        // 3. COPY LOGIC (Exact mirror of your perfect Copy Constructor)
-        dims = other.dims;
-        type = other.type;
-        total_size = other.total_size;
-        flags = other.flags;
-        tape = other.tape;
-        
-        if (other.refCount) {
-            refCount = other.refCount;
-            refCount->fetch_add(1, std::memory_order_relaxed);
-        }
-        
-        if (dims <= SBO_MAX_DIMS) {
-            memcpy(shape(), other.shape(), dims * sizeof(size_m));
-            memcpy(strides(), other.strides(), dims * sizeof(size_m));
-        } else {
-            array_desc.shared_arr_desc = other.array_desc.shared_arr_desc;
-            array_desc.shared_arr_desc->refCount.fetch_add(1,
-                                                           std::memory_order_relaxed);
-        }
-        
-    } else {
-        // =======================================================
-        // PATH B: DEEP COPY (Exclusive Ownership)
-        // =======================================================
-        if (buffer == other.buffer &&
-            effectiveBufferSize() == other.effectiveBufferSize()) {
-#ifdef CopyLog
-            std::cout << "Ignored redundant self-assignment of views.\n";
-#endif
-            return *this;
-        }
-        
-        size_t new_byte_size = other.total_size * dtype_size(other.type);
-        size_t old_byte_size = total_size * dtype_size(type);
-        bool can_reuse_memory =
-        (buffer != nullptr && refCount == nullptr &&
-         !(flags & NON_OWNERSHIP_FLAG) && old_byte_size == new_byte_size);
-        // see if i am not sharing this data with anyone else and recieving from
-        // another sorce off same size why allocate again just copy
-        if (can_reuse_memory) {
-            // Rebuild the shape descriptor
-            if (dims <= SBO_MAX_DIMS) {
-                memcpy(shape(), other.shape(), dims * sizeof(size_m));
-            } else {
-                // If we already had a heap descriptor, we can just reuse it too!
-                if (!array_desc.shared_arr_desc) {
-                    array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
-                }
-                memcpy(shape(), other.shape(), dims * sizeof(size_m));
-            }
-            
-            // DEEP COPY PATH: Standard fallback
-            if (metalBuffer) {
-                copyGPUinplace(*this, other, 0);
-            } else {
+//                eval_cpu();
+//                const_cast<matrix&>(other).eval_cpu();
                 copyCPUinplace(*this, other, 0);
             }
-            tape = other.tape;
+            return *this;
+        } else {
+            matrix Brodcasted_other = other.broadcast_toV2(shape(), dims);
+            if (total_size > 10) {
+//                eval_metal();
+//                Brodcasted_other.eval_metal();
+                copyGPUinplace(*this, Brodcasted_other, 0);
+            } else {
+//                eval_cpu();
+//                Brodcasted_other.eval_cpu();
+                copyCPUinplace(*this, Brodcasted_other, 0);
+            }
             return *this;
         }
-        destroyInstance();
-        // 3. COPY LOGIC (Exact mirror of your perfect Copy Constructor)
-        dims = other.dims;
-        type = other.type;
+    }
+
+    //copy shape and strides
+    if (dims > SBO_MAX_DIMS) {
+        array_desc.shared_arr_desc->release();
+    }
+
+    dims = other.dims;
+    if (other.dims <= SBO_MAX_DIMS) {
+        memcpy(shape(), other.shape(), dims * sizeof(size_m));
+        memcpy(strides(), other.strides(), dims * sizeof(size_m));
+    } else {
+        array_desc.shared_arr_desc = other.array_desc.shared_arr_desc;
+        array_desc.shared_arr_desc->refCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    type = other.type;
+    releaseTape();
+    tape = other.tape;
+    if (tape) tape->primitive_refCount.fetch_add(1, std::memory_order_relaxed);
+    
+    // part of graph
+    // if a mat has tape then if it is realised (meaning graph has been compiled or exectuted then it must be refcounted)
+    if (other.tape) {
+        if (other.buffer) {
+            this->releaseBuffer();
+            refCount = other.refCount;
+            refCount->fetch_add(1);
+        }
+        buffer = other.buffer;
+        metalBuffer = other.metalBuffer;
         total_size = other.total_size;
         flags = other.flags;
-        tape = other.tape;
-        // 2. CLEANUP EXISTING STATE
-        // We safely release our current buffer and shared descriptors so we don't
-        // leak memory.
-        buffer = new uint8_t[new_byte_size];
-        buildMetalBuffer();
-        refCount = nullptr;
-        
-        flags &= ~NON_OWNERSHIP_FLAG;
-        flags &= ~NON_CONTIGUOUS_FLAG;
-        
-        if (dims <= SBO_MAX_DIMS) {
-            memcpy(shape(), other.shape(), dims * sizeof(size_m));
-        } else {
-            array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
-            memcpy(shape(), other.shape(), dims * sizeof(size_m));
-        }
-        
-        calcStrides();
-        copyCPUinplace(*this, other, 0);
+        return *this;
     }
+
+    // for the times when mat isnt part of a graph and is ref counted
+    if (other.refCount) {
+        this->releaseBuffer();
+        buffer = other.buffer;
+        metalBuffer = other.metalBuffer;
+        refCount = other.refCount;
+        refCount->fetch_add(1);
+        return *this;
+    }
+
+    // DEEP COPY
+    this->releaseBuffer();
+    total_size = other.total_size;
+    buffer = new uint8_t[total_size * dtype_size(other.type)];
+    calcStrides();
+    flags = other.flags;
+    flags &= ~NON_OWNERSHIP_FLAG;
+    flags &= ~NON_CONTIGUOUS_FLAG;
+    if (total_size > 10) {
+        buildMetalBuffer();
+        copyGPUinplace(*this, other, 0);
+    }
+    copyCPUinplace(*this, other, 0);
+
     return *this;
 }
+
+//matrix &matrix::operator=(const matrix &other) {
+//#ifdef CopyLog
+//    std::cout << "Copy Assignment\n";
+//#endif
+//    // 1. SELF-ASSIGNMENT CHECK (Critical!)
+//    // If someone does `A = A;`, we must do nothing. If we didn't check this,
+//    // we would destroy A's data, and then try to copy from the destroyed A!
+//    if (this == &other) {
+//        return *this;
+//    }
+//    
+//    if (flags & NON_OWNERSHIP_FLAG) {
+//        // Copy Assignment if coping data into a view for eg doing Video[1] = frame;
+//        // Video[1] is a view in which frame is being copied into
+//        if (buffer == other.buffer) {
+//#ifdef CopyLog
+//            std::cout << "Ignored redundant self-assignment of views.\n";
+//#endif
+//            return *this;
+//        }
+//        
+//        // --- THE BROADCAST UPGRADE ---
+//        if (total_size == other.total_size || dims == other.dims) {
+//            // Exact match fast-path
+//            if (metalBuffer) {
+//                copyGPUinplace(*this, other, 0);
+//            } else {
+//                // Inline fast-path: Dodge function jump to `copyCPUinplace` entirely
+//                // for contiguous pixel buffers!
+//                if (total_size == other.total_size && type == other.type &&
+//                    !(flags & NON_CONTIGUOUS_FLAG) &&
+//                    !(other.flags & NON_CONTIGUOUS_FLAG)) {
+//                    size_t bytes = total_size * dtype_size(type);
+//                    if (bytes == 4)
+//                        *reinterpret_cast<uint32_t *>(buffer) =
+//                        *reinterpret_cast<const uint32_t *>(other.buffer);
+//                    else if (bytes == 1)
+//                        *reinterpret_cast<uint8_t *>(buffer) =
+//                        *reinterpret_cast<const uint8_t *>(other.buffer);
+//                    else if (bytes == 8)
+//                        *reinterpret_cast<uint64_t *>(buffer) =
+//                        *reinterpret_cast<const uint64_t *>(other.buffer);
+//                    else
+//                        memcpy(buffer, other.buffer, bytes);
+//                } else {
+//                    copyCPUinplace(*this, other, 0);
+//                }
+//            }
+//            
+//        } else {
+//            // Create a temporary broadcasted view of 'other' to match 'this'
+//            matrix broadcasted_other = other.broadcast_to(shape(), dims);
+//            
+//            if (metalBuffer)
+//                copyGPUinplace(*this, broadcasted_other, 0);
+//            else
+//                copyCPUinplace(*this, broadcasted_other, 0);
+//        }
+//        tape = other.tape;
+//        return *this;
+//    }
+//    
+//    if (other.refCount) {
+//        // =======================================================
+//        // PATH A: SHALLOW COPY (View Sharing)
+//        // =======================================================
+//        destroyInstance();
+//        
+//        buffer = other.buffer;
+//        metalBuffer = other.metalBuffer;
+//        
+//        // 3. COPY LOGIC (Exact mirror of your perfect Copy Constructor)
+//        dims = other.dims;
+//        type = other.type;
+//        total_size = other.total_size;
+//        flags = other.flags;
+//        tape = other.tape;
+//        
+//        if (other.refCount) {
+//            refCount = other.refCount;
+//            refCount->fetch_add(1, std::memory_order_relaxed);
+//        }
+//        
+//        if (dims <= SBO_MAX_DIMS) {
+//            memcpy(shape(), other.shape(), dims * sizeof(size_m));
+//            memcpy(strides(), other.strides(), dims * sizeof(size_m));
+//        } else {
+//            array_desc.shared_arr_desc = other.array_desc.shared_arr_desc;
+//            array_desc.shared_arr_desc->refCount.fetch_add(1,
+//                                                           std::memory_order_relaxed);
+//        }
+//        
+//    } else {
+//        // =======================================================
+//        // PATH B: DEEP COPY (Exclusive Ownership)
+//        // =======================================================
+//        if (buffer == other.buffer &&
+//            effectiveBufferSize() == other.effectiveBufferSize()) {
+//#ifdef CopyLog
+//            std::cout << "Ignored redundant self-assignment of views.\n";
+//#endif
+//            return *this;
+//        }
+//        
+//        size_t new_byte_size = other.total_size * dtype_size(other.type);
+//        size_t old_byte_size = total_size * dtype_size(type);
+//        bool can_reuse_memory =
+//        (buffer != nullptr && refCount == nullptr &&
+//         !(flags & NON_OWNERSHIP_FLAG) && old_byte_size == new_byte_size);
+//        // see if i am not sharing this data with anyone else and recieving from
+//        // another sorce off same size why allocate again just copy
+//        if (can_reuse_memory) {
+//            // Rebuild the shape descriptor
+//            if (dims <= SBO_MAX_DIMS) {
+//                memcpy(shape(), other.shape(), dims * sizeof(size_m));
+//            } else {
+//                // If we already had a heap descriptor, we can just reuse it too!
+//                if (!array_desc.shared_arr_desc) {
+//                    array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
+//                }
+//                memcpy(shape(), other.shape(), dims * sizeof(size_m));
+//            }
+//            
+//            // DEEP COPY PATH: Standard fallback
+//            if (metalBuffer) {
+//                copyGPUinplace(*this, other, 0);
+//            } else {
+//                copyCPUinplace(*this, other, 0);
+//            }
+//            tape = other.tape;
+//            return *this;
+//        }
+//        destroyInstance();
+//        // 3. COPY LOGIC (Exact mirror of your perfect Copy Constructor)
+//        dims = other.dims;
+//        type = other.type;
+//        total_size = other.total_size;
+//        flags = other.flags;
+//        tape = other.tape;
+//        // 2. CLEANUP EXISTING STATE
+//        // We safely release our current buffer and shared descriptors so we don't
+//        // leak memory.
+//        buffer = new uint8_t[new_byte_size];
+//        buildMetalBuffer();
+//        refCount = nullptr;
+//        
+//        flags &= ~NON_OWNERSHIP_FLAG;
+//        flags &= ~NON_CONTIGUOUS_FLAG;
+//        
+//        if (dims <= SBO_MAX_DIMS) {
+//            memcpy(shape(), other.shape(), dims * sizeof(size_m));
+//        } else {
+//            array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
+//            memcpy(shape(), other.shape(), dims * sizeof(size_m));
+//        }
+//        
+//        calcStrides();
+//        copyCPUinplace(*this, other, 0);
+//    }
+//    return *this;
+//}
 
 matrix::~matrix() {
     if (dims > SBO_MAX_DIMS && array_desc.shared_arr_desc) {
         array_desc.shared_arr_desc->release();
     }
     
-    if (!refCount) {
+    if (!refCount && buffer) {
         if (!(flags & NON_OWNERSHIP_FLAG)) {
             delete[] static_cast<uint8_t *>(buffer);
             buffer = nullptr;
@@ -2465,7 +6363,7 @@ matrix::~matrix() {
 #endif
         }
     } else {
-        if (refCount->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (refCount && refCount->fetch_sub(1, std::memory_order_acq_rel) == 1) {
             delete[] static_cast<uint8_t *>(buffer);
             buffer = nullptr;
             delete refCount;
@@ -2475,6 +6373,7 @@ matrix::~matrix() {
 #endif
         }
     }
+    releaseTape();
 }
 //};
 
@@ -5714,3 +9613,595 @@ bool compare_shapes(const matrix &a, const matrix &b) {
 ////    }
 //
 //};
+
+matrix matrix::conv(const matrix& input, const matrix& kernel, const std::vector<int>& padding, const std::vector<int>& stride, const std::vector<int>& dilation, int groups) {
+    // generic ND convolution
+    // input shape [batch, S1, S2, ..., SN, channels]
+    // kernel shape [out_channel, K1, K2, ..., KN, in_channel]
+    // padding, stride, dilation lengths are N
+    // N = input.dims - 2
+    
+    matrix output(input.dims, input.type);
+    output.shape()[0] = input.shape()[0];
+    
+    int N = input.dims - 2;
+    for (int i = 0; i < N; i++) {
+        output.shape()[i + 1] = (input.shape()[i + 1] + 2 * padding[i] - dilation[i] * (kernel.shape()[i + 1] - 1) - 1) / stride[i] + 1;
+    }
+    
+    output.shape()[input.dims - 1] = kernel.shape()[0];
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+    output.tape = new ConvolvePrimitive(input, kernel, padding, stride, dilation, groups);
+    return output;
+}
+
+void matrix::conv_gpu(const matrix& kernel, matrix& output) {
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    
+    int typeCode = (int)type;
+    if (!GlobalGPUManager.ConvInit[typeCode]) {
+        GlobalGPUManager.initConv(typeCode);
+    }
+    
+    [commandEncoder setComputePipelineState:GlobalGPUManager.ConvComputeState[typeCode]];
+    
+    ConvolvePrimitive* prim = (ConvolvePrimitive*)output.tape;
+    int groups = prim->groups;
+    
+    // N = output.dims - 2
+    int N = output.dims - 2;
+    int num_spatial_dims = N;
+    
+    // Calculate total spatial dimensions for thread grid
+    size_t batch_and_remaining_spatial = output.shape()[0];
+    for (int i = 1; i < N; i++) {
+        batch_and_remaining_spatial *= output.shape()[i];
+    }
+    
+    // Grid: [Channels, Last Spatial Dim, Batch * Remaining Spatial Dims]
+    MTLSize gridSize = MTLSizeMake(output.shape()[output.dims - 1], output.shape()[N], batch_and_remaining_spatial);
+    
+    NSUInteger threadGroupSize = GlobalGPUManager.ConvComputeState[typeCode].maxTotalThreadsPerThreadgroup;
+    if (threadGroupSize > gridSize.width) {
+        threadGroupSize = gridSize.width;
+    }
+    MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
+    
+    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+    [commandEncoder setBuffer:metalBuffer offset:0 atIndex:1];
+    [commandEncoder setBuffer:kernel.metalBuffer offset:0 atIndex:2];
+    
+    [commandEncoder setBytes:shape() length:dims * sizeof(size_m) atIndex:3];
+    [commandEncoder setBytes:kernel.shape() length:kernel.dims * sizeof(size_m) atIndex:4];
+    [commandEncoder setBytes:output.shape() length:output.dims * sizeof(size_m) atIndex:5];
+    
+    [commandEncoder setBytes:prim->padding.data() length:prim->padding.size() * sizeof(int) atIndex:6];
+    [commandEncoder setBytes:prim->stride.data() length:prim->stride.size() * sizeof(int) atIndex:7];
+    [commandEncoder setBytes:prim->dilation.data() length:prim->dilation.size() * sizeof(int) atIndex:8];
+    [commandEncoder setBytes:&groups length:sizeof(int) atIndex:9];
+    
+    [commandEncoder setBytes:strides() length:dims * sizeof(size_m) atIndex:10];
+    [commandEncoder setBytes:kernel.strides() length:kernel.dims * sizeof(size_m) atIndex:11];
+    [commandEncoder setBytes:output.strides() length:output.dims * sizeof(size_m) atIndex:12];
+    [commandEncoder setBytes:&num_spatial_dims length:sizeof(int) atIndex:13];
+    
+    int kernel_dot_totalsize = 1;
+    for (int i = 1; i < kernel.dims; i++) {
+        kernel_dot_totalsize *= kernel.shape()[i];
+    }
+    [commandEncoder setBytes:&kernel_dot_totalsize length:sizeof(int) atIndex:14];
+    
+    [commandEncoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+}
+
+template matrix &matrix::operator=<float>(float);
+//template matrix &matrix::operator=<float16_t>(float16_t);
+template matrix &matrix::operator=<uint8_t>(uint8_t);
+template matrix &matrix::operator=<int>(int);
+template matrix &matrix::operator=<int16_t>(int16_t);
+template matrix &matrix::operator=<uint32_t>(uint32_t);
+template matrix &matrix::operator=<uint16_t>(uint16_t);
+
+// MARK: Max / Min Boilerplate
+
+matrix matrix::max(int axis, bool keepdims) {
+    if (dims == 0) {
+        return *this;
+    }
+    int outputDims = keepdims ? dims : dims - 1;
+    matrix output(outputDims, type);
+    
+    if (axis < 0) axis += dims;
+    
+    if (keepdims) {
+        memcpy(output.shape(), shape(), output.dims * sizeof(size_m));
+        output.shape()[axis] = 1;
+    } else {
+        memcpy(output.shape(), shape(), axis * sizeof(size_m));
+        memcpy(output.shape() + axis, shape() + axis + 1, (output.dims - axis) * sizeof(size_m));
+    }
+    
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+    
+    MaxPrimitive* prim = new MaxPrimitive(*this, axis, keepdims);
+    prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, INT32_MAX, keepdims);
+    prim->has_collapsed_dims = true;
+    output.tape = prim;
+    
+    return output;
+}
+
+void matrix::max(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device) {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
+    size_m noOfOpp = shape()[axis];
+    
+    MaxPrimitive* primit = static_cast<MaxPrimitive*>(output.tape);
+    
+    CollapsedDims_2 collapsed;
+    uint32_t cdims;
+    if (primit->has_collapsed_dims) {
+        collapsed = primit->collapsed_dims;
+        cdims = collapsed.out_dims;
+    } else {
+        cdims = 1;
+        collapsed.stridesA[0] = 1;
+        collapsed.stridesB[0] = 1;
+        collapsed.shape[0] = 1;
+    }
+    
+    if (cdims == 0) {
+        cdims = 1;
+        collapsed.stridesA[0] = 1;
+        collapsed.stridesB[0] = 1;
+        collapsed.shape[0] = 1;
+    }
+
+    if (exec_device == ExecutionDevice::METAL) {
+        bool use_tgr = (noOfOpp > 256);
+        int kernel_idx = cdims >= 4 ? 3 : cdims - 1;
+        if (use_tgr) {
+            kernel_idx += 4; // TGR kernels are at offset +4
+        }
+        
+        if (!GlobalGPUManager.MaxInit[(int)type][kernel_idx]) {
+            GlobalGPUManager.initMax_nd((int)type, kernel_idx);
+        }
+        
+        id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, *this, 1);
+        
+        [commandEncoder setBytes:&reduce_axis_stride length: sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:&noOfOpp length: sizeof(size_m) atIndex:3];
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        
+        int x_multiplier = use_tgr ? 256 : 1;
+        if (use_tgr) {
+            _threadsPerThreadgroup = MTLSizeMake(256, 1, 1);
+        }
+
+        if (cdims == 1) {
+            [commandEncoder setBytes:&collapsed.stridesA[0] length:sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&collapsed.stridesB[0] length:sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[0] * x_multiplier, 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setBytes:collapsed.stridesA length:2 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:2 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[1] * x_multiplier, collapsed.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setBytes:collapsed.stridesA length:3 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:3 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[2] * x_multiplier, collapsed.shape[1], collapsed.shape[0]);
+        } else {
+            [commandEncoder setBytes:collapsed.stridesA length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:cdims * sizeof(size_m) atIndex:5];
+            [commandEncoder setBytes:collapsed.shape length:cdims * sizeof(size_m) atIndex:6];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:7];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= collapsed.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[cdims-1] * x_multiplier, collapsed.shape[cdims-2], acc);
+        }
+
+        [commandEncoder setComputePipelineState:GlobalGPUManager.MaxComputeState_nd[(int)type][kernel_idx]];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        dispatch_type(type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            T* in_data = (T*)buffer;
+            size_t total_out = output.total_size;
+            
+            for (size_t gid = 0; gid < total_out; gid++) {
+                size_t AxisOffset = 0;
+                size_t remaining = gid;
+                for (size_t i = 0; i < cdims; i++) {
+                    AxisOffset += (remaining / collapsed.stridesA[i]) * collapsed.stridesB[i];
+                    remaining %= collapsed.stridesA[i];
+                }
+                T current_max = std::numeric_limits<T>::lowest();
+                for (size_t i = 0; i < noOfOpp; i++) {
+                    current_max = std::max(current_max, in_data[AxisOffset + i * reduce_axis_stride]);
+                }
+                out_data[gid] = current_max;
+            }
+        });
+    }
+}
+
+matrix matrix::max(int start, int end, bool keepdims) {
+    matrix flat = this->flatten(start, end);
+    return flat.max(start, keepdims);
+}
+
+matrix matrix::max() {
+    matrix flat = this->flatten(0, -1);
+    return flat.max(0);
+}
+
+matrix matrix::min(int axis, bool keepdims) {
+    if (dims == 0) {
+        return *this;
+    }
+    
+    int outputDims = keepdims ? dims : dims - 1;
+    matrix output(outputDims, type);
+    
+    if (axis < 0) axis += dims;
+    
+    if (keepdims) {
+        memcpy(output.shape(), shape(), output.dims * sizeof(size_m));
+        output.shape()[axis] = 1;
+    } else {
+        memcpy(output.shape(), shape(), axis * sizeof(size_m));
+        memcpy(output.shape() + axis, shape() + axis + 1, (output.dims - axis) * sizeof(size_m));
+    }
+    
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    MinPrimitive* prim = new MinPrimitive(*this, axis, keepdims);
+    prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, INT32_MAX, keepdims);
+    prim->has_collapsed_dims = true;
+    output.tape = prim;
+    
+    return output;
+}
+
+void matrix::min(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device) {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
+    size_m noOfOpp = shape()[axis];
+    
+    MinPrimitive* primit = static_cast<MinPrimitive*>(output.tape);
+    
+    CollapsedDims_2 collapsed;
+    uint32_t cdims;
+    if (primit->has_collapsed_dims) {
+        collapsed = primit->collapsed_dims;
+        cdims = collapsed.out_dims;
+    } else {
+        cdims = 1;
+        collapsed.stridesA[0] = 1;
+        collapsed.stridesB[0] = 1;
+        collapsed.shape[0] = 1;
+    }
+    
+    if (cdims == 0) {
+        cdims = 1;
+        collapsed.stridesA[0] = 1;
+        collapsed.stridesB[0] = 1;
+        collapsed.shape[0] = 1;
+    }
+
+    if (exec_device == ExecutionDevice::METAL) {
+        bool use_tgr = (noOfOpp > 256);
+        int kernel_idx = cdims >= 4 ? 3 : cdims - 1;
+        if (use_tgr) {
+            kernel_idx += 4; // TGR kernels are at offset +4
+        }
+        
+        if (!GlobalGPUManager.MinInit[(int)type][kernel_idx]) {
+            GlobalGPUManager.initMin_nd((int)type, kernel_idx);
+        }
+
+        id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, *this, 1);
+        
+        [commandEncoder setBytes:&reduce_axis_stride length: sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:&noOfOpp length: sizeof(size_m) atIndex:3];
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        
+        int x_multiplier = use_tgr ? 256 : 1;
+        if (use_tgr) {
+            _threadsPerThreadgroup = MTLSizeMake(256, 1, 1);
+        }
+
+        if (cdims == 1) {
+            [commandEncoder setBytes:&collapsed.stridesA[0] length:sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&collapsed.stridesB[0] length:sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[0] * x_multiplier, 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setBytes:collapsed.stridesA length:2 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:2 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[1] * x_multiplier, collapsed.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setBytes:collapsed.stridesA length:3 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:3 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[2] * x_multiplier, collapsed.shape[1], collapsed.shape[0]);
+        } else {
+            [commandEncoder setBytes:collapsed.stridesA length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:cdims * sizeof(size_m) atIndex:5];
+            [commandEncoder setBytes:collapsed.shape length:cdims * sizeof(size_m) atIndex:6];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:7];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= collapsed.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[cdims-1] * x_multiplier, collapsed.shape[cdims-2], acc);
+        }
+
+        [commandEncoder setComputePipelineState:GlobalGPUManager.MinComputeState_nd[(int)type][kernel_idx]];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        dispatch_type(type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            T* in_data = (T*)buffer;
+            size_t total_out = output.total_size;
+            
+            for (size_t gid = 0; gid < total_out; gid++) {
+                size_t AxisOffset = 0;
+                size_t remaining = gid;
+                for (size_t i = 0; i < cdims; i++) {
+                    AxisOffset += (remaining / collapsed.stridesA[i]) * collapsed.stridesB[i];
+                    remaining %= collapsed.stridesA[i];
+                }
+                T current_min = std::numeric_limits<T>::max();
+                for (size_t i = 0; i < noOfOpp; i++) {
+                    current_min = std::min(current_min, in_data[AxisOffset + i * reduce_axis_stride]);
+                }
+                out_data[gid] = current_min;
+            }
+        });
+    }
+}
+
+matrix matrix::min(int start, int end, bool keepdims) {
+    matrix flat = this->flatten(start, end);
+    return flat.min(start, keepdims);
+}
+
+matrix matrix::min() {
+    matrix flat = this->flatten(0, -1);
+    return flat.min(0);
+}
+
+matrix matrix::sum(int axis, bool keepdims) {
+    if (dims == 0) {
+        return *this;
+    }
+    int outputDims = keepdims ? dims : dims - 1;
+    matrix output(outputDims, type);
+    
+    if (axis < 0) axis += dims;
+    
+    if (keepdims) {
+        memcpy(output.shape(), shape(), output.dims * sizeof(size_m));
+        output.shape()[axis] = 1;
+    } else {
+        memcpy(output.shape(), shape(), axis * sizeof(size_m));
+        memcpy(output.shape() + axis, shape() + axis + 1, (output.dims - axis) * sizeof(size_m));
+    }
+    
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+    
+    SumPrimitive* prim = new SumPrimitive(*this, axis, keepdims);
+    prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, INT32_MAX, keepdims);
+    prim->has_collapsed_dims = true;
+    output.tape = prim;
+    
+    return output;
+}
+
+void matrix::sum(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device) {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
+    size_m noOfOpp = shape()[axis];
+    
+    SumPrimitive* primit = static_cast<SumPrimitive*>(output.tape);
+    
+    CollapsedDims_2 collapsed;
+    uint32_t cdims;
+    if (primit->has_collapsed_dims) {
+        collapsed = primit->collapsed_dims;
+        cdims = collapsed.out_dims;
+    } else {
+        cdims = 1;
+        collapsed.stridesA[0] = 1;
+        collapsed.stridesB[0] = 1;
+        collapsed.shape[0] = 1;
+    }
+    
+    if (cdims == 0) {
+        cdims = 1;
+        collapsed.stridesA[0] = 1;
+        collapsed.stridesB[0] = 1;
+        collapsed.shape[0] = 1;
+    }
+
+    if (exec_device == ExecutionDevice::METAL) {
+        bool use_tgr = (noOfOpp > 256);
+        int kernel_idx = cdims >= 4 ? 3 : cdims - 1;
+        if (use_tgr) {
+            kernel_idx += 4; // TGR kernels are at offset +4
+        }
+        
+        if (!GlobalGPUManager.SumInit_nd[(int)type][kernel_idx]) {
+            GlobalGPUManager.initSum_nd((int)type, kernel_idx);
+        }
+
+        id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, *this, 1);
+        
+        [commandEncoder setBytes:&reduce_axis_stride length: sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:&noOfOpp length: sizeof(size_m) atIndex:3];
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        
+        int x_multiplier = use_tgr ? 256 : 1;
+        if (use_tgr) {
+            _threadsPerThreadgroup = MTLSizeMake(256, 1, 1);
+        }
+
+        if (cdims == 1) {
+            [commandEncoder setBytes:&collapsed.stridesA[0] length:sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&collapsed.stridesB[0] length:sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[0] * x_multiplier, 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setBytes:collapsed.stridesA length:2 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:2 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[1] * x_multiplier, collapsed.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setBytes:collapsed.stridesA length:3 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:3 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[2] * x_multiplier, collapsed.shape[1], collapsed.shape[0]);
+        } else {
+            [commandEncoder setBytes:collapsed.stridesA length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:cdims * sizeof(size_m) atIndex:5];
+            [commandEncoder setBytes:collapsed.shape length:cdims * sizeof(size_m) atIndex:6];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:7];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= collapsed.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[cdims-1] * x_multiplier, collapsed.shape[cdims-2], acc);
+        }
+
+        [commandEncoder setComputePipelineState:GlobalGPUManager.SumComputeState_nd[(int)type][kernel_idx]];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        dispatch_type(type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            T* in_data = (T*)buffer;
+            size_t total_out = output.total_size;
+            
+            for (size_t gid = 0; gid < total_out; gid++) {
+                size_t AxisOffset = 0;
+                size_t remaining = gid;
+                for (size_t i = 0; i < cdims; i++) {
+                    AxisOffset += (remaining / collapsed.stridesA[i]) * collapsed.stridesB[i];
+                    remaining %= collapsed.stridesA[i];
+                }
+                T current_sum = 0;
+                for (size_t i = 0; i < noOfOpp; i++) {
+                    current_sum += in_data[AxisOffset + i * reduce_axis_stride];
+                }
+                out_data[gid] = current_sum;
+            }
+        });
+    }
+}
+
+matrix matrix::sum(int start, int end, bool keepdims) {
+    matrix flat = this->flatten(start, end);
+    return flat.sum(start, keepdims);
+}
+
+matrix matrix::sum() {
+    matrix flat = this->flatten(0, -1);
+    return flat.sum(0);
+}
+
+matrix matrix::mean(int axis, bool keepdims) {
+    matrix s = this->sum(axis, keepdims);
+    return s / (float)shape()[axis];
+}
+
+matrix matrix::mean(int start, int end, bool keepdims) {
+    matrix s = this->sum(start, end, keepdims);
+    int real_end = (end < 0) ? end + dims : end;
+    size_m collapse_size = 1;
+    for (int i = start; i <= real_end; i++) {
+        collapse_size *= shape()[i];
+    }
+    return s / (float)collapse_size;
+}
+
+matrix matrix::mean() {
+    matrix s = this->sum();
+    return s / (float)total_size;
+}
+
+matrix matrix::rms(int axis, bool keepdims) {
+    matrix sq = (*this) * (*this);
+    matrix m = sq.mean(axis, keepdims);
+    return matrix::sqrt(m);
+}
+
+matrix matrix::rms(int start, int end, bool keepdims) {
+    matrix sq = (*this) * (*this);
+    matrix m = sq.mean(start, end, keepdims);
+    return matrix::sqrt(m);
+}
+
+matrix matrix::rms() {
+    matrix sq = (*this) * (*this);
+    matrix m = sq.mean();
+    return matrix::sqrt(m);
+}
+
+matrix matrix::operator[](size_m index) {
+    if (dims == 0) throw std::runtime_error("Cannot slice a 0-dimensional matrix");
+    if (index >= shape()[0]) throw std::runtime_error("Index out of bounds");
+    
+    matrix out(dims > 1 ? dims - 1 : 1, type);
+    
+    out.flags = NON_OWNERSHIP_FLAG;
+    if (flags & NON_CONTIGUOUS_FLAG) out.flags |= NON_CONTIGUOUS_FLAG;
+    
+    out.buffer = (uint8_t*)buffer + index * strides()[0] * dtype_size(type);
+    
+    if (refCount) {
+        out.refCount = refCount;
+        out.refCount->fetch_add(1, std::memory_order_relaxed);
+    }
+    
+    if (dims > 1) {
+        memcpy(out.shape(), shape() + 1, (dims - 1) * sizeof(size_m));
+        memcpy(out.strides(), strides() + 1, (dims - 1) * sizeof(size_m));
+    } else {
+        out.shape()[0] = 1;
+        out.strides()[0] = 1;
+    }
+    
+    out.total_size = 1;
+    for (int i = 0; i < out.dims; i++) {
+        out.total_size *= out.shape()[i];
+    }
+    
+    return out;
+}

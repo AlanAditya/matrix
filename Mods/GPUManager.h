@@ -59,11 +59,23 @@ public:
     bool TransposeInit[3];
     id<MTLComputePipelineState> TransposeComputeState[3];
     
-    bool GEMMAInit[3];
-    id<MTLComputePipelineState> GEMMAComputeState[3];
+    bool GEMMAInit[4];
+    id<MTLComputePipelineState> GEMMAComputeState[4];
     
-    bool SumInit[3];
-    id<MTLComputePipelineState> SumComputeState[3];
+    bool BatchedMatMulInit[4][2];
+    id<MTLComputePipelineState> BatchedMatMulComputeState[4][2];
+    
+    bool SumInit[4];
+    id<MTLComputePipelineState> SumComputeState[4];
+    
+    bool SumInit_nd[10][8];
+    id<MTLComputePipelineState> SumComputeState_nd[10][8];
+    
+    bool MaxInit[10][8];
+    id<MTLComputePipelineState> MaxComputeState_nd[10][8];
+    
+    bool MinInit[10][8];
+    id<MTLComputePipelineState> MinComputeState_nd[10][8];
     
     bool SinInit[3];
     id<MTLComputePipelineState> SinComputeState[3];
@@ -80,8 +92,37 @@ public:
     bool ExpInit[3];
     id<MTLComputePipelineState> ExpComputeState[3];
     
+    bool AbsInit[4][4];
+    id<MTLComputePipelineState> AbsComputeState[4][4];
+    
+    bool LogInit[4][4];
+    id<MTLComputePipelineState> LogComputeState[4][4];
+    
+    bool ClampInit_nd[4][4];
+    id<MTLComputePipelineState> ClampComputeState_nd[4][4];
+    
+    bool SinInit_nd[4][4];
+    id<MTLComputePipelineState> SinComputeState_nd[4][4];
+    bool CosInit_nd[4][4];
+    id<MTLComputePipelineState> CosComputeState_nd[4][4];
+    bool TanInit_nd[4][4];
+    id<MTLComputePipelineState> TanComputeState_nd[4][4];
+    bool SqrtInit_nd[4][4];
+    id<MTLComputePipelineState> SqrtComputeState_nd[4][4];
+    bool ExpInit_nd[4][4];
+    id<MTLComputePipelineState> ExpComputeState_nd[4][4];
+    
     bool ConvolveInit[3];
     id<MTLComputePipelineState> ConvolveComputeState[3];
+    
+    bool Conv1dInit[3];
+    id<MTLComputePipelineState> Conv1dComputeState[3];
+    bool Conv2dInit[3];
+    id<MTLComputePipelineState> Conv2dComputeState[3];
+    bool Conv3dInit[3];
+    id<MTLComputePipelineState> Conv3dComputeState[3];
+    bool ConvInit[3];
+    id<MTLComputePipelineState> ConvComputeState[3];
     
     bool ConvolveFullInit[3];
     id<MTLComputePipelineState> ConvolveFullComputeState[3];
@@ -104,6 +145,8 @@ public:
     bool CopyInplace[6][6][6];
     id<MTLComputePipelineState> CopyInplace_ComputeState[6][6][6];
     
+    bool PaddingInit[6][4];
+    id<MTLComputePipelineState> Padding_ComputeState[6][4];
     
     NSMutableDictionary<NSString*, NSNumber*>* shaderNameToIndex;
     NSMutableArray<id<MTLComputePipelineState>>* customComputeShader;
@@ -122,14 +165,22 @@ public:
         for (int i = 0; i < 3; i++) {
             TransposeInit[i] = false;
         }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             GEMMAInit[i] = false;
         }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 2; j++) {
+                BatchedMatMulInit[i][j] = false;
+            }
+        }
+        for (int i = 0; i < 4; i++) {
             SumInit[i] = false;
         }
         for (int i = 0; i < 3; i++) {
             ConvolveInit[i] = false;
+            Conv1dInit[i] = false;
+            Conv2dInit[i] = false;
+            Conv3dInit[i] = false;
         }
         for (int i = 0; i < 3; i++) {
             ConvolveFullInit[i] = false;
@@ -162,12 +213,26 @@ public:
         }
         for (int i = 0; i < 3; i++) {
             TanInit[i] = false;
-        }
-        for (int i = 0; i < 3; i++) {
+            SqrtInit[i] = false;
             ExpInit[i] = false;
         }
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                AbsInit[i][j] = false;
+                LogInit[i][j] = false;
+                SinInit_nd[i][j] = false;
+                CosInit_nd[i][j] = false;
+                TanInit_nd[i][j] = false;
+                SqrtInit_nd[i][j] = false;
+                ExpInit_nd[i][j] = false;
+                ClampInit_nd[i][j] = false;
+            }
+        }
         for (int i = 0; i < 3; i++) {
-            SqrtInit[i] = false;
+            ConvolveInit[i] = false;
+            Conv1dInit[i] = false;
+            Conv2dInit[i] = false;
+            Conv3dInit[i] = false;
         }
         for (int i = 0; i < 4; i++) {
             Concat_2M[i] = false;
@@ -177,6 +242,11 @@ public:
                 for (int k = 0; k < 6; k++) {
                     CopyInplace[i][j][k] = false;
                 }
+            }
+        }
+        for (int i = 0; i < 6; i++) {
+            for (int k = 0; k < 4; k++) {
+                PaddingInit[i][k] = false;
             }
         }
     }
@@ -192,9 +262,6 @@ public:
         }
         return gCommandBuffer;
     }
-    void commitCommandBuffer() {
-        [gCommandBuffer commit];
-    }
     
     id<MTLComputeCommandEncoder> getCommandEncoder() {
         if (!gCommandEncoder) {
@@ -202,6 +269,23 @@ public:
             gCommandEncoder = [getCommandBuffer() computeCommandEncoder];
         }
         return gCommandEncoder;
+    }
+    
+//    id<MTLBlitCommandEncoder> getNewCommandEncoder() {
+//        endCommandEncoding();
+//        return [getCommandBuffer() blitCommandEncoder];
+//    }
+    
+    void endCommandEncoding() {
+        if (gCommandEncoder) {
+            [gCommandEncoder endEncoding];
+            gCommandEncoder = nil;
+        }
+    }
+    
+    id<MTLComputeCommandEncoder> getNewCommandEncoder() {
+        endCommandEncoding();
+        return getCommandEncoder();
     }
     
     id<MTLLibrary> getSourceOfMetalFiles(id<MTLDevice> device) {
@@ -409,11 +493,45 @@ public:
         GEMMAInit[i] = true;
     }
     
+    void initBatchedMatMul(int type_idx, int spec_idx) {
+        NSError* error = nil;
+        NSString* funcName;
+        if (spec_idx == 0) {
+            funcName = [NSString stringWithFormat:@"BatchedMatMul_3Dgg_%i", type_idx];
+        } else {
+            funcName = [NSString stringWithFormat:@"BatchedMatMul_NDgg_%i", type_idx];
+        }
+        id<MTLFunction> func = [library newFunctionWithName:funcName];
+        BatchedMatMulComputeState[type_idx][spec_idx] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        BatchedMatMulInit[type_idx][spec_idx] = true;
+    }
+    
     void initSum_All(int i) {
         NSError* error = nil;
         id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"SumGPU_%i", i]];
         SumComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         SumInit[i] = true;
+    }
+    
+    void initSum_nd(int type_code, int cdims) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"SumGPU_%i_%i", type_code, cdims]];
+        SumComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        SumInit_nd[type_code][cdims] = true;
+    }
+    
+    void initMax_nd(int type_code, int cdims) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"MaxGPU_%i_%i", type_code, cdims]];
+        MaxComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        MaxInit[type_code][cdims] = true;
+    }
+
+    void initMin_nd(int type_code, int cdims) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"MinGPU_%i_%i", type_code, cdims]];
+        MinComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        MinInit[type_code][cdims] = true;
     }
     
     void initSin(int i) {
@@ -449,6 +567,34 @@ public:
         id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ConvolveGPU_%i", i]];
         ConvolveComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ConvolveInit[i] = true;
+    }
+
+    void initConv1d(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"conv1d_gpu_%i", i]];
+        Conv1dComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        Conv1dInit[i] = true;
+    }
+    
+    void initConv2d(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"conv2d_gpu_%i", i]];
+        Conv2dComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        Conv2dInit[i] = true;
+    }
+
+    void initConv3d(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"conv3d_gpu_%i", i]];
+        Conv3dComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        Conv3dInit[i] = true;
+    }
+
+    void initConv(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"conv_gpu_%i", i]];
+        ConvComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        ConvInit[i] = true;
     }
     
     void initConvolve_FULL(int i) {
@@ -492,6 +638,76 @@ public:
         ExpComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ExpInit[i] = true;
     }
+
+    void initAbs(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"AbsGPU_%i_%i", type_code, cdims]];
+        AbsComputeState[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        AbsInit[type_code][cdims] = true;
+        if (error) {
+            NSLog(@"Error occurred while compiling abs shader for type %i and cdims %i: %@", type_code, cdims, error);
+            std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+        }
+    }
+    
+    void initLog(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"LogGPU_%i_%i", type_code, cdims]];
+        LogComputeState[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        LogInit[type_code][cdims] = true;
+        if (error) {
+            NSLog(@"Error occurred while compiling log shader for type %i and cdims %i: %@", type_code, cdims, error);
+            std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+        }
+    }
+
+    void initSin_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"SinGPU_nd_%i_%i", type_code, cdims]];
+        SinComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        SinInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+    
+    void initClamp_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ClampGPU_nd_%i_%i", type_code, cdims]];
+        ClampComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        ClampInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+    
+    void initCos_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"CosGPU_nd_%i_%i", type_code, cdims]];
+        CosComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        CosInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+    
+    void initTan_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TanGPU_nd_%i_%i", type_code, cdims]];
+        TanComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        TanInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+    
+    void initSqrt_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"SqrtGPU_nd_%i_%i", type_code, cdims]];
+        SqrtComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        SqrtInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+    
+    void initExp_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ExpGPU_nd_%i_%i", type_code, cdims]];
+        ExpComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        ExpInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
     
     void initConcat_2M_GPU(int i) {
         NSError* error = nil;
@@ -506,6 +722,14 @@ public:
         id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"CopyInplaceGPU_%i_%i_%i", dstTypeCode, typeCode, dimSpecialiation]];
         CopyInplace_ComputeState[dstTypeCode][typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         CopyInplace[dstTypeCode][typeCode][dimSpecialiation] = true;
+        
+    }
+    void initPadding(int typeCode, int dimSpecialiation) {
+        NSError* error = nil;
+        NSLog([NSString stringWithFormat:@"PaddingGPU_%i_%i", typeCode, dimSpecialiation]);
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"PaddingGPU_%i_%i", typeCode, dimSpecialiation]];
+        Padding_ComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        PaddingInit[typeCode][dimSpecialiation] = true;
         
     }
 };

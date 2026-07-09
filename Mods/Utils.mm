@@ -166,6 +166,107 @@ CollapsedDims_2 collapse_dims(const size_m shape[], const size_m stridesA[], con
     return result;
 }
 
+CollapsedDims_3 collapse_dims(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const size_m stridesC[], const uint32_t dims, const size_t SIZE_CAP) {
+    CollapsedDims_3 result;
+    if (dims == 0) {
+        result.out_dims = 0;
+        return result;
+    }
+
+    result.shape[0]   = shape[0];
+    result.stridesA[0] = stridesA[0];
+    result.stridesB[0] = stridesB[0];
+    result.stridesC[0] = stridesC[0];
+    uint32_t last_index = 0;
+
+    for (int i = 1; i < dims; i++) {
+        if (shape[i] == 1) { continue; }
+        if (result.stridesA[last_index] != stridesA[i] * shape[i] ||
+            result.stridesB[last_index] != stridesB[i] * shape[i] ||
+            result.stridesC[last_index] != stridesC[i] * shape[i] ||
+            result.shape[last_index] * shape[i] > SIZE_CAP) {
+            last_index++;
+            result.shape[last_index]   = shape[i];
+            result.stridesA[last_index] = stridesA[i];
+            result.stridesB[last_index] = stridesB[i];
+            result.stridesC[last_index] = stridesC[i];
+        } else {
+            result.shape[last_index] *= shape[i];
+            result.stridesA[last_index] = stridesA[i];
+            result.stridesB[last_index] = stridesB[i];
+            result.stridesC[last_index] = stridesC[i];
+        }
+    }
+    result.out_dims = last_index+1;
+    return result;
+}
+
+CollapsedDims_3 collapse_dims_matmul(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const size_m stridesC[], const uint32_t dims, const size_t SIZE_CAP) {
+    CollapsedDims_3 result;
+    // shapeA => [....., M, K]
+    // shapeB from B.T() => [....., N, K]
+    // shape => [......, M, N]
+    result.shape[0]   = shape[0];
+    result.stridesA[0] = stridesA[0];
+    result.stridesB[0] = stridesB[0];
+    result.stridesC[0] = stridesC[0];
+    uint32_t last_index = 0;
+    // LOGIC IS FOR CONTIGUITY AT AN AXIS WE WANT stride[axis] = stride[axis+1] * shape[axis+1]
+    // whenevr two axis are collapsed into one the strides of the inner axis are taken
+    // THIS IS BATCHED MATMUL SO WE CAN COLLAPSE ALL DIMS EXCEPT THE LAST TWO
+    for (int i = 1; i < dims-2; i++) {
+        if (shape[i] == 1) { continue; }
+        if (result.stridesA[last_index] != stridesA[i] * shape[i] ||
+            result.stridesB[last_index] != stridesB[i] * shape[i] ||
+            result.stridesC[last_index] != stridesC[i] * shape[i] ||
+            result.shape[last_index] * shape[i] > SIZE_CAP) {
+            last_index++;
+            result.shape[last_index]   = shape[i];
+            result.stridesA[last_index] = stridesA[i];
+            result.stridesB[last_index] = stridesB[i];
+            result.stridesC[last_index] = stridesC[i];
+        } else {
+            result.shape[last_index] *= shape[i];
+            result.stridesA[last_index] = stridesA[i];
+            result.stridesB[last_index] = stridesB[i];
+            result.stridesC[last_index] = stridesC[i];
+        }
+    }
+
+    result.out_dims = last_index+1 + 2;
+
+    // shape => [......, M, N]
+    result.shape[result.out_dims-1] = shape[dims-1];
+    result.shape[result.out_dims-2] = shape[dims-2];
+
+    // SINCE WE ONLY COLLAPSE AXIS EXCEPT LAST TWO COPY THE INNER TWO STRIDES AS IT IS
+    result.stridesC[result.out_dims-2] = stridesC[dims-2];
+    result.stridesC[result.out_dims-1] = stridesC[dims-1];
+
+
+    result.stridesA[result.out_dims-2] = stridesA[dims-2];
+    result.stridesA[result.out_dims-1] = stridesA[dims-1];
+    result.stridesB[result.out_dims-2] = stridesB[dims-2];
+    result.stridesB[result.out_dims-1] = stridesB[dims-1];
+    return result;
+}
+
+CollapsedDims_2 collapse_dims_reduce(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const uint32_t dims, const int reduce_axis, const size_t SIZE_CAP, bool keepdims) {
+    size_m reduced_shape[32];
+    size_m reduced_stridesA[32];
+    size_m reduced_stridesB[32];
+    int idx = 0;
+    for (int i = 0; i < dims; i++) {
+        if (i != reduce_axis) {
+            reduced_shape[idx] = shape[i];
+            reduced_stridesA[idx] = keepdims ? stridesA[i] : stridesA[idx];
+            reduced_stridesB[idx] = stridesB[i];
+            idx++;
+        }
+    }
+    return collapse_dims(reduced_shape, reduced_stridesA, reduced_stridesB, idx, SIZE_CAP);
+}
+
 void PatternFill(void* destination, const void* pattern, size_t patternSize, uint32_t n) {
     uint32_t exp = 0;
     uint32_t pO2 = 1;
