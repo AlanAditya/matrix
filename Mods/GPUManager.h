@@ -20,8 +20,9 @@ public:
     id<MTLDevice> metalDevice = MTLCreateSystemDefaultDevice();
     id<MTLCommandQueue> gCommandQueue = [metalDevice newCommandQueue];
     
-    id<MTLCommandBuffer> gCommandBuffer = nil;
-    id<MTLComputeCommandEncoder> gCommandEncoder = nil;
+    // Thread-local storage to prevent cross-thread race conditions
+    inline static thread_local void* _thread_gCommandBuffer = nullptr;
+    inline static thread_local void* _thread_gCommandEncoder = nullptr;
     
     id<MTLLibrary> library = [metalDevice newDefaultLibrary];
     
@@ -258,29 +259,57 @@ public:
     }
     
     id<MTLCommandBuffer> getCommandBuffer() {
-        if (!gCommandBuffer) {
-            gCommandBuffer = [gCommandQueue commandBuffer];
+        if (!_thread_gCommandBuffer) {
+            id<MTLCommandBuffer> buf = [gCommandQueue commandBuffer];
+            _thread_gCommandBuffer = (__bridge_retained void*)buf;
         }
-        return gCommandBuffer;
+        return (__bridge id<MTLCommandBuffer>)_thread_gCommandBuffer;
+    }
+    
+    void setCommandBuffer(id<MTLCommandBuffer> buf) {
+        if (_thread_gCommandBuffer) {
+            CFRelease(_thread_gCommandBuffer);
+        }
+        if (buf) {
+            _thread_gCommandBuffer = (__bridge_retained void*)buf;
+        } else {
+            _thread_gCommandBuffer = nullptr;
+        }
+    }
+    void commitCommandBuffer() {
+        [getCommandBuffer() commit];
+        setCommandBuffer(nil);
     }
     
     id<MTLComputeCommandEncoder> getCommandEncoder() {
-        if (!gCommandEncoder) {
-            
-            gCommandEncoder = [getCommandBuffer() computeCommandEncoder];
+        if (!_thread_gCommandEncoder) {
+            id<MTLComputeCommandEncoder> enc = [getCommandBuffer() computeCommandEncoder];
+            _thread_gCommandEncoder = (__bridge_retained void*)enc;
         }
-        return gCommandEncoder;
+        return (__bridge id<MTLComputeCommandEncoder>)_thread_gCommandEncoder;
     }
     
-//    id<MTLBlitCommandEncoder> getNewCommandEncoder() {
-//        endCommandEncoding();
-//        return [getCommandBuffer() blitCommandEncoder];
-//    }
+    void setCommandEncoder(id<MTLComputeCommandEncoder> enc) {
+        if (_thread_gCommandEncoder) {
+            CFRelease(_thread_gCommandEncoder);
+        }
+        if (enc) {
+            _thread_gCommandEncoder = (__bridge_retained void*)enc;
+        } else {
+            _thread_gCommandEncoder = nullptr;
+        }
+    }
+    
+    id<MTLBlitCommandEncoder> getNewBlitCommandEncoder() {
+        endCommandEncoding();
+        return [getCommandBuffer() blitCommandEncoder];
+    }
     
     void endCommandEncoding() {
-        if (gCommandEncoder) {
-            [gCommandEncoder endEncoding];
-            gCommandEncoder = nil;
+        if (_thread_gCommandEncoder) {
+            id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)_thread_gCommandEncoder;
+            [enc endEncoding];
+            setCommandEncoder(nil);
         }
     }
     

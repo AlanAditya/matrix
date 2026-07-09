@@ -2335,7 +2335,7 @@ void matrix::CopyToTexture(id<MTLTexture> texture, Execution exec) {
     if (exec == Execution::EncodeAndExecute) {
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
-        GlobalGPUManager.gCommandBuffer = nil;
+        GlobalGPUManager.setCommandBuffer(nil);
     }
 }
 
@@ -5798,13 +5798,12 @@ void matrix::eval_cpu() {
 }
 void matrix::eval_metal() {
     if (!tape) return;
+    id<MTLCommandBuffer> oldBuffer = GlobalGPUManager._thread_gCommandBuffer ? GlobalGPUManager.getCommandBuffer() : nullptr;
     tape->eval_metal(*this, EvalType::EVAL_INSTANTLY);
     
-    if (GlobalGPUManager.gCommandBuffer) {
+    if (GlobalGPUManager._thread_gCommandBuffer && oldBuffer == nullptr) {
         GlobalGPUManager.endCommandEncoding();
-        [GlobalGPUManager.gCommandBuffer commit];
-        [GlobalGPUManager.gCommandBuffer waitUntilCompleted];
-        GlobalGPUManager.gCommandBuffer = nil;
+        GlobalGPUManager.commitCommandBuffer();
     }
 }
 void matrix::compile_cpu() {
@@ -5818,13 +5817,12 @@ void matrix::execute_cpu() {
 }
 void matrix::execute_metal() {
     if (!tape) return;
+    id<MTLCommandBuffer> oldBuffer = GlobalGPUManager._thread_gCommandBuffer ? GlobalGPUManager.getCommandBuffer() : nullptr;
     tape->eval_metal(*this, EvalType::EXEC_TRACE);
     
-    if (GlobalGPUManager.gCommandBuffer) {
+    if (GlobalGPUManager._thread_gCommandBuffer && oldBuffer == nullptr) {
         GlobalGPUManager.endCommandEncoding();
-        [GlobalGPUManager.gCommandBuffer commit];
-        [GlobalGPUManager.gCommandBuffer waitUntilCompleted];
-        GlobalGPUManager.gCommandBuffer = nil;
+        GlobalGPUManager.commitCommandBuffer();
     }
 }
 void matrix::clear_trace_checks() {
