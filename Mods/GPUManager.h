@@ -19,8 +19,9 @@ class GPUManager {
 public:
     id<MTLDevice> metalDevice = MTLCreateSystemDefaultDevice();
     id<MTLCommandQueue> gCommandQueue = [metalDevice newCommandQueue];
-    id<MTLCommandBuffer> gCommandBuffer = [gCommandQueue commandBuffer];
-    id<MTLComputeCommandEncoder> gCommandEncoder = [gCommandBuffer computeCommandEncoder];
+    
+    id<MTLCommandBuffer> gCommandBuffer = nil;
+    id<MTLComputeCommandEncoder> gCommandEncoder = nil;
     
     id<MTLLibrary> library = [metalDevice newDefaultLibrary];
     
