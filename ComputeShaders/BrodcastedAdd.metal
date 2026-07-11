@@ -135,3 +135,6 @@ instantiate_kernel("BrodcastedAddGPU_3", BrodcastedAddGPU_NDg, int);
 //}
 //
 //result[gid] = A[indicies dot strideA] + B[indicies dot strideB];
+
+
+

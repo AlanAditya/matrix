@@ -101,16 +101,16 @@ dtype promote_types(dtype a, dtype b) {
 //
 // struct SharedArrayDescriptor {
 //     std::atomic<uint32_t> refCount;
-inline size_m *SharedArrayDescriptor::shape() {
-    return reinterpret_cast<size_m *>(this + 1);
-}
-inline size_m *SharedArrayDescriptor::strides(int dims) {
-    return shape() + dims;
-}
-SharedArrayDescriptor* SharedArrayDescriptor::retain() {
-    refCount.fetch_add(1, std::memory_order_relaxed);
-    return this;
-}
+//inline size_m *SharedArrayDescriptor::shape() {
+//    return reinterpret_cast<size_m *>(this + 1);
+//}
+//inline size_m *SharedArrayDescriptor::strides(int dims) {
+//    return shape() + dims;
+//}
+//SharedArrayDescriptor* SharedArrayDescriptor::retain() {
+//    refCount.fetch_add(1, std::memory_order_relaxed);
+//    return this;
+//}
 
 //    static SharedArrayDescriptor* create(uint32_t dims) {
 //        size_t total_bytes = sizeof(SharedArrayDescriptor) + (dims * 2 *
@@ -424,6 +424,7 @@ matrix matrix::reshape(array_descriptor reshape_desc, size_t reshape_dims) {
 
 
 matrix matrix::unsqueeze(int axis) const {
+    if (axis < 0) axis += dims+1;
     matrix output(dims+1, type);
     memcpy(output.shape(), shape(), axis * sizeof(size_m));
     output.shape()[axis]=1;
@@ -540,7 +541,7 @@ matrix matrix::squeeze() const {
     return output;
 }
 
-matrix matrix::flatten(int start_dim, int end_dim) {
+matrix matrix::flatten(int start_dim, int end_dim) const {
     // Handle negative indexing
     if (end_dim < 0) end_dim += dims;
     if (start_dim < 0) start_dim += dims;
@@ -571,7 +572,7 @@ matrix matrix::flatten(int start_dim, int end_dim) {
     output.flags &= ~NON_CONTIGUOUS_FLAG;
     output.flags &= ~NON_OWNERSHIP_FLAG;
     bool REQUIRES_NEW_BUFFER = (flags & NON_CONTIGUOUS_FLAG) != 0;
-    output.tape = new ReshapePrimitive(*this, output.array_desc, output.dims, REQUIRES_NEW_BUFFER);
+    output.tape = new ReshapePrimitive(const_cast<matrix&>(*this), output.array_desc, output.dims, REQUIRES_NEW_BUFFER);
     
     return output;
 }
@@ -814,37 +815,7 @@ matrix::matrix(uint32_t rank, dtype type_inp) {
 //    }
 //}
 
-inline size_m *matrix::shape() {
-    return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer : array_desc.shared_arr_desc->shape();
-}
-inline size_m *matrix::strides() {
-    return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer + SBO_MAX_DIMS : array_desc.shared_arr_desc->strides(dims);
-}
 
-inline const size_m *matrix::shape() const {
-    return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer : array_desc.shared_arr_desc->shape();
-}
-
-inline const size_m *matrix::strides() const {
-    return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer + SBO_MAX_DIMS : array_desc.shared_arr_desc->strides(dims);
-}
-
-inline void matrix::buildMetalBuffer() {
-    metalBuffer = [GlobalGPUManager.metalDevice newBufferWithBytesNoCopy:buffer length:effectiveBufferSize() * dtype_size(type) options:MTLResourceStorageModeShared deallocator:^(void *_Nonnull pointer, NSUInteger length){
-    }];
-}
-inline void matrix::detach_shape() {
-    if (dims > SBO_MAX_DIMS) {
-        auto old_desc = array_desc.shared_arr_desc;
-        if (old_desc->refCount.load(std::memory_order_acquire) == 1)
-            return; // already exclusive
-        array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
-        memcpy(shape(), old_desc->shape(), dims * sizeof(size_m));
-        memcpy(strides(), old_desc->strides(dims), dims * sizeof(size_m));
-        
-        old_desc->release();
-    }
-}
  void matrix::shareBuffer(matrix &mat) const {
     mat.releaseBuffer();
     if (refCount) {
@@ -856,9 +827,7 @@ inline void matrix::detach_shape() {
     mat.buffer = buffer;
     mat.metalBuffer = metalBuffer;
     if (mat.tape) {
-        mat.tape->out_buffer = (uint8_t*)buffer;
-        mat.tape->out_metal_buffer = metalBuffer;
-        mat.tape->out_refcount = refCount;
+        mat.tape->update_cache((uint8_t*)buffer, metalBuffer, refCount);
     }
 }
 
@@ -868,9 +837,9 @@ inline void matrix::update_from_trace() {
         buffer = tape->out_buffer;
         metalBuffer = tape->out_metal_buffer;
         refCount = tape->out_refcount;
-        if (refCount) {
+//        if (refCount) {
             refCount->fetch_add(1);
-        }
+//        }
     }
 }
 inline void matrix::beginReferenceCounting() {
@@ -1109,10 +1078,7 @@ std::function<matrix(matrix)> matrix::grad_gpu(std::function<matrix(matrix)> fun
         returnable_output.set_array_desc(grad_output.array_desc);
         returnable_output.shareBuffer(grad_output);
         grad_output.releaseBuffer();
-        grad_output.tape->out_buffer = nullptr;
-        grad_output.tape->out_refcount = nullptr;
-        grad_output.tape->out_metal_buffer = nullptr;
-        grad_output.clear_trace_checks();
+        grad_output.tape->update_cache(nullptr, nil, nullptr);
         returnable_output.tape = nullptr;
         
         grad_output.clear_trace_checks();
@@ -1330,8 +1296,8 @@ std::function<std::vector<matrix>(const std::vector<matrix>)> matrix::grad_graph
 //        return output;
 //    }
 
-void matrix::print()  {
-    eval();
+void matrix::print() const {
+    const_cast<matrix&>(*this).eval();
     if (!buffer)
         return;
     
@@ -2847,6 +2813,7 @@ void matrix::begin_refcount() {
     refCount = new std::atomic<uint32_t>(1);
 }
 void matrix::stack(const std::vector<matrix>& mats, matrix& output, int axis, EvalType eval_type, ExecutionDevice exec_device) {
+    if (axis < 0) axis += mats[0].dims;
 #ifdef SAFE_MODE
     if (output.dims != mats[0].dims + 1) {
         throw std::invalid_argument("matrix::stack: output dims must be input dims + 1");
@@ -2955,6 +2922,7 @@ matrix matrix::stackCPU(const std::vector<matrix>& mats, int axis, EvalType eval
 }
 
 matrix matrix::concat(const std::vector<matrix>& mats, int axis) {
+    if (axis < 0) axis+= mats[0].dims;
     matrix output(mats[0].dims, mats[0].type);
     memcpy(output.shape(), mats[0].shape(), sizeof(size_m) * output.dims);
     for (int i = 1; i < mats.size(); i++) {
@@ -5794,7 +5762,7 @@ void matrix::eval() {
 }
 
 void matrix::eval_cpu() {
-    tape->eval_cpu(*this, EvalType::EVAL_INSTANTLY);
+    if (tape) tape->eval_cpu(*this, EvalType::EVAL_INSTANTLY);
 }
 void matrix::eval_metal() {
     if (!tape) return;
@@ -9704,7 +9672,236 @@ template matrix &matrix::operator=<uint16_t>(uint16_t);
 
 // MARK: Max / Min Boilerplate
 
-matrix matrix::max(int axis, bool keepdims) {
+matrix matrix::max(const matrix& a, const matrix& b) {
+    dtype res_type = promote_types(a.type, b.type);
+    matrix result(std::max(a.dims, b.dims), res_type);
+    auto primit = new MaxPrimitive(a, b);
+    primit->desc_a = BroadcastDescriptor::create(result.dims);
+    primit->desc_b = BroadcastDescriptor::create(result.dims);
+    broadcast_shapes(a.array_desc, b.array_desc, result.array_desc,
+                     primit->desc_a, primit->desc_b, a.dims, b.dims);
+    primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+    primit->dims_collapsed = true;
+    result.total_size = result.accumul(0, result.dims);
+    result.tape = primit;
+    return result;
+}
+
+void matrix::max(const matrix& other, matrix& result, ExecutionDevice exec_device) const {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    const_cast<matrix*>(this)->update_from_trace();
+    const_cast<matrix*>(&other)->update_from_trace();
+    
+    if (result.dims != std::max(dims, other.dims)) {
+        throw std::invalid_argument("Incompatible dims of the result mat");
+    }
+    
+    int cdims = ((MaxPrimitive *)result.tape)->collapsed_dims_3.out_dims;
+    size_m* strideA = ((MaxPrimitive *)result.tape)->collapsed_dims_3.stridesA;
+    size_m* strideB = ((MaxPrimitive *)result.tape)->collapsed_dims_3.stridesB;
+    size_m* strideR = ((MaxPrimitive *)result.tape)->collapsed_dims_3.stridesC;
+    size_m* result_shape = ((MaxPrimitive *)result.tape)->collapsed_dims_3.shape;
+    
+    if (exec_device == ExecutionDevice::METAL) {
+        int typeCode = (int)type;
+        int kernelCode = -1;
+        if (cdims == 0) { kernelCode = 0; }
+        else if (cdims == 1) { kernelCode = 0; }
+        else if (cdims == 2) { kernelCode = 1; }
+        else if (cdims == 3) { kernelCode = 2; }
+        else { kernelCode = 3; }
+        
+        if (!GlobalGPUManager.BrodcastedMaxInit[typeCode][kernelCode]) {
+            GlobalGPUManager.initBrodcastedMaxInit(typeCode, kernelCode);
+        }
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedMaxComputeState[typeCode][kernelCode]];
+        
+        [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, *this, 1);
+        setBufferOrBytes(commandEncoder, other, 2);
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        
+        if (cdims == 0) {
+            size_m one = 1;
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        } else if (cdims == 1) {
+            [commandEncoder setBytes:strideR length:sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:strideA length:sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:strideB length:sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(result_shape[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setBytes:strideR length:2 * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:strideA length:2 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:strideB length:2 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(result_shape[1], result_shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setBytes:strideR length:3 * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:strideA length:3 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:strideB length:3 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(result_shape[2], result_shape[1], result_shape[0]);
+        } else {
+            [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
+            [commandEncoder setBytes:result_shape length:cdims * sizeof(size_m) atIndex:6];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:7];
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= result_shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(result_shape[cdims-1], result_shape[cdims-2], acc);
+        }
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        if (result.dims == 0) {
+            dispatch_type(type, result.buffer, [&](auto *out_data) {
+                using T = std::decay_t<decltype(*out_data)>;
+                out_data[0] = std::max(static_cast<T*>(buffer)[0], static_cast<T*>(other.buffer)[0]);
+            });
+            return;
+        }
+        dispatch_type(type, result.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            for (int gid = 0; gid < result.total_size; gid++) {
+                size_t GindexA = 0;
+                size_t GindexB = 0;
+                size_t indexR = 0;
+                int rem = gid;
+                for (int i = 0; i < cdims; i++) {
+                    indexR = rem / strideR[i];
+                    GindexA += indexR * strideA[i];
+                    GindexB += indexR * strideB[i];
+                    rem %= strideR[i];
+                }
+                out_data[gid] = std::max(static_cast<T *>(buffer)[GindexA], static_cast<T *>(other.buffer)[GindexB]);
+            }
+        });
+    }
+}
+
+matrix matrix::min(const matrix& a, const matrix& b) {
+    dtype res_type = promote_types(a.type, b.type);
+    matrix result(std::max(a.dims, b.dims), res_type);
+    auto primit = new MinPrimitive(a, b);
+    primit->desc_a = BroadcastDescriptor::create(result.dims);
+    primit->desc_b = BroadcastDescriptor::create(result.dims);
+    broadcast_shapes(a.array_desc, b.array_desc, result.array_desc,
+                     primit->desc_a, primit->desc_b, a.dims, b.dims);
+    primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+    primit->dims_collapsed = true;
+    result.total_size = result.accumul(0, result.dims);
+    result.tape = primit;
+    return result;
+}
+
+void matrix::min(const matrix& other, matrix& result, ExecutionDevice exec_device) const {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    const_cast<matrix*>(this)->update_from_trace();
+    const_cast<matrix*>(&other)->update_from_trace();
+    
+    if (result.dims != std::max(dims, other.dims)) {
+        throw std::invalid_argument("Incompatible dims of the result mat");
+    }
+    
+    int cdims = ((MinPrimitive *)result.tape)->collapsed_dims_3.out_dims;
+    size_m* strideA = ((MinPrimitive *)result.tape)->collapsed_dims_3.stridesA;
+    size_m* strideB = ((MinPrimitive *)result.tape)->collapsed_dims_3.stridesB;
+    size_m* strideR = ((MinPrimitive *)result.tape)->collapsed_dims_3.stridesC;
+    size_m* result_shape = ((MinPrimitive *)result.tape)->collapsed_dims_3.shape;
+    
+    if (exec_device == ExecutionDevice::METAL) {
+        int typeCode = (int)type;
+        int kernelCode = -1;
+        if (cdims == 0) { kernelCode = 0; }
+        else if (cdims == 1) { kernelCode = 0; }
+        else if (cdims == 2) { kernelCode = 1; }
+        else if (cdims == 3) { kernelCode = 2; }
+        else { kernelCode = 3; }
+        
+        if (!GlobalGPUManager.BrodcastedMinInit[typeCode][kernelCode]) {
+            GlobalGPUManager.initBrodcastedMinInit(typeCode, kernelCode);
+        }
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedMinComputeState[typeCode][kernelCode]];
+        
+        [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, *this, 1);
+        setBufferOrBytes(commandEncoder, other, 2);
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        
+        if (cdims == 0) {
+            size_m one = 1;
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        } else if (cdims == 1) {
+            [commandEncoder setBytes:strideR length:sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:strideA length:sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:strideB length:sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(result_shape[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setBytes:strideR length:2 * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:strideA length:2 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:strideB length:2 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(result_shape[1], result_shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setBytes:strideR length:3 * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:strideA length:3 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:strideB length:3 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(result_shape[2], result_shape[1], result_shape[0]);
+        } else {
+            [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
+            [commandEncoder setBytes:result_shape length:cdims * sizeof(size_m) atIndex:6];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:7];
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= result_shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(result_shape[cdims-1], result_shape[cdims-2], acc);
+        }
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        if (result.dims == 0) {
+            dispatch_type(type, result.buffer, [&](auto *out_data) {
+                using T = std::decay_t<decltype(*out_data)>;
+                out_data[0] = std::min(static_cast<T*>(buffer)[0], static_cast<T*>(other.buffer)[0]);
+            });
+            return;
+        }
+        dispatch_type(type, result.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            for (int gid = 0; gid < result.total_size; gid++) {
+                size_t GindexA = 0;
+                size_t GindexB = 0;
+                size_t indexR = 0;
+                int rem = gid;
+                for (int i = 0; i < cdims; i++) {
+                    indexR = rem / strideR[i];
+                    GindexA += indexR * strideA[i];
+                    GindexB += indexR * strideB[i];
+                    rem %= strideR[i];
+                }
+                out_data[gid] = std::min(static_cast<T *>(buffer)[GindexA], static_cast<T *>(other.buffer)[GindexB]);
+            }
+        });
+    }
+}
+
+
+matrix matrix::max(int axis, bool keepdims) const {
     if (dims == 0) {
         return *this;
     }
@@ -9724,7 +9921,7 @@ matrix matrix::max(int axis, bool keepdims) {
     output.calcStrides();
     output.total_size = output.accumul(0, output.dims);
     
-    MaxPrimitive* prim = new MaxPrimitive(*this, axis, keepdims);
+    MaxReductionPrimitive* prim = new MaxReductionPrimitive(const_cast<matrix&>(*this), axis, keepdims);
     prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, INT32_MAX, keepdims);
     prim->has_collapsed_dims = true;
     output.tape = prim;
@@ -9740,7 +9937,7 @@ void matrix::max(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
     size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
     size_m noOfOpp = shape()[axis];
     
-    MaxPrimitive* primit = static_cast<MaxPrimitive*>(output.tape);
+    MaxReductionPrimitive* primit = static_cast<MaxReductionPrimitive*>(output.tape);
     
     CollapsedDims_2 collapsed;
     uint32_t cdims;
@@ -9837,17 +10034,17 @@ void matrix::max(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
     }
 }
 
-matrix matrix::max(int start, int end, bool keepdims) {
+matrix matrix::max(int start, int end, bool keepdims) const {
     matrix flat = this->flatten(start, end);
     return flat.max(start, keepdims);
 }
 
-matrix matrix::max() {
+matrix matrix::max() const{
     matrix flat = this->flatten(0, -1);
     return flat.max(0);
 }
 
-matrix matrix::min(int axis, bool keepdims) {
+matrix matrix::min(int axis, bool keepdims) const{
     if (dims == 0) {
         return *this;
     }
@@ -9868,7 +10065,7 @@ matrix matrix::min(int axis, bool keepdims) {
     output.calcStrides();
     output.total_size = output.accumul(0, output.dims);
 
-    MinPrimitive* prim = new MinPrimitive(*this, axis, keepdims);
+    MinReductionPrimitive* prim = new MinReductionPrimitive(const_cast<matrix&>(*this), axis, keepdims);
     prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, INT32_MAX, keepdims);
     prim->has_collapsed_dims = true;
     output.tape = prim;
@@ -9884,7 +10081,7 @@ void matrix::min(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
     size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
     size_m noOfOpp = shape()[axis];
     
-    MinPrimitive* primit = static_cast<MinPrimitive*>(output.tape);
+    MinReductionPrimitive* primit = static_cast<MinReductionPrimitive*>(output.tape);
     
     CollapsedDims_2 collapsed;
     uint32_t cdims;
@@ -9981,17 +10178,17 @@ void matrix::min(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
     }
 }
 
-matrix matrix::min(int start, int end, bool keepdims) {
+matrix matrix::min(int start, int end, bool keepdims) const {
     matrix flat = this->flatten(start, end);
     return flat.min(start, keepdims);
 }
 
-matrix matrix::min() {
+matrix matrix::min() const {
     matrix flat = this->flatten(0, -1);
     return flat.min(0);
 }
 
-matrix matrix::sum(int axis, bool keepdims) {
+matrix matrix::sum(int axis, bool keepdims) const {
     if (dims == 0) {
         return *this;
     }
@@ -10011,7 +10208,7 @@ matrix matrix::sum(int axis, bool keepdims) {
     output.calcStrides();
     output.total_size = output.accumul(0, output.dims);
     
-    SumPrimitive* prim = new SumPrimitive(*this, axis, keepdims);
+    SumPrimitive* prim = new SumPrimitive(const_cast<matrix&>(*this), axis, keepdims);
     prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, INT32_MAX, keepdims);
     prim->has_collapsed_dims = true;
     output.tape = prim;
@@ -10124,22 +10321,22 @@ void matrix::sum(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
     }
 }
 
-matrix matrix::sum(int start, int end, bool keepdims) {
+matrix matrix::sum(int start, int end, bool keepdims) const {
     matrix flat = this->flatten(start, end);
     return flat.sum(start, keepdims);
 }
 
-matrix matrix::sum() {
+matrix matrix::sum() const {
     matrix flat = this->flatten(0, -1);
     return flat.sum(0);
 }
 
-matrix matrix::mean(int axis, bool keepdims) {
+matrix matrix::mean(int axis, bool keepdims) const {
     matrix s = this->sum(axis, keepdims);
     return s / (float)shape()[axis];
 }
 
-matrix matrix::mean(int start, int end, bool keepdims) {
+matrix matrix::mean(int start, int end, bool keepdims) const {
     matrix s = this->sum(start, end, keepdims);
     int real_end = (end < 0) ? end + dims : end;
     size_m collapse_size = 1;
@@ -10149,24 +10346,24 @@ matrix matrix::mean(int start, int end, bool keepdims) {
     return s / (float)collapse_size;
 }
 
-matrix matrix::mean() {
+matrix matrix::mean() const {
     matrix s = this->sum();
     return s / (float)total_size;
 }
 
-matrix matrix::rms(int axis, bool keepdims) {
+matrix matrix::rms(int axis, bool keepdims) const {
     matrix sq = (*this) * (*this);
     matrix m = sq.mean(axis, keepdims);
     return matrix::sqrt(m);
 }
 
-matrix matrix::rms(int start, int end, bool keepdims) {
+matrix matrix::rms(int start, int end, bool keepdims) const {
     matrix sq = (*this) * (*this);
     matrix m = sq.mean(start, end, keepdims);
     return matrix::sqrt(m);
 }
 
-matrix matrix::rms() {
+matrix matrix::rms() const {
     matrix sq = (*this) * (*this);
     matrix m = sq.mean();
     return matrix::sqrt(m);
@@ -10202,4 +10399,136 @@ matrix matrix::operator[](size_m index) {
     }
     
     return out;
+}
+
+matrix matrix::take(const matrix& index, int axis) const {
+    matrix output(dims - 1 + index.dims, type);
+    // replaces the input axis shape with index shape =>
+    // inp shape [s0, s1, ... axis ..., s_n]
+    // index shape [i0, i1 .. i_m]
+    // output shape [[s0, s1, ... (i0, i1 .. i_m) ..., s_n]]
+    memcpy(output.shape(), shape(), axis * sizeof(size_m));
+    memcpy(output.shape() + axis, index.shape(), index.dims * sizeof(size_m));
+    memcpy(output.shape() + axis + index.dims, shape() + axis + 1, (dims - axis - 1) * sizeof(size_m));
+    
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+    output.tape = new TakePrimitive(const_cast<matrix&>(*this), const_cast<matrix&>(index), axis);
+    return output;
+}
+
+void matrix::take_backend(const matrix& index, matrix& output, int axis, ExecutionDevice exec_device) const {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = output.total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    uint32_t cdims = output.dims; // Dimension should be based on output
+    
+    size_m eff_src_strides[cdims];
+    size_m eff_idx_strides[cdims];
+    if (cdims != 0) {
+        memset(eff_src_strides, 0, cdims * sizeof(size_m));
+        memset(eff_idx_strides, 0, cdims * sizeof(size_m));
+        
+        memcpy(eff_src_strides, strides(), axis * sizeof(size_m));
+        memcpy(eff_idx_strides + axis, index.strides(), index.dims * sizeof(size_m));
+        memcpy(eff_src_strides + index.dims + axis, strides() + axis + 1, (dims-axis-1) * sizeof(size_m));
+    }
+    if (exec_device == ExecutionDevice::METAL) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)type;
+        int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+
+        if (!GlobalGPUManager.TakeInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initTake_nd(typeCode, kernel_code);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.TakeComputeState_nd[typeCode][kernel_code]];
+
+        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // dst
+        setBufferOrBytes(commandEncoder, *this, 1); // src
+        setBufferOrBytes(commandEncoder, index, 2); // indices
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        if (cdims == 0 || cdims == 1) {
+            size_m out_stride = cdims == 0 ? 1 : output.strides()[0];
+            size_m src_stride = cdims == 0 ? 0 : eff_src_strides[0];
+            size_m idx_stride = cdims == 0 ? 0 : eff_idx_strides[0];
+            [commandEncoder setBytes:&out_stride length:sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:&src_stride length:sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&idx_stride length:sizeof(size_m) atIndex:5];
+            
+            size_m src_axis_stride = strides()[axis];
+            [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
+            
+            _dispatchExecutionSize = MTLSizeMake(cdims == 0 ? 1 : output.shape()[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setBytes:output.strides() length:2 * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:eff_src_strides length:2 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:eff_idx_strides length:2 * sizeof(size_m) atIndex:5];
+            
+            size_m src_axis_stride = strides()[axis];
+            [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
+            
+            _dispatchExecutionSize = MTLSizeMake(output.shape()[1], output.shape()[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setBytes:output.strides() length:3 * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:eff_src_strides length:3 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:eff_idx_strides length:3 * sizeof(size_m) atIndex:5];
+            
+            size_m src_axis_stride = strides()[axis];
+            [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
+            
+            _dispatchExecutionSize = MTLSizeMake(output.shape()[2], output.shape()[1], output.shape()[0]);
+        } else {
+            [commandEncoder setBytes:output.strides() length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:eff_src_strides length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:eff_idx_strides length:cdims * sizeof(size_m) atIndex:5];
+            
+            size_m src_axis_stride = strides()[axis];
+            [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
+            
+            [commandEncoder setBytes:output.shape() length:cdims * sizeof(size_m) atIndex:7];
+            int ndim = cdims;
+            [commandEncoder setBytes:&ndim length:sizeof(int) atIndex:8];
+            
+            size_m total_threads = output.total_size;
+            size_m threads_y = output.shape()[cdims-2];
+            size_m threads_x = output.shape()[cdims-1];
+            size_m threads_z = total_threads / (threads_x * threads_y);
+            _dispatchExecutionSize = MTLSizeMake(threads_x, threads_y, threads_z);
+        }
+        
+        // We don't need to pass axis to the GPU anymore since we resolved it on CPU!
+        
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        // CPU Execution Fallback
+        int typeCode = (int)type;
+        if (typeCode == (int)dtype::Float) {
+            float* dst_ptr = (float*)output.buffer;
+            float* src_ptr = (float*)buffer;
+            int* idx_ptr = (int*)index.buffer;
+            
+            size_m src_axis_stride = strides()[axis];
+            
+            for (size_t i = 0; i < output.total_size; ++i) {
+                size_m remA = i;
+                size_m dst_idx = 0;
+                size_m idx_idx = 0;
+                size_m src_idx = 0;
+                for (int d = cdims - 1; d >= 0; --d) {
+                    size_m mod = remA % output.shape()[d];
+                    dst_idx += mod * output.strides()[d];
+                    idx_idx += mod * eff_idx_strides[d];
+                    src_idx += mod * eff_src_strides[d];
+                    remA /= output.shape()[d];
+                }
+                int idx_val = idx_ptr[idx_idx];
+                src_idx += idx_val * src_axis_stride;
+                dst_ptr[dst_idx] = src_ptr[src_idx];
+            }
+        }
+    }
 }

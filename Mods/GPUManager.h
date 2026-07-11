@@ -114,6 +114,9 @@ public:
     bool ExpInit_nd[4][4];
     id<MTLComputePipelineState> ExpComputeState_nd[4][4];
     
+    bool TakeInit_nd[4][4];
+    id<MTLComputePipelineState> TakeComputeState_nd[4][4];
+    
     bool ConvolveInit[3];
     id<MTLComputePipelineState> ConvolveComputeState[3];
     
@@ -129,17 +132,18 @@ public:
     bool ConvolveFullInit[3];
     id<MTLComputePipelineState> ConvolveFullComputeState[3];
     
-    bool BrodcastedAddInit[4][4];
     id<MTLComputePipelineState> BrodcastedAddComputeState[4][4];
-    
-    bool BrodcastedSubInit[4][4];
     id<MTLComputePipelineState> BrodcastedSubComputeState[4][4];
-    
-    bool BrodcastedMulInit[4][4];
     id<MTLComputePipelineState> BrodcastedMulComputeState[4][4];
-    
-    bool BrodcastedDivInit[4][4];
     id<MTLComputePipelineState> BrodcastedDivComputeState[4][4];
+    id<MTLComputePipelineState> BrodcastedMaxComputeState[4][4];
+    id<MTLComputePipelineState> BrodcastedMinComputeState[4][4];
+    bool BrodcastedAddInit[4][4] = {{false}};
+    bool BrodcastedSubInit[4][4] = {{false}};
+    bool BrodcastedMulInit[4][4] = {{false}};
+    bool BrodcastedDivInit[4][4] = {{false}};
+    bool BrodcastedMaxInit[4][4] = {{false}};
+    bool BrodcastedMinInit[4][4] = {{false}};
     
     bool Concat_2M[4];
     id<MTLComputePipelineState> Concat_2M_ComputeState[4];
@@ -228,6 +232,7 @@ public:
                 SqrtInit_nd[i][j] = false;
                 ExpInit_nd[i][j] = false;
                 ClampInit_nd[i][j] = false;
+                TakeInit_nd[i][j] = false;
             }
         }
         for (int i = 0; i < 3; i++) {
@@ -278,6 +283,7 @@ public:
     }
     void commitCommandBuffer() {
         [getCommandBuffer() commit];
+        [getCommandBuffer() waitUntilCompleted];
         setCommandBuffer(nil);
     }
     
@@ -662,6 +668,20 @@ public:
         BrodcastedDivComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         BrodcastedDivInit[typeCode][dimSpecialiation] = true;
     }
+    
+    void initBrodcastedMaxInit(int typeCode, int dimSpecialiation) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedMaxGPU_%i_%i", typeCode, dimSpecialiation]];
+        BrodcastedMaxComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        BrodcastedMaxInit[typeCode][dimSpecialiation] = true;
+    }
+    
+    void initBrodcastedMinInit(int typeCode, int dimSpecialiation) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedMinGPU_%i_%i", typeCode, dimSpecialiation]];
+        BrodcastedMinComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        BrodcastedMinInit[typeCode][dimSpecialiation] = true;
+    }
     void initExp(int i) {
         NSError* error = nil;
         id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ExpGPU_%i", i]];
@@ -736,6 +756,14 @@ public:
         id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ExpGPU_nd_%i_%i", type_code, cdims]];
         ExpComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ExpInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+
+    void initTake_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TakeGPU_nd_%i_%i", type_code, cdims]];
+        TakeComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        TakeInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
     }
     

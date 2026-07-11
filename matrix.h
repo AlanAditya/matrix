@@ -113,9 +113,16 @@ dtype promote_types(dtype a, dtype b);
 
 struct SharedArrayDescriptor {
     std::atomic<uint32_t> refCount;
-    size_m *shape();
-    size_m *strides(int dims);
-    
+    inline size_m* shape() {
+        return reinterpret_cast<size_m *>(this + 1);
+    }
+    inline size_m* strides(int dims) {
+        return shape() + dims;
+    }
+    inline SharedArrayDescriptor* retain() {
+        refCount.fetch_add(1, std::memory_order_relaxed);
+        return this;
+    }
     static SharedArrayDescriptor *create(uint32_t dims) {
         size_t total_bytes =
         sizeof(SharedArrayDescriptor) + (dims * 2 * sizeof(size_m));
@@ -124,7 +131,6 @@ struct SharedArrayDescriptor {
         shared->refCount.store(1, std::memory_order_relaxed);
         return shared;
     }
-    SharedArrayDescriptor* retain();
     void release();
 };
 
@@ -393,17 +399,41 @@ public:
             using BufT = std::decay_t<decltype(*typed_buffer)>;
             *typed_buffer = static_cast<BufT>(val);
         });
+        s.begin_refcount();
         return s;
     }
     
-    size_m *shape();
-    size_m *strides();
-    
-    const size_m *shape() const;
-    const size_m *strides() const;
-    
-    void buildMetalBuffer();
-    void detach_shape();
+    inline size_m* shape() {
+        return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer : array_desc.shared_arr_desc->shape();
+    }
+    inline size_m* strides() {
+        return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer + SBO_MAX_DIMS : array_desc.shared_arr_desc->strides(dims);
+    }
+
+    inline const size_m* shape() const {
+        return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer : array_desc.shared_arr_desc->shape();
+    }
+
+    inline const size_m* strides() const {
+        return dims <= SBO_MAX_DIMS ? array_desc.inline_buffer + SBO_MAX_DIMS : array_desc.shared_arr_desc->strides(dims);
+    }
+
+    inline void buildMetalBuffer() {
+        metalBuffer = [GlobalGPUManager.metalDevice newBufferWithBytesNoCopy:buffer length:effectiveBufferSize() * dtype_size(type) options:MTLResourceStorageModeShared deallocator:^(void *_Nonnull pointer, NSUInteger length){
+        }];
+    }
+    inline void detach_shape() {
+        if (dims > SBO_MAX_DIMS) {
+            auto old_desc = array_desc.shared_arr_desc;
+            if (old_desc->refCount.load(std::memory_order_acquire) == 1)
+                return; // already exclusive
+            array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
+            memcpy(shape(), old_desc->shape(), dims * sizeof(size_m));
+            memcpy(strides(), old_desc->strides(dims), dims * sizeof(size_m));
+            
+            old_desc->release();
+        }
+    }
     void shareBuffer(matrix &mat) const;
     
     void beginReferenceCounting();
@@ -424,7 +454,7 @@ public:
         return output;
     }
     
-    void print();
+    void print() const;
     
     friend void setBufferOrBytes(id<MTLComputeCommandEncoder> commandEncoder, const matrix &tensor, NSUInteger index);
     
@@ -694,6 +724,9 @@ public:
     matrix slice_assign(R slice_range, int slice_axis, const matrix& rhs);
     matrix slice_assign(array_descriptor slice_range, std::vector<size_m>& slice_indices, size_t offset, const matrix& rhs);
 
+    matrix take(const matrix& index, int axis) const;
+    void take_backend(const matrix& index, matrix& output, int axis, ExecutionDevice exec_device) const;
+
     matrix operator[](size_m index);
     
     inline void set_array_desc(const array_descriptor& new_array_desc);
@@ -710,28 +743,28 @@ public:
     matrix insert_break(std::function<void(matrix&)> lambda, ExecutionDevice exec_device = ExecutionDevice::METAL) const;
 
     matrix sum_legacy(int axis,  bool keepdims = false);
-    matrix sum(int axis, bool keepdims = false);
+    matrix sum(int axis, bool keepdims = false) const ;
     void sum(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device = ExecutionDevice::AUTO);
-    matrix sum(int start, int end, bool keepdims = false);
-    matrix sum(); // global sum
+    matrix sum(int start, int end, bool keepdims = false) const;
+    matrix sum() const; // global sum
     
-    matrix mean(int axis, bool keepdims = false);
-    matrix mean(int start, int end = -1, bool keepdims = false);
-    matrix mean(); // global mean
+    matrix mean(int axis, bool keepdims = false) const;
+    matrix mean(int start, int end = -1, bool keepdims = false) const;
+    matrix mean() const; // global mean
 
-    matrix rms(int axis, bool keepdims = false);
-    matrix rms(int start, int end = -1, bool keepdims = false);
-    matrix rms(); // global rms
+    matrix rms(int axis, bool keepdims = false) const;
+    matrix rms(int start, int end = -1, bool keepdims = false) const;
+    matrix rms() const; // global rms
 
-    matrix max(int axis, bool keepdims = false);
+    matrix max(int axis, bool keepdims = false) const;
     void max(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device = ExecutionDevice::AUTO);
-    matrix max(int start, int end, bool keepdims = false);
-    matrix max(); // global max
+    matrix max(int start, int end, bool keepdims = false) const;
+    matrix max() const; // global max
 
-    matrix min(int axis, bool keepdims = false);
+    matrix min(int axis, bool keepdims = false) const;
     void min(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device = ExecutionDevice::AUTO);
-    matrix min(int start, int end, bool keepdims = false);
-    matrix min(); // global min
+    matrix min(int start, int end, bool keepdims = false) const;
+    matrix min() const; // global min
     void unbrodcast(matrix& output, matrix& target);
     matrix unbroadcast_shape(const size_m* target_shape, int target_dims) const;
     
@@ -837,8 +870,8 @@ public:
             if (exec == Execution::EncodeAndExecute) {
                 [commandBuffer commit];
                 [commandBuffer waitUntilCompleted];
-                GlobalGPUManager.gCommandBuffer = nil;
-                GlobalGPUManager.gCommandEncoder = nil;
+                GlobalGPUManager.setCommandBuffer(nil);
+                GlobalGPUManager.setCommandEncoder(nil);
             }
             return;
         }
@@ -920,7 +953,7 @@ public:
             GlobalGPUManager.endCommandEncoding();
             [commandBuffer commit];
             [commandBuffer waitUntilCompleted];
-            GlobalGPUManager.gCommandBuffer = nil;
+            GlobalGPUManager.setCommandBuffer(nil);
         }
     }
     
@@ -1022,7 +1055,7 @@ public:
             GlobalGPUManager.endCommandEncoding();
             [commandBuffer commit];
             [commandBuffer waitUntilCompleted];
-            GlobalGPUManager.gCommandBuffer = nil;
+            GlobalGPUManager.setCommandBuffer(nil);
         }
     }
     
@@ -1237,7 +1270,7 @@ public:
     int brodcast_shapes(const array_descriptor &shape1,
                         const array_descriptor &shape2, int dims1, int dims2,
                         array_descriptor &outShape);
-    matrix flatten(int start_dim = 0, int end_dim = -1);
+    matrix flatten(int start_dim = 0, int end_dim = -1) const;
     
     void add( matrix &other, matrix &result,
              EvalType evalType = EvalType::EVAL_AUTO)   ;
@@ -1288,6 +1321,11 @@ public:
     
     matrix clamp(double min_val, double max_val) const;
     void clamp(matrix& output, double min_val, double max_val, ExecutionDevice exec_device) const;
+    
+    static matrix max(const matrix& a, const matrix& b);
+    void max(const matrix& other, matrix& output, ExecutionDevice exec_device) const;
+    static matrix min(const matrix& a, const matrix& b);
+    void min(const matrix& other, matrix& output, ExecutionDevice exec_device) const;
 
     static matrix conv(const matrix& input, const matrix& kernel, const std::vector<int>& padding, const std::vector<int>& stride, const std::vector<int>& dilation, int groups = 1);
     
