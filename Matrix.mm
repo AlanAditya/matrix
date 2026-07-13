@@ -33,7 +33,7 @@
     #import <MobileCoreServices/MobileCoreServices.h>
 #endif
 
-using R = Range;
+//using R = AxisRange;
 
 // enum class dtype {
 //     Float = 0,
@@ -343,11 +343,13 @@ matrix matrix::reshape(Args... newShape) {
     output.calcStrides();
     output.flags = flags;
     output.flags &= ~NON_CONTIGUOUS_FLAG;
-    output.flags &= ~NON_OWNERSHIP_FLAG;
+    
     output.total_size = total_size;
-    output.refCount = refCount;
 
     bool REQUIRES_NEW_BUFFER = (flags & NON_CONTIGUOUS_FLAG) != 0;
+    if (REQUIRES_NEW_BUFFER) {
+        output.flags &= ~NON_OWNERSHIP_FLAG;
+    }
     output.tape = new ReshapePrimitive(*this, output.array_desc, output.dims, REQUIRES_NEW_BUFFER);
     return output;
 }
@@ -366,27 +368,27 @@ template matrix matrix::reshape(int, int, int, int);
 template matrix matrix::reshape(int, int, int, int, int);
 
 void matrix::reshape_eval(matrix& output, array_descriptor reshape_desc, size_t reshape_dims, ExecutionDevice execDev) {
-    if (flags & NON_CONTIGUOUS_FLAG) {
-        // Create a temporary view of output that perfectly matches the input's shape
-        // This is necessary because copyGPUinplace and copyCPUinplace rely on collapse_dims
-        // which assumes the number of dimensions in inMat and outMat match.
-        matrix output_view(dims, type);
-        memcpy(output_view.shape(), shape(), dims * sizeof(size_m));
-        output_view.calcStrides();
-        output_view.buffer = output.buffer;
-        output_view.metalBuffer = output.metalBuffer;
-        output_view.total_size = total_size;
-        output_view.flags = output.flags;
-        
-        if (execDev == ExecutionDevice::AUTO) {
-            execDev = (total_size > 10) ? ExecutionDevice::METAL : ExecutionDevice::CPU;
-        }
-        if (execDev == ExecutionDevice::METAL) {
-            copyGPUinplace(output_view, *this, 0, Execution::Encode);
-        } else {
-            copyCPUinplace(output_view, *this, 0);
-        }
+
+    // Create a temporary view of output that perfectly matches the input's shape
+    // This is necessary because copyGPUinplace and copyCPUinplace rely on collapse_dims
+    // which assumes the number of dimensions in inMat and outMat match.
+    matrix output_view(dims, type);
+    memcpy(output_view.shape(), shape(), dims * sizeof(size_m));
+    output_view.calcStrides();
+    output.shareBuffer(output_view);
+    output_view.metalBuffer = output.metalBuffer;
+    output_view.total_size = total_size;
+    output_view.flags = output.flags;
+    
+    if (execDev == ExecutionDevice::AUTO) {
+        execDev = (total_size > 10) ? ExecutionDevice::METAL : ExecutionDevice::CPU;
     }
+    if (execDev == ExecutionDevice::METAL) {
+        copyGPUinplace(output_view, *this, 0, Execution::Encode);
+    } else {
+        copyCPUinplace(output_view, *this, 0);
+    }
+    
 }
 
 matrix matrix::reshape(array_descriptor reshape_desc, size_t reshape_dims) {
@@ -407,7 +409,7 @@ matrix matrix::reshape(array_descriptor reshape_desc, size_t reshape_dims) {
     
     output.flags = flags;
     output.flags &= ~NON_CONTIGUOUS_FLAG;
-    output.refCount = refCount;
+    
 
 //    if (!(flags & NON_CONTIGUOUS_FLAG)) {
 //        output.buffer = buffer;
@@ -579,6 +581,7 @@ matrix matrix::flatten(int start_dim, int end_dim) const {
 
 
 matrix matrix::unsqueeze(uint32_t* axes, uint32_t num_axes) const {
+    if (num_axes == 0) return *this;
     // normalize and sort axes (negative axis support optional)
     uint32_t new_dims = dims + num_axes;
     
@@ -605,28 +608,22 @@ matrix matrix::unsqueeze(uint32_t* axes, uint32_t num_axes) const {
         new_i++;
     }
     
-    if (flags & NON_CONTIGUOUS_FLAG) {
-        old_i = 0;
-        new_i = 0;
-        ax_i = 0;
-        while (new_i < new_dims) {
-            if (ax_i < num_axes && sorted_axes[ax_i] == new_i) {
-                output.strides()[new_i] = (old_i < dims) ? strides()[old_i] : 1;
-                ax_i++;
-            } else {
-                output.strides()[new_i] = strides()[old_i];
-                old_i++;
-            }
-            new_i++;
+    
+    old_i = 0;
+    new_i = 0;
+    ax_i = 0;
+    while (new_i < new_dims) {
+        if (ax_i < num_axes && sorted_axes[ax_i] == new_i) {
+            output.strides()[new_i] = (old_i < dims) ? strides()[old_i] : 1;
+            ax_i++;
+        } else {
+            output.strides()[new_i] = strides()[old_i];
+            old_i++;
         }
-        output.flags = flags;
-        output.flags &= ~NON_OWNERSHIP_FLAG;
-    } else {
-        output.calcStrides();
-        output.flags = flags;
-        output.flags &= ~NON_CONTIGUOUS_FLAG;
-        output.flags &= ~NON_OWNERSHIP_FLAG;
+        new_i++;
     }
+    output.flags = flags;
+
     output.total_size = total_size;
     output.tape = new ReshapePrimitive(const_cast<matrix&>(*this), output.array_desc, output.dims, false);
     return output;
@@ -816,18 +813,18 @@ matrix::matrix(uint32_t rank, dtype type_inp) {
 //}
 
 
- void matrix::shareBuffer(matrix &mat) const {
-    mat.releaseBuffer();
-    if (refCount) {
-        mat.refCount = refCount;
-        refCount->fetch_add(1);
-    } else {
-        mat.flags |= NON_OWNERSHIP_FLAG;
-    }
-    mat.buffer = buffer;
-    mat.metalBuffer = metalBuffer;
+void matrix::shareBuffer(matrix &mat) const {
     if (mat.tape) {
         mat.tape->update_cache((uint8_t*)buffer, metalBuffer, refCount);
+    }
+    mat.releaseBuffer();
+    mat.buffer = buffer;
+    mat.metalBuffer = metalBuffer;
+    if (refCount) {
+        mat.refCount = refCount;
+        refCount->fetch_add(1, std::memory_order_relaxed);
+    } else {
+        mat.flags |= NON_OWNERSHIP_FLAG;
     }
 }
 
@@ -1097,7 +1094,6 @@ std::function<matrix(matrix)> matrix::grad_graph_gpu(std::function<matrix(matrix
     
     matrix grad_output = matrix::build_grad_graph(output, sample);
     grad_output.compile_metal();
-    sample.releaseBuffer();
     
     return [sample, grad_output](matrix input) mutable -> matrix {
         if (!input.tape) {
@@ -1297,6 +1293,7 @@ std::function<std::vector<matrix>(const std::vector<matrix>)> matrix::grad_graph
 //    }
 
 void matrix::print() const {
+    const_cast<matrix&>(*this).update_from_trace();
     const_cast<matrix&>(*this).eval();
     if (!buffer)
         return;
@@ -1725,43 +1722,56 @@ matrix matrix::eye(uint m, dtype type ) {
 //    }
 matrix matrix::slice(R slice_range, int slice_axis) {
     update_from_trace();
-    matrix slicedMat = matrix(dims, type);
+    uint32_t out_dims = slice_range.is_index ? dims - 1 : dims;
+    
+    matrix slicedMat = matrix(out_dims, type);
     const size_m *src_shape = this->shape();
     const size_m *src_strides = this->strides();
     size_m *dst_shape = slicedMat.shape();
     size_m *dst_strides = slicedMat.strides();
     
-    
-    size_t index = 0;
     size_t offsets = 0;
-    memcpy(dst_shape, src_shape, dims * sizeof(size_m));
-    memcpy(dst_strides, src_strides, dims * sizeof(size_m));
     
     size_t actual_start = slice_range.start < 0 ? src_shape[slice_axis] + slice_range.start : slice_range.start;
     size_t actual_end;
     if (slice_range.is_all()) {
-        actual_start = 0;
         actual_end = src_shape[slice_axis];
     } else {
         actual_end = slice_range.end < 0 ? src_shape[slice_axis] + slice_range.end : slice_range.end;
     }
-    offsets = actual_start * src_strides[slice_axis];
-    dst_shape[slice_axis] = actual_end - actual_start;
-
+    std::vector<size_m> indices(2 * dims, 0);
+    size_t dst_index = 0;
+    for (int i = 0; i < dims; i++) {
+        if (i == slice_axis) {
+            indices[2*i]   = actual_start;
+            indices[2*i+1] = actual_end;
+            offsets += actual_start * src_strides[i];
+            if (slice_range.is_index) {
+                continue;  // squeeze: no dst write, axis dropped, dst_index does NOT advance
+            }
+            dst_shape[dst_index]   = (uint32_t)(actual_end - actual_start);
+            dst_strides[dst_index] = src_strides[i];
+            dst_index++;
+        } else {
+            indices[2*i]   = 0;
+            indices[2*i+1] = src_shape[i];   // full range, not {0,0}
+            dst_shape[dst_index]   = src_shape[i];
+            dst_strides[dst_index] = src_strides[i];
+            dst_index++;
+        }
+    }
+    
     slicedMat.total_size = slicedMat.accumul(0, dims);
     slicedMat.flags |= NON_OWNERSHIP_FLAG;
     slicedMat.flags |= NON_CONTIGUOUS_FLAG;
-    
-    std::vector<size_m> indices(2 * dims, 0);
-    indices[2* slice_axis] = actual_start;
-    indices[2* slice_axis + 1] = actual_end;
-    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, indices, slicedMat.total_size, offsets);
+    std::vector<size_m> unsqueze_mask = slice_range.is_index ? std::vector<size_m>{ (size_m)slice_axis } : std::vector<size_m>{};
+    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, indices, unsqueze_mask, slicedMat.total_size, offsets);
     
     return slicedMat;
 }
 
 
-matrix matrix::slice(array_descriptor slice_range, std::vector<size_m>& slice_indices, size_t offset) {
+matrix matrix::slice(array_descriptor slice_range, std::vector<size_m>& slice_indices, const std::vector<size_m>& unsqueeze_axis, size_t offset) {
     update_from_trace();
     matrix slicedMat = matrix(dims, type);
 
@@ -1771,7 +1781,7 @@ matrix matrix::slice(array_descriptor slice_range, std::vector<size_m>& slice_in
     slicedMat.total_size = slicedMat.accumul(0, dims);
     slicedMat.flags |= NON_OWNERSHIP_FLAG;
     slicedMat.flags |= NON_CONTIGUOUS_FLAG;
-    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, slice_indices, slicedMat.total_size, offset);
+    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, slice_indices, unsqueeze_axis, slicedMat.total_size, offset);
 
     return slicedMat;
 }
@@ -1818,57 +1828,87 @@ matrix matrix::slice(std::initializer_list<std::optional<std::pair<size_m, size_
     slicedMat.total_size = slicedMat.accumul(0, dims);
     slicedMat.flags |= NON_OWNERSHIP_FLAG;
     slicedMat.flags |= NON_CONTIGUOUS_FLAG;
-    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, indices, slicedMat.total_size, offsets);
+    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, indices, {}, slicedMat.total_size, offsets);
     return slicedMat;
 }
 
 matrix matrix::slice(std::initializer_list<R> slice_range) {
     update_from_trace();
-    matrix slicedMat = matrix(dims, type);
     const size_m *src_shape = this->shape();
     const size_m *src_strides = this->strides();
+
+    // 1. FAST FIRST PASS: Count dimensions after slicing
+    size_t out_dims = dims;
+    for (const auto& i : slice_range) {
+        if (i.is_index) out_dims--;
+    }
+
+    matrix slicedMat(out_dims, type);
     size_m *dst_shape = slicedMat.shape();
     size_m *dst_strides = slicedMat.strides();
+
     std::vector<size_m> indices(2 * dims, 0);
-    size_t index = 0;
+    // Renamed to unsqueeze_mask: tracks dimensions that need to be restored during backprop
+    std::vector<size_m> unsqueeze_mask(dims, 0);
+
+    uint32_t src_axis = 0;
+    uint32_t dst_axis = 0;
     size_t offsets = 0;
-    for (auto i : slice_range) {
-        size_t actual_start = i.start < 0 ? src_shape[index] + i.start : i.start;
+
+    for (const auto& i : slice_range) {
+        size_t actual_start = (i.start < 0) ? (src_shape[src_axis] + i.start) : i.start;
         size_t actual_end;
+
         if (i.is_all()) {
-            actual_start = 0;
-            actual_end = src_shape[index];
+            actual_end = src_shape[src_axis];
+        } else if (i.is_index) {
+            actual_end = actual_start + 1;
         } else {
-            actual_end = i.end < 0 ? src_shape[index] + i.end : i.end;
+            actual_end = (i.end < 0) ? (src_shape[src_axis] + i.end) : i.end;
         }
+
 #ifdef SAFE_MODE
         if (!i.is_all()) {
-            if (actual_end > src_shape[index]) {
-                std::cerr << "matrix: index " << actual_end << " excedes the shape "
-                << src_shape[index] << "of axis " << index << "\n";
-            }
-            if (actual_start > src_shape[index]) {
-                std::cerr << "matrix: index " << actual_start << " excedes the shape "
-                << src_shape[index] << "of axis " << index << "\n";
+            if (actual_end > src_shape[src_axis] || actual_start > src_shape[src_axis]) {
+                std::cerr << "matrix: index out of bounds on axis " << src_axis
+                          << ". Shape is " << src_shape[src_axis] << "\n";
             }
         }
 #endif
-        indices[2 * index] = actual_start;
-        indices[2 * index + 1] = actual_end;
-        dst_shape[index] = (uint32_t)(actual_end - actual_start);
-        offsets += actual_start * src_strides[index];
+
+        indices[2 * src_axis] = actual_start;
+        indices[2 * src_axis + 1] = actual_end;
+        offsets += actual_start * src_strides[src_axis];
+
+        if (i.is_index) {
+            // Mark axis to be unsqueezed when routing gradients back to the original shape
+            unsqueeze_mask[src_axis] = 1;
+        } else {
+            dst_shape[dst_axis] = actual_end - actual_start;
+            dst_strides[dst_axis] = src_strides[src_axis];
+            dst_axis++;
+        }
+        src_axis++;
+    }
+
+    // Fill trailing dimensions natively
+    while (src_axis < dims) {
+        indices[2 * src_axis] = 0;
+        indices[2 * src_axis + 1] = src_shape[src_axis];
         
-        index++;
+        dst_shape[dst_axis] = src_shape[src_axis];
+        dst_strides[dst_axis] = src_strides[src_axis];
+        
+        src_axis++;
+        dst_axis++;
     }
-    if (slice_range.size() < dims) {
-        memcpy(dst_shape + slice_range.size(), src_shape + slice_range.size(),
-               (dims - slice_range.size()) * sizeof(size_m));
-    }
-    memcpy(dst_strides, src_strides, dims * sizeof(size_m));
-    slicedMat.total_size = slicedMat.accumul(0, dims);
+
+    slicedMat.total_size = slicedMat.accumul(0, out_dims);
     slicedMat.flags |= NON_OWNERSHIP_FLAG;
     slicedMat.flags |= NON_CONTIGUOUS_FLAG;
-    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, indices, slicedMat.total_size, offsets);
+    
+    // Pass the unsqueeze_mask to the autograd tape
+    slicedMat.tape = new SlicePrimitive(*this, slicedMat.array_desc, indices, unsqueeze_mask, slicedMat.total_size, offsets);
 
     return slicedMat;
 }
@@ -1894,7 +1934,7 @@ matrix matrix::slice_assign(array_descriptor slice_range, std::vector<size_m>& s
     memcpy(outMat.strides(), this->strides(), dims * sizeof(size_m));
     outMat.total_size = this->total_size;
 
-    matrix virtual_slice = this->slice(slice_range, slice_indices, offset);
+    matrix virtual_slice = this->slice(slice_range, slice_indices, {},  offset);
     SlicePrimitive* sp = static_cast<SlicePrimitive*>(virtual_slice.tape);
     outMat.tape = new SliceAssignPrimitive(*this, rhs, virtual_slice.array_desc, sp->slice_indices, virtual_slice.total_size, sp->offset);
     
@@ -2107,6 +2147,7 @@ matrix matrix::padding(std::vector<size_m>& padding_range, const matrix& value) 
 }
 
 matrix matrix::broadcast_to(const size_m *target_shape, int target_dims) const {
+    throw std::runtime_error("matrix: depreceated function use broadcast_toV2");
     if (target_dims < dims)
         throw std::runtime_error("matrix: Cannot broadcast to fewer dimensions.");
     
@@ -2215,57 +2256,57 @@ std::tuple<matrix, matrix, matrix> matrix::meshgrid(const matrix& x, const matri
     return {X_out, Y_out, Z_out};
 }
 
-matrix matrix::operator[](Range range) {
+matrix matrix::operator[](AxisRange range) {
     return slice({range});
 }
-matrix matrix::operator[](Range range1, Range range2) {
+matrix matrix::operator[](AxisRange range1, AxisRange range2) {
     return slice({range1, range2});
 }
-matrix matrix::operator[](Range range1, Range range2, Range range3) {
+matrix matrix::operator[](AxisRange range1, AxisRange range2, AxisRange range3) {
     return slice({range1, range2, range3});
 }
 
-matrix matrix::operator[](int i, int j) const {
-#ifdef SAFE_MODE
-    if (i < 0) {
-        i = shape[0] + i;
-    }
-    if (i >= shape[0]) {
-        throw std::invalid_argument("Index Out Of range");
-    }
-    
-    if (j < 0) {
-        j = shape[1] + j;
-    }
-    if (j >= shape[1]) {
-        throw std::invalid_argument("Index Out Of range");
-    }
-#endif
-    matrix slicedMat(dims - 2, type);
-    const size_m *curr_stride = strides();
-    
-    slicedMat.buffer =
-    (uint8_t *)buffer +
-    (curr_stride[0] * i + curr_stride[1] * j) * dtype_size(type);
-    
-    int sub_dims = dims - 2;
-    if (sub_dims == 1) {
-        // Highly optimized fast-path for 3D tensors returning a 1D pixel natively
-        slicedMat.strides()[0] = curr_stride[2];
-        slicedMat.shape()[0] = shape()[2];
-        slicedMat.total_size = shape()[2];
-    } else {
-        memcpy(slicedMat.strides(), curr_stride + 2, sub_dims * sizeof(size_m));
-        memcpy(slicedMat.shape(), shape() + 2, sub_dims * sizeof(size_m));
-        slicedMat.total_size = accumul(2, dims);
-    }
-    
-    if (slicedMat.total_size > 10) {
-        slicedMat.buildMetalBuffer();
-    }
-    slicedMat.flags |= NON_OWNERSHIP_FLAG;
-    return slicedMat;
-}
+//matrix matrix::operator[](int i, int j) const {
+//#ifdef SAFE_MODE
+//    if (i < 0) {
+//        i = shape[0] + i;
+//    }
+//    if (i >= shape[0]) {
+//        throw std::invalid_argument("Index Out Of range");
+//    }
+//    
+//    if (j < 0) {
+//        j = shape[1] + j;
+//    }
+//    if (j >= shape[1]) {
+//        throw std::invalid_argument("Index Out Of range");
+//    }
+//#endif
+//    matrix slicedMat(dims - 2, type);
+//    const size_m *curr_stride = strides();
+//    
+//    slicedMat.buffer =
+//    (uint8_t *)buffer +
+//    (curr_stride[0] * i + curr_stride[1] * j) * dtype_size(type);
+//    
+//    int sub_dims = dims - 2;
+//    if (sub_dims == 1) {
+//        // Highly optimized fast-path for 3D tensors returning a 1D pixel natively
+//        slicedMat.strides()[0] = curr_stride[2];
+//        slicedMat.shape()[0] = shape()[2];
+//        slicedMat.total_size = shape()[2];
+//    } else {
+//        memcpy(slicedMat.strides(), curr_stride + 2, sub_dims * sizeof(size_m));
+//        memcpy(slicedMat.shape(), shape() + 2, sub_dims * sizeof(size_m));
+//        slicedMat.total_size = accumul(2, dims);
+//    }
+//    
+//    if (slicedMat.total_size > 10) {
+//        slicedMat.buildMetalBuffer();
+//    }
+//    slicedMat.flags |= NON_OWNERSHIP_FLAG;
+//    return slicedMat;
+//}
 
 void matrix::CopyToTexture(id<MTLTexture> texture, Execution exec) {
 #ifdef SAFE_MODE
@@ -2812,8 +2853,9 @@ void matrix::begin_refcount() {
         return;
     refCount = new std::atomic<uint32_t>(1);
 }
-void matrix::stack(const std::vector<matrix>& mats, matrix& output, int axis, EvalType eval_type, ExecutionDevice exec_device) {
-    if (axis < 0) axis += mats[0].dims;
+
+matrix matrix::stack(const std::vector<matrix>& mats, int axis) {
+    if (axis < 0) axis += mats[0].dims + 1;
 #ifdef SAFE_MODE
     if (output.dims != mats[0].dims + 1) {
         throw std::invalid_argument("matrix::stack: output dims must be input dims + 1");
@@ -2836,48 +2878,26 @@ void matrix::stack(const std::vector<matrix>& mats, matrix& output, int axis, Ev
     }
 #endif
     
+    matrix output(mats[0].dims + 1, mats[0].type);
+    
     size_m* out_shape = output.shape();
-    if (eval_type == EvalType::EVAL_AUTO) {
-        memcpy(out_shape, mats[0].shape(), axis * sizeof(size_m));
-        memcpy(out_shape + (axis + 1), mats[0].shape() + (axis), (mats[0].dims - axis) * sizeof(size_m));
-        out_shape[axis] = (size_m)mats.size();
-        output.total_size = mats[0].total_size * mats.size();
-        output.calcStrides();
-        
-        output.tape = new StackPrimitive(mats, axis);
-        
-        return;
-    }
+    memcpy(out_shape, mats[0].shape(), axis * sizeof(size_m));
+    memcpy(out_shape + (axis + 1), mats[0].shape() + (axis), (mats[0].dims - axis) * sizeof(size_m));
+    out_shape[axis] = (size_m)mats.size();
+    output.total_size = mats[0].total_size * mats.size();
+    output.calcStrides();
+    
+    output.tape = new StackPrimitive(mats, axis);
+    
+    return output;
+}
+void matrix::stack(const std::vector<matrix>& mats, matrix& output, int axis, ExecutionDevice exec_device) {
+    if (axis < 0) axis += mats[0].dims;
+    
+    size_m* out_shape = output.shape();
     if (exec_device == ExecutionDevice::AUTO) {
         exec_device = output.total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
     }
-    
-    if (!output.buffer) {
-        // strides are the property of buffer and should be calculated with its total size in mind;
-        // Fix for garbage point clouds: newBufferWithBytesNoCopy requires page-aligned memory.
-        size_t sizeBytes = mats[0].total_size * mats.size() * dtype_size(output.type);
-        size_t pageSize = sysconf(_SC_PAGESIZE);
-        // Round up to full page size for safety (though just alignment is strictly required for address)
-        size_t alignedSize = (sizeBytes + pageSize - 1) & ~(pageSize - 1);
-        
-        void* raw_mem = nullptr;
-        if (posix_memalign(&raw_mem, pageSize, alignedSize) != 0) {
-            std::cerr << "MatrixH: Failed to allocate aligned memory" << "\n";
-            throw std::bad_alloc();
-        }
-        
-        output.buffer = raw_mem;
-        output.total_size = mats[0].total_size * mats.size();
-        output.flags |= NON_OWNERSHIP_FLAG;
-        
-        output.metalBuffer = [GlobalGPUManager.metalDevice newBufferWithBytesNoCopy:raw_mem
-                                                                             length:alignedSize
-                                                                            options:MTLResourceStorageModeShared
-                                                                        deallocator:^(void * _Nonnull pointer, NSUInteger length) {
-            free(pointer);
-        }];
-    }
-    if (eval_type == EvalType::COMPILE_TRACE) { return; }
     
     output.flags |= NON_CONTIGUOUS_FLAG;
     out_shape[axis] = 1;
@@ -2908,17 +2928,6 @@ void matrix::stack(const std::vector<matrix>& mats, matrix& output, int axis, Ev
     output.shape()[axis] = (size_m)mats.size();
     output.total_size = mats[0].total_size * mats.size();
     output.flags &= ~NON_CONTIGUOUS_FLAG;
-}
-
-matrix matrix::stackGPU(const std::vector<matrix>& mats, int axis, EvalType eval_type) {
-    matrix output(mats[0].dims+1, mats[0].type);
-    stack(mats, output, axis, eval_type, ExecutionDevice::METAL);
-    return output;
-}
-matrix matrix::stackCPU(const std::vector<matrix>& mats, int axis, EvalType eval_type) {
-    matrix output(mats[0].dims+1, mats[0].type);
-    stack(mats, output, axis, eval_type, ExecutionDevice::CPU);
-    return output;
 }
 
 matrix matrix::concat(const std::vector<matrix>& mats, int axis) {
@@ -10369,37 +10378,25 @@ matrix matrix::rms() const {
     return matrix::sqrt(m);
 }
 
-matrix matrix::operator[](size_m index) {
-    if (dims == 0) throw std::runtime_error("Cannot slice a 0-dimensional matrix");
-    if (index >= shape()[0]) throw std::runtime_error("Index out of bounds");
-    
-    matrix out(dims > 1 ? dims - 1 : 1, type);
-    
-    out.flags = NON_OWNERSHIP_FLAG;
-    if (flags & NON_CONTIGUOUS_FLAG) out.flags |= NON_CONTIGUOUS_FLAG;
-    
-    out.buffer = (uint8_t*)buffer + index * strides()[0] * dtype_size(type);
-    
-    if (refCount) {
-        out.refCount = refCount;
-        out.refCount->fetch_add(1, std::memory_order_relaxed);
-    }
-    
-    if (dims > 1) {
-        memcpy(out.shape(), shape() + 1, (dims - 1) * sizeof(size_m));
-        memcpy(out.strides(), strides() + 1, (dims - 1) * sizeof(size_m));
-    } else {
-        out.shape()[0] = 1;
-        out.strides()[0] = 1;
-    }
-    
-    out.total_size = 1;
-    for (int i = 0; i < out.dims; i++) {
-        out.total_size *= out.shape()[i];
-    }
-    
-    return out;
-}
+//matrix matrix::operator[](int index) {
+//    if (dims == 0) throw std::runtime_error("Cannot slice a 0-dimensional matrix");
+//    if (index >= shape()[0]) throw std::runtime_error("Index out of bounds");
+//    if (index < 0) index + dims;
+//    
+//    matrix output(dims-1, type);
+//    
+//    output.flags = flags;
+//    output.flags |= NON_OWNERSHIP_FLAG;
+//    
+//    
+//    if (dims > 1) {
+//        memcpy(output.shape(),   shape() + 1, (dims - 1) * sizeof(size_m));
+//        memcpy(output.strides(), strides() + 1, (dims - 1) * sizeof(size_m));
+//    }
+//    output.total_size = output.accumul(0, output.dims);
+//    output.tape = new SlicePrimitive()
+//    return output;
+//}
 
 matrix matrix::take(const matrix& index, int axis) const {
     matrix output(dims - 1 + index.dims, type);

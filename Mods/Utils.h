@@ -9,6 +9,7 @@
 #define Utils_h
 #include <vector>
 #include <iostream>
+#include <chrono>
 //#include <simd/simd.h>
 @import simd;
 
@@ -161,6 +162,27 @@ struct Range {
     }
 };
 
+struct AxisRange {
+    long long start;
+    long long end;
+    bool is_index;
+
+    // 1. Specific range: R(0, 1)
+    constexpr AxisRange(long long s, long long e) : start(s), end(e), is_index(false) {}
+
+    // 2. Full range: R() (Represents all elements in this dimension, like ':' in Python)
+    constexpr AxisRange() : start(0), end(LLONG_MAX), is_index(false) {}
+
+    // 3. Single index range
+    constexpr AxisRange(long long i) : start(i), end(i + 1), is_index(true) {}
+
+    // Helper to check if it's a full range
+    constexpr bool is_all() const {
+        return end == LLONG_MAX;
+    }
+};
+
+
 void PatternFill(void* destination, const void* pattern, size_t patternSize, uint32_t n);
 void append_uint32(uint32_t value, std::vector<uint8_t>& header);
 
@@ -238,5 +260,26 @@ std::vector<uint8_t> write_box2i_out(
 std::vector<uint8_t> write_v2f_out(
                float x,
                 float y);
+
+class Timer {
+public:
+     Timer() {
+        m_startTime = std::chrono::high_resolution_clock::now();
+    }
+    ~Timer() {
+        Stop();
+    }
+    
+    void Stop() {
+        auto endPointTime = std::chrono::high_resolution_clock::now();
+        auto start = std::chrono::time_point_cast<std::chrono::nanoseconds>(m_startTime).time_since_epoch().count();
+        auto end = std::chrono::time_point_cast<std::chrono::nanoseconds>(endPointTime).time_since_epoch().count();
+        auto duration = end - start;
+        double us = duration * 0.001;
+        std::cout << "It took " << duration << " ns " << us << " us " <<  "\n";
+    }
+private:
+    std::chrono::time_point<std::chrono::high_resolution_clock> m_startTime;
+};
 
 #endif /* Utils_h */

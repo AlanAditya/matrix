@@ -47,7 +47,30 @@ public:
     
     virtual matrix* get_borrowed_input() { return nullptr; }
 
-    virtual ~Primitive() = default;
+    virtual ~Primitive() {
+        if (out_refcount) {
+            if (out_refcount->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                if (out_buffer) delete[] static_cast<uint8_t*>(out_buffer);
+                delete out_refcount;
+            }
+        }
+    }
+
+    void update_cache(uint8_t* new_buf, id<MTLBuffer> new_metal, std::atomic<uint32_t>* new_refcount) {
+        if (out_refcount == new_refcount) return;
+        if (out_refcount) {
+            if (out_refcount->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                if (out_buffer) delete[] static_cast<uint8_t*>(out_buffer);
+                delete out_refcount;
+            }
+        }
+        out_buffer = new_buf;
+        out_metal_buffer = new_metal;
+        out_refcount = new_refcount;
+        out_refcount->fetch_add(1, std::memory_order_relaxed);
+        
+    }
+    
     virtual void eval_cpu(matrix& out, EvalType eval_type) = 0;
     virtual void eval_metal(matrix& out, EvalType eval_type) =0;
 
@@ -67,6 +90,7 @@ public:
         out_buffer = (uint8_t*)output.buffer;
         out_metal_buffer = output.metalBuffer;
         out_refcount = output.refCount;
+        if (out_refcount) out_refcount->fetch_add(1, std::memory_order_relaxed);
     }
 
     void eval_cpu(matrix &out, EvalType eval_type) override {
@@ -133,6 +157,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -163,6 +188,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -220,6 +246,10 @@ public:
     matrix b;
     BroadcastDescriptor* desc_a = nullptr;
     BroadcastDescriptor* desc_b = nullptr;
+    ~AdditionPrimitive() {
+        if (desc_a) BroadcastDescriptor::destroy(desc_a);
+        if (desc_b) BroadcastDescriptor::destroy(desc_b);
+    }
     CollapsedDims_3 collapsed_dims_3;
     bool dims_collapsed = false;
 
@@ -248,6 +278,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -277,6 +308,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -326,6 +358,10 @@ class SubtractionPrimitive : public Primitive {
     matrix b;
     BroadcastDescriptor* desc_a = nullptr;
     BroadcastDescriptor* desc_b = nullptr;
+    ~SubtractionPrimitive() {
+        if (desc_a) BroadcastDescriptor::destroy(desc_a);
+        if (desc_b) BroadcastDescriptor::destroy(desc_b);
+    }
     CollapsedDims_3 collapsed_dims_3;
     bool dims_collapsed = false;
 
@@ -351,6 +387,7 @@ class SubtractionPrimitive : public Primitive {
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -378,6 +415,7 @@ class SubtractionPrimitive : public Primitive {
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -389,8 +427,8 @@ class SubtractionPrimitive : public Primitive {
 
 
     std::vector<matrix> vjp(matrix& grad_out) override {
-        // a, b, c are vectors (a+b)=>c soo J = (dc/da, dc/db) and for addition its 1 so J = (1, 1)
-        return {grad_out.unbroadcast_shape(a.shape(), a.dims), grad_out.unbroadcast_shape(b.shape(), b.dims)};
+        // a, b, c are vectors (a-b)=>c soo J = (dc/da, dc/db) and for subtraction its 1, -1 so J = (1, -1)
+        return {grad_out.unbroadcast_shape(a.shape(), a.dims), grad_out.unbroadcast_shape(b.shape(), b.dims) * -1.0f};
     }
 
     matrix jvp(std::vector<matrix>& tangents) override {
@@ -425,6 +463,10 @@ class MultiplicationPrimitive : public Primitive {
     matrix b;
     BroadcastDescriptor* desc_a = nullptr;
     BroadcastDescriptor* desc_b = nullptr;
+    ~MultiplicationPrimitive() {
+        if (desc_a) BroadcastDescriptor::destroy(desc_a);
+        if (desc_b) BroadcastDescriptor::destroy(desc_b);
+    }
     CollapsedDims_3 collapsed_dims_3;
     bool dims_collapsed = false;
     MultiplicationPrimitive(const matrix& a, const matrix& b) : a(ensure_graph_ready(a)), b(ensure_graph_ready(b)) {
@@ -448,6 +490,7 @@ class MultiplicationPrimitive : public Primitive {
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -475,6 +518,7 @@ class MultiplicationPrimitive : public Primitive {
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -529,6 +573,10 @@ class DivisionPrimitive : public Primitive {
     matrix b;
     BroadcastDescriptor* desc_a = nullptr;
     BroadcastDescriptor* desc_b = nullptr;
+    ~DivisionPrimitive() {
+        if (desc_a) BroadcastDescriptor::destroy(desc_a);
+        if (desc_b) BroadcastDescriptor::destroy(desc_b);
+    }
     CollapsedDims_3 collapsed_dims_3;
     bool dims_collapsed = false;
 
@@ -554,6 +602,7 @@ class DivisionPrimitive : public Primitive {
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -581,6 +630,7 @@ class DivisionPrimitive : public Primitive {
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -661,13 +711,14 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
         }
         if (evaluated) {return;} else {evaluated = true;}
-        matrix::stack(inputs, out, axis, eval_type, ExecutionDevice::CPU);
+        matrix::stack(inputs, out, axis, ExecutionDevice::CPU);
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
         for (size_t i = 0; i < inputs.size(); i++) {
@@ -689,13 +740,14 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
         }
         if (evaluated) {return;} else {evaluated = true;}
-        matrix::stack(inputs, out, axis, eval_type, ExecutionDevice::METAL);
+        matrix::stack(inputs, out, axis, ExecutionDevice::METAL);
     }
 
 
@@ -704,7 +756,7 @@ public:
         std::vector<matrix> grad_vec;
         grad_vec.reserve(inputs.size());
         for (int i = 0; i < inputs.size(); i++) {
-            grad_vec.push_back(grad_out.slice(R(i, i+1), axis));
+            grad_vec.push_back(grad_out.slice(i, axis));
         }
         return grad_vec;
     }
@@ -766,6 +818,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -794,6 +847,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -810,7 +864,7 @@ public:
         grad_vec.reserve(inputs.size());
         size_m index = 0;
         for (int i = 0; i < inputs.size(); i++) {
-            grad_vec.push_back(grad_out.slice(R(index, inputs[i].shape()[axis]), axis));
+            grad_vec.push_back(grad_out.slice(R(index, index + inputs[i].shape()[axis]), axis));
             index += inputs[i].shape()[axis];
         }
         return grad_vec;
@@ -849,10 +903,24 @@ public:
     matrix input;
     array_descriptor slice_desc;
     std::vector<size_m> slice_indices;
+    std::vector<size_m> unsqeeze_mask;
     size_t slice_size;
     size_t offset;
-    SlicePrimitive(matrix& input_mat, array_descriptor& input_slice_desc, std::vector<size_m>& input_slice_indices, size_t input_slice_size, size_t input_offset ): input(ensure_graph_ready(input_mat)), slice_desc(input_slice_desc), slice_indices(input_slice_indices),slice_size(input_slice_size), offset(input_offset) {
+    SlicePrimitive(matrix& input_mat, array_descriptor& input_slice_desc, const std::vector<size_m>& input_slice_indices, const std::vector<size_m>& input_unsqueeze_mask, size_t input_slice_size, size_t input_offset ):
+    input(ensure_graph_ready(input_mat)),
+    slice_desc(input_slice_desc),
+    slice_indices(input_slice_indices),
+    unsqeeze_mask(input_unsqueeze_mask),
+    slice_size(input_slice_size),
+    offset(input_offset) {}
+    
+    ~SlicePrimitive() override {
+        if (out_refcount) {
+            out_refcount->fetch_sub(1, std::memory_order_relaxed);
+            out_refcount = nullptr; // Let input.~matrix() do the final safe deletion
+        }
     }
+    
     void eval_cpu(matrix &out, EvalType eval_type) override {
         if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); };
         input.update_from_trace();
@@ -873,6 +941,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (out.buffer != (uint8_t*)input.buffer) {
@@ -885,6 +954,7 @@ public:
             out.tape->out_buffer = (uint8_t*)out.buffer;
             out.tape->out_metal_buffer = out.metalBuffer;
             out.tape->out_refcount = out.refCount;
+            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -910,6 +980,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (out.buffer != (uint8_t*)input.buffer) {
@@ -922,6 +993,7 @@ public:
             out.tape->out_buffer = (uint8_t*)out.buffer;
             out.tape->out_metal_buffer = out.metalBuffer;
             out.tape->out_refcount = out.refCount;
+            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -934,12 +1006,12 @@ public:
         // a is vectors a[.., .., ...]=>c soo J = (dc/da, dc/db) = Identity padded with zeros for the orignal matrix values that were'nt in the slice
         // offset = ind[0] * strides[0] + ind[1] * strides[1] ... + ind[n-1] * strides[n-1];
         matrix padded_grad_out(input.dims, input.type);
-        grad_out.padding(slice_indices, padded_grad_out, {0});
-        return {grad_out};
+        grad_out.unsqueeze(unsqeeze_mask.data(), unsqeeze_mask.size()).padding(slice_indices, padded_grad_out, {0});
+        return {padded_grad_out};
     }
     matrix jvp(std::vector<matrix>& tangents) override {
         // a are vectors a[.., .., ...]=>c soo J = (dc/da, dc/db)=>J=(1, 1) and only return the slice of the incoming derivative
-        return tangents[0].slice(slice_desc, slice_indices, offset);
+        return tangents[0].slice(slice_desc, slice_indices, unsqeeze_mask, offset);
     }
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
@@ -994,6 +1066,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) return;
@@ -1030,6 +1103,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) return;
@@ -1049,7 +1123,7 @@ public:
 
     std::vector<matrix> vjp(matrix& grad_out) override {
         matrix dc_dlhs = grad_out.slice_assign(slice_desc, slice_indices, offset, matrix::scalar(0.0f, input.type));
-        matrix dc_drhs = grad_out.slice(slice_desc, slice_indices, offset);
+        matrix dc_drhs = grad_out.slice(slice_desc, slice_indices, {}, offset);
         return {dc_dlhs, dc_drhs};
     }
     
@@ -1079,7 +1153,7 @@ public:
     std::vector<matrix> get_inputs() override { return {input, rhs}; }
 };
 
-class MaxPrimitive : public Primitive {
+class MaxReductionPrimitive : public Primitive {
 public:
     matrix input;
     int axis;
@@ -1088,7 +1162,7 @@ public:
     CollapsedDims_2 collapsed_dims;
     bool has_collapsed_dims = false;
 
-    MaxPrimitive(matrix& input_mat, int input_axis, bool input_keepdims) 
+    MaxReductionPrimitive(matrix& input_mat, int input_axis, bool input_keepdims) 
         : input(input_mat), axis(input_axis), keepdims(input_keepdims) {}
 
     void eval_cpu(matrix &out, EvalType eval_type) override {
@@ -1108,6 +1182,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -1134,6 +1209,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -1172,7 +1248,7 @@ public:
     }
 };
 
-class MinPrimitive : public Primitive {
+class MinReductionPrimitive : public Primitive {
 public:
     matrix input;
     int axis;
@@ -1181,7 +1257,7 @@ public:
     CollapsedDims_2 collapsed_dims;
     bool has_collapsed_dims = false;
 
-    MinPrimitive(matrix& input_mat, int input_axis, bool input_keepdims) 
+    MinReductionPrimitive(matrix& input_mat, int input_axis, bool input_keepdims) 
         : input(input_mat), axis(input_axis), keepdims(input_keepdims) {}
 
     void eval_cpu(matrix &out, EvalType eval_type) override {
@@ -1201,6 +1277,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -1227,6 +1304,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -1266,6 +1344,200 @@ public:
 
 };
 
+class MaxPrimitive : public Primitive {
+public:
+    matrix a;
+    matrix b;
+    BroadcastDescriptor* desc_a = nullptr;
+    BroadcastDescriptor* desc_b = nullptr;
+    ~MaxPrimitive() {
+        if (desc_a) BroadcastDescriptor::destroy(desc_a);
+        if (desc_b) BroadcastDescriptor::destroy(desc_b);
+    }
+    CollapsedDims_3 collapsed_dims_3;
+    bool dims_collapsed = false;
+
+    MaxPrimitive(const matrix& a, const matrix& b) : a(ensure_graph_ready(a)), b(ensure_graph_ready(b)) {
+    }
+    MaxPrimitive(const matrix& a, const matrix& b, CollapsedDims_3 collapsed_dims_3) : a(ensure_graph_ready(a)), b(ensure_graph_ready(b)), collapsed_dims_3(collapsed_dims_3) {
+        dims_collapsed = true;
+    }
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_cpu(a, eval_type); }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_cpu(b, eval_type); }
+        a.update_from_trace();
+        b.update_from_trace();
+
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) {return;} else {evaluated = true;}
+
+        a.max(b, out, ExecutionDevice::CPU);
+    }
+    
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); }
+        a.update_from_trace();
+        b.update_from_trace();
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) {return;} else { evaluated = true; }
+        a.max(b, out, ExecutionDevice::METAL);
+    }
+
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        return {matrix(0, dtype::UInt8), matrix(0, dtype::UInt8)};
+    }
+    matrix jvp(std::vector<matrix>& tangents) override {
+        return matrix(0, dtype::UInt8);
+    }
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+        if (!this->evaluated) return true;
+        if (a.tape && a.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+        if (b.tape && b.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+        return false;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (a.tape) { a.tape->clear_trace_checks(); }
+        if (b.tape) { b.tape->clear_trace_checks(); }
+    }
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {a, b}; }
+};
+
+class MinPrimitive : public Primitive {
+public:
+    matrix a;
+    matrix b;
+    BroadcastDescriptor* desc_a = nullptr;
+    BroadcastDescriptor* desc_b = nullptr;
+    ~MinPrimitive() {
+        if (desc_a) BroadcastDescriptor::destroy(desc_a);
+        if (desc_b) BroadcastDescriptor::destroy(desc_b);
+    }
+    CollapsedDims_3 collapsed_dims_3;
+    bool dims_collapsed = false;
+
+    MinPrimitive(const matrix& a, const matrix& b) : a(ensure_graph_ready(a)), b(ensure_graph_ready(b)) {
+    }
+    MinPrimitive(const matrix& a, const matrix& b, CollapsedDims_3 collapsed_dims_3) : a(ensure_graph_ready(a)), b(ensure_graph_ready(b)), collapsed_dims_3(collapsed_dims_3) {
+        dims_collapsed = true;
+    }
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_cpu(a, eval_type); }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_cpu(b, eval_type); }
+        a.update_from_trace();
+        b.update_from_trace();
+
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) {return;} else {evaluated = true;}
+
+        a.min(b, out, ExecutionDevice::CPU);
+    }
+    
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); }
+        a.update_from_trace();
+        b.update_from_trace();
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) {return;} else { evaluated = true; }
+        a.min(b, out, ExecutionDevice::METAL);
+    }
+
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        return {matrix(0, dtype::UInt8), matrix(0, dtype::UInt8)};
+    }
+    matrix jvp(std::vector<matrix>& tangents) override {
+        return matrix(0, dtype::UInt8);
+    }
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+        if (!this->evaluated) return true;
+        if (a.tape && a.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+        if (b.tape && b.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+        return false;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (a.tape) { a.tape->clear_trace_checks(); }
+        if (b.tape) { b.tape->clear_trace_checks(); }
+    }
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {a, b}; }
+};
+
 class SumPrimitive : public Primitive {
 public:
     matrix input;
@@ -1295,6 +1567,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -1323,6 +1596,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -1390,6 +1664,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -1418,6 +1693,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -1432,8 +1708,7 @@ public:
 
     std::vector<matrix> vjp(matrix& grad_out) override {
         // a, c are vectors (padding ... a .. padding)=>c soo J = (dc/da, dc/db) and for addition its 1 so J = (1, 1)
-        matrix grad_sliced = grad_out.slice(input.array_desc, padding_range, offset);
-        memcpy(grad_sliced.strides(), grad_out.strides(), input.dims*sizeof(size_m));
+        matrix grad_sliced = grad_out.slice(input.array_desc, padding_range, {}, offset);
         return { grad_sliced };
     }
     matrix jvp(std::vector<matrix>& tangents) override {
@@ -1464,6 +1739,7 @@ public:
 
 class BrodcastPrimitive : public Primitive {
 public:
+    matrix* get_borrowed_input() override { return &input; }
     matrix input;
     array_descriptor brodcast_desc;
     size_t broadcasted_dims;
@@ -1489,6 +1765,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (out.buffer != (uint8_t*)input.buffer) {
@@ -1497,10 +1774,11 @@ public:
             out.metalBuffer = input.metalBuffer;
             out.refCount = input.refCount;
             if (out.refCount) out.refCount->fetch_add(1);
-
-            out.tape->out_buffer = (uint8_t*)out.buffer;
-            out.tape->out_metal_buffer = out.metalBuffer;
-            out.tape->out_refcount = out.refCount;
+            out.tape->update_cache((uint8_t*)out.buffer, out.metalBuffer, out.refCount);
+            // out.tape->out_buffer = (uint8_t*)out.buffer;
+            // out.tape->out_metal_buffer = out.metalBuffer;
+            // out.tape->out_refcount = out.refCount;
+            // out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -1526,6 +1804,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (out.buffer != (uint8_t*)input.buffer) {
@@ -1534,10 +1813,12 @@ public:
             out.metalBuffer = input.metalBuffer;
             out.refCount = input.refCount;
             if (out.refCount) out.refCount->fetch_add(1);
-
-            out.tape->out_buffer = (uint8_t*)out.buffer;
-            out.tape->out_metal_buffer = out.metalBuffer;
-            out.tape->out_refcount = out.refCount;
+            
+            out.tape->update_cache((uint8_t*)out.buffer, out.metalBuffer, out.refCount);
+            // out.tape->out_buffer = (uint8_t*)out.buffer;
+            // out.tape->out_metal_buffer = out.metalBuffer;
+            // out.tape->out_refcount = out.refCount;
+            // out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -1576,7 +1857,7 @@ public:
 
 class ReshapePrimitive : public Primitive {
 public:
-    matrix* get_borrowed_input() override { return &input; }
+    matrix* get_borrowed_input() override { return REQUIRES_NEW_BUFFER ? nullptr : &input; }
     matrix input;
     array_descriptor reshape_desc;
     size_t reshape_dim;
@@ -1600,6 +1881,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             } else {
                 out.buffer = (uint8_t*)input.buffer;
                 out.metalBuffer = input.metalBuffer;
@@ -1609,6 +1891,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (out.buffer != (uint8_t*)input.buffer && !REQUIRES_NEW_BUFFER) {
@@ -1617,10 +1900,12 @@ public:
             out.metalBuffer = input.metalBuffer;
             out.refCount = input.refCount;
             if (out.refCount) out.refCount->fetch_add(1);
-
-            out.tape->out_buffer = (uint8_t*)out.buffer;
-            out.tape->out_metal_buffer = out.metalBuffer;
-            out.tape->out_refcount = out.refCount;
+            
+            out.tape->update_cache((uint8_t*)out.buffer, out.metalBuffer, out.refCount);
+//            out.tape->out_buffer = (uint8_t*)out.buffer;
+//            out.tape->out_metal_buffer = out.metalBuffer;
+//            out.tape->out_refcount = out.refCount;
+//            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -1651,6 +1936,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             } else {
                 out.buffer = (uint8_t*)input.buffer;
                 out.metalBuffer = input.metalBuffer;
@@ -1660,6 +1946,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (out.buffer != (uint8_t*)input.buffer && !REQUIRES_NEW_BUFFER) {
@@ -1668,10 +1955,12 @@ public:
             out.metalBuffer = input.metalBuffer;
             out.refCount = input.refCount;
             if (out.refCount) out.refCount->fetch_add(1);
-
-            out.tape->out_buffer = (uint8_t*)out.buffer;
-            out.tape->out_metal_buffer = out.metalBuffer;
-            out.tape->out_refcount = out.refCount;
+            
+            out.tape->update_cache((uint8_t*)out.buffer, out.metalBuffer, out.refCount);
+//            out.tape->out_buffer = (uint8_t*)out.buffer;
+//            out.tape->out_metal_buffer = out.metalBuffer;
+//            out.tape->out_refcount = out.refCount;
+//            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
         }
 
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -1738,6 +2027,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
@@ -1764,6 +2054,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
 
             }
         }
@@ -1830,6 +2121,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (out.buffer != (uint8_t*)input.buffer) {
@@ -1842,6 +2134,7 @@ public:
             out.tape->out_buffer = (uint8_t*)out.buffer;
             out.tape->out_metal_buffer = out.metalBuffer;
             out.tape->out_refcount = out.refCount;
+            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
         }
         if (out.buffer != (uint8_t*)input.buffer) {
             out.releaseBuffer();
@@ -1853,6 +2146,7 @@ public:
             out.tape->out_buffer = (uint8_t*)out.buffer;
             out.tape->out_metal_buffer = out.metalBuffer;
             out.tape->out_refcount = out.refCount;
+            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -1878,6 +2172,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (out.buffer != (uint8_t*)input.buffer) {
@@ -1890,6 +2185,7 @@ public:
             out.tape->out_buffer = (uint8_t*)out.buffer;
             out.tape->out_metal_buffer = out.metalBuffer;
             out.tape->out_refcount = out.refCount;
+            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -1956,6 +2252,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -1974,8 +2271,10 @@ public:
             }
         }
         
-        if (owning_node->tape && typeid(*owning_node->tape) != typeid(SwapLeafPrimitive)) {
+        if (owning_node->tape && typeid(*owning_node->tape) != typeid(SwapLeafPrimitive) && owning_node->buffer != sample_parameter.buffer) {
             out.shareBuffer(*owning_node);
+        } else {
+            std::cerr << "CompiledNodePrimitive: Head Tail Collision cant chop" << std::endl;
         }
 
         output_graph.execute_cpu();
@@ -2001,11 +2300,11 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
         if (evaluated) {return;} else {evaluated = true;}
-        
         if (!outer_input.metalBuffer && outer_input.buffer) {
             outer_input.buildMetalBuffer();
         }
@@ -2024,14 +2323,15 @@ public:
             }
         }
         
-        if (owning_node->tape && typeid(*owning_node->tape) != typeid(SwapLeafPrimitive)) {
+        if (owning_node->tape && typeid(*owning_node->tape) != typeid(SwapLeafPrimitive) && owning_node->buffer != sample_parameter.buffer) {
             out.shareBuffer(*owning_node);
+        } else {
+            std::cerr << "CompiledNodePrimitive: Head Tail Collision cant chop" << std::endl;
+            throw std::runtime_error("CompiledNodePrimitive: Head Tail Collision - cannot chop");
         }
 
         output_graph.execute_metal();
         output_graph.clear_trace_checks();
-        
-        
     }
 
 
@@ -2119,6 +2419,7 @@ public:
                     out_i.tape->out_buffer = (uint8_t*)out_i.buffer;
                     out_i.tape->out_metal_buffer = out_i.metalBuffer;
                     out_i.tape->out_refcount = out_i.refCount;
+                    out_i.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
@@ -2184,6 +2485,7 @@ public:
                     out_i.tape->out_buffer = (uint8_t*)out_i.buffer;
                     out_i.tape->out_metal_buffer = out_i.metalBuffer;
                     out_i.tape->out_refcount = out_i.refCount;
+                    out_i.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
@@ -2275,6 +2577,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -2302,6 +2605,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -2364,6 +2668,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -2391,6 +2696,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -2451,6 +2757,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -2475,6 +2782,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -2534,6 +2842,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -2560,6 +2869,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -2619,6 +2929,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -2644,6 +2955,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -2702,6 +3014,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -2727,6 +3040,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -2786,6 +3100,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -2812,6 +3127,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -2870,6 +3186,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -2896,6 +3213,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         // ONLY Allocate, don't execute or mark as evaluated!
@@ -2936,6 +3254,10 @@ public:
     matrix b_transposed;
     BroadcastDescriptor* desc_a = nullptr;
     BroadcastDescriptor* desc_b = nullptr;
+    ~DotPrimitive() {
+        if (desc_a) BroadcastDescriptor::destroy(desc_a);
+        if (desc_b) BroadcastDescriptor::destroy(desc_b);
+    }
     CollapsedDims_3 collapsed_dims_3;
 
     DotPrimitive(const matrix& a, const matrix& b_transposed)
@@ -2962,6 +3284,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) return;
@@ -2990,6 +3313,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
         if (eval_type == EvalType::COMPILE_TRACE) return;
@@ -3070,6 +3394,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
 
@@ -3107,6 +3432,7 @@ public:
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
 
@@ -3147,4 +3473,106 @@ public:
         if (input.tape) input.tape->clear_trace_checks();
     }
     matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+};
+
+class TakePrimitive : public Primitive {
+public:
+    matrix source;
+    matrix indices;
+    int axis;
+
+    TakePrimitive(const matrix& source_in, const matrix& indices_in, int axis_in)
+        : source(source_in), indices(indices_in), axis(axis_in) {}
+
+    matrix* get_borrowed_input() override { return nullptr; } // Allocates new memory
+    
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (source.tape && !source.tape->evaluated) { source.tape->eval_cpu(source, eval_type); }
+        if (indices.tape && !indices.tape->evaluated) { indices.tape->eval_cpu(indices, eval_type); }
+        source.update_from_trace();
+        indices.update_from_trace();
+
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return; else evaluated = true;
+
+        source.take_backend(indices, out, axis, ExecutionDevice::CPU);
+    }
+
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (source.tape && !source.tape->evaluated) { source.tape->eval_metal(source, eval_type); }
+        if (indices.tape && !indices.tape->evaluated) { indices.tape->eval_metal(indices, eval_type); }
+        source.update_from_trace();
+        indices.update_from_trace();
+
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return; else evaluated = true;
+
+        source.take_backend(indices, out, axis, ExecutionDevice::METAL);
+    }
+    
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        return {grad_out};
+    }
+    
+    matrix jvp(std::vector<matrix>& tangents) override {
+        return tangents[0];
+    }
+    
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+        if (!this->evaluated) return true;
+        if (source.tape && source.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+        if (indices.tape && indices.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        return false;
+    }
+    
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (source.tape) source.tape->clear_trace_checks();
+        if (indices.tape) indices.tape->clear_trace_checks();
+    }
+    
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override {
+        return matrix(0, dtype::UInt8);
+    }
+    
+    std::vector<matrix> get_inputs() override {
+        return {source, indices};
+    }
 };

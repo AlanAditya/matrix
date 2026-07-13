@@ -25,8 +25,8 @@
 #import <UIKit/UIKit.h>
 #endif
 
-using R = Range;
-
+using R = AxisRange;
+using r = Range;
 enum class dtype: uint8_t {
     Float = 0,
     Float16 = 1,
@@ -455,6 +455,25 @@ public:
     }
     
     void print() const;
+    void printShape(bool verbose = true) const {
+        if (verbose == true) { std::cout << "Shape is [ "; }
+        const size_m* shape_ptr = shape();
+        for (int i=0; i<dims; i++) {
+            std::cout << shape_ptr[i] << ", ";
+        }
+        if (verbose == true) { std::cout << "]\n"; }
+        
+    }
+    
+    void printStrides(bool verbose = true) const {
+        if (verbose == true) { std::cout << "Strides are [ "; }
+        const size_m* stride_ptr = strides();
+        for (int i=0; i<dims; i++) {
+            std::cout << stride_ptr[i] << ", ";
+        }
+        if (verbose == true) { std::cout << "]\n"; }
+        
+    }
     
     friend void setBufferOrBytes(id<MTLComputeCommandEncoder> commandEncoder, const matrix &tensor, NSUInteger index);
     
@@ -552,10 +571,10 @@ public:
     
     matrix ones() const;
     matrix zeros() const;
-    
-    static void stack(const std::vector<matrix>& mats, matrix& output, int axis = 0, EvalType eval_type = EvalType::EVAL_AUTO, ExecutionDevice exec_device = ExecutionDevice::AUTO);
-    static matrix stackGPU(const std::vector<matrix>& mats, int axis = 0, EvalType eval_type = EvalType::EVAL_AUTO);
-    static matrix stackCPU(const std::vector<matrix>& mats, int axis = 0, EvalType eval_type = EvalType::EVAL_AUTO);
+
+    static matrix stack(const std::vector<matrix>& mats, int axis);
+
+    static void stack(const std::vector<matrix>& mats, matrix& output, int axis = 0, ExecutionDevice exec_device = ExecutionDevice::AUTO);
     void padding(std::initializer_list<std::pair<size_m, size_m>> padding_range, matrix& padded_mat, const matrix& value, EvalType eval_type = EvalType::EVAL_AUTO);
     void padding(std::vector<size_m>& padding_range, matrix& padded_mat, const matrix& value, EvalType eval_type = EvalType::EVAL_AUTO);
     matrix padding(std::vector<size_m>& padding_range, const matrix& value);
@@ -717,7 +736,7 @@ public:
                  slice_range);
     matrix slice(std::initializer_list<R> slice_range);
     matrix slice(R slice_range, int slice_axis);
-    matrix slice(array_descriptor slice_range, std::vector<size_m>& slice_indices, size_t offset);
+    matrix slice(array_descriptor slice_range, std::vector<size_m>& slice_indices, const std::vector<size_m>& unsqueeze_axis, size_t offset);
 
     matrix slice_assign(std::initializer_list<std::optional<std::pair<size_m, size_m>>> slice_range, const matrix& rhs);
     matrix slice_assign(std::initializer_list<R> slice_range, const matrix& rhs);
@@ -727,7 +746,6 @@ public:
     matrix take(const matrix& index, int axis) const;
     void take_backend(const matrix& index, matrix& output, int axis, ExecutionDevice exec_device) const;
 
-    matrix operator[](size_m index);
     
     inline void set_array_desc(const array_descriptor& new_array_desc);
     inline void set_array_desc(const array_descriptor& new_array_desc, uint32_t new_dims);
@@ -768,10 +786,9 @@ public:
     void unbrodcast(matrix& output, matrix& target);
     matrix unbroadcast_shape(const size_m* target_shape, int target_dims) const;
     
-    matrix operator[](Range range);
-    matrix operator[](Range range1, Range range2);
-    matrix operator[](Range range1, Range range2, Range range3);
-    matrix operator[](int i, int j) const;
+    matrix operator[](AxisRange range);
+    matrix operator[](AxisRange range1, AxisRange range2);
+    matrix operator[](AxisRange range1, AxisRange range2, AxisRange range3);
     
     void CopyToTexture(id<MTLTexture> texture,
                        Execution exec = Execution::EncodeAndExecute);
