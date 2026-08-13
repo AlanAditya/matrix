@@ -18,9 +18,13 @@ A `Mesh` defines the physical geometry of an object. Rather than using standard 
 
 ## 2. Materials
 `Material` defines the visual appearance of a `Mesh`. 
-- `colors`: A `matrix` of RGBA values. If the shape is `[1, 4]`, it represents a solid color applied to the whole mesh (stride is 0). If it matches the vertex count, it provides per-vertex coloring.
+- `colors`: A `matrix` of RGBA values that automatically broadcasts across instances and vertices using dynamic strides (`uint2 color_strides`). It supports exactly three shapes:
+  - `[4]` (1D): A single solid color. Treated as `[1, 1, 4]` (1 instance, 1 vertex) with `instance_stride = 0`, `vertex_stride = 0`.
+  - `[V, 4]` (2D): Per-vertex coloring. Treated as `[1, V, 4]` with `instance_stride = 0`, `vertex_stride = strides[0]/4`.
+  - `[I, V, 4]` (3D): Per-instance and/or per-vertex coloring. Uses explicit `instance_stride = strides[0]/4` and `vertex_stride = strides[1]/4`. For example, `[N, 1, 4]` applies one unique color per instance.
 - `texture`: An optional `id<MTLTexture>`.
 - `has_texture`: A boolean flag determining the fragment shader's sampling behavior.
+- `depth_bias`: A struct allowing meshes (like decals or wireframes) to apply a custom Polygon Offset during rendering to resolve Z-fighting.
 
 ## 3. GeoNode (The DAG)
 The `GeoNode` is the fundamental building block of the 3D scene graph (DAG - Directed Acyclic Graph). It inherits from `std::enable_shared_from_this` and uses `std::shared_ptr` for memory safety.
@@ -59,9 +63,12 @@ By treating transforms as N-dimensional `matrix` instances, the engine seamlessl
 **Scene Management & Interactivity:**
 Beyond just rendering, the `Viewer` acts as the central orchestrator for user interaction and structural scene mutation:
 - **Hit-Testing & Selection**: The Viewer projects screen coordinates (e.g., from a mouse click) into 3D world space. This ray-casting identifies the specific `GeoNode` and its exact instance ID that the user interacted with.
-- **Handling Drag Events**: When a user drags an object, the Viewer intercepts these 2D deltas and translates them into 3D world-space translation vectors.
+- **Handling Drag Events**: When a user drags an object, the Viewer translates 2D screen deltas into 3D world-space translation vectors. For constrained movement (e.g., dragging along the XY, YZ, or ZX planes via Gizmos), the Viewer calculates the mathematical intersection of the mouse ray against an infinite 3D plane. This perfectly maps 2D mouse movement into a precise 2D surface within the 3D world.
 - **Graph Mutation (Top-Down Injection)**: Instead of modifying heavy vertex buffers, the Viewer injects the translation delta directly into the targeted `GeoNode`'s `local_transform` matrix. Because this transform is a dynamic scalar node at the top of the DAG, updating its value instantly marks it as "dirty".
 - **Triggering Evaluation**: On the next frame, the 2-Pass backprop catches this dirty flag, invalidates the specific branch of the graph, and recalculates the nested instance arrays on the GPU—allowing the user to drag a single parent object and have its millions of instanced children follow perfectly in real-time.
+
+**UI Overlays & X-Ray Rendering:**
+For editor tools like Transform Gizmos, the engine separates rendering into two distinct streams: `scene_nodes` and `gizmo_nodes`. To achieve an "X-Ray" effect where the gizmo is always visible through scene geometry without losing its own internal depth sorting (self-occlusion), the Viewer applies a mathematical projection trick. Rather than relying on Metal's `DepthBias` or disabling depth testing entirely, the Viewer passes a cloned View-Projection matrix to the gizmo's shader with the Z-coordinate components scaled down by 99% (e.g., `overlayMatrix.columns[2] *= 0.01f`). This artificially compresses the gizmo into a microscopic layer against the near clipping plane, forcing it to render entirely over the scene while flawlessly preserving the relative depths of its own components.
 
 ## 6. Execution Boundary Nodes (CPU-GPU Sync)
 To support interactive logic (like modifying a buffer sequentially on the CPU mid-graph), the matrix DAG supports `insert_break()` primitives. When the evaluation pass hits a boundary node, it temporarily halts the pipeline, forces a synchronous commit to the GPU, safely executes a CPU lambda on the memory-shared buffer, and then spins up a new command encoder for the rest of the downstream graph. This gives the engine TouchDesigner-like procedural flexibility without breaking the continuous mathematical tape.

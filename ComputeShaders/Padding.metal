@@ -52,26 +52,25 @@ template <typename T>
 
 // ND Optimized Copy
 template <typename T, int N = 1, typename IdxT = size_m>
-[[kernel]] void padding_gg(device  T* dst [[buffer(0)]], device const T* src [[buffer(1)]], constant const size_m* dst_strides [[buffer(2)]], constant const size_m* src_strides [[buffer(3)]], constant const size_m* limits [[buffer(4)]], constant const int& offset [[buffer(5)]], constant const T& value [[buffer(6)]], constant const size_m* src_shape [[buffer(7)]], constant const int& ndim [[buffer(8)]], uint3 index [[thread_position_in_grid]]) {
+[[kernel]] void padding_gg(device  T* dst [[buffer(0)]], device const T* src [[buffer(1)]], constant const size_m* dst_strides [[buffer(2)]], constant const size_m* src_strides [[buffer(3)]], constant const size_m* limits [[buffer(4)]], constant const int& offset [[buffer(5)]], constant const T& value [[buffer(6)]], constant const size_m* dst_shape [[buffer(7)]], constant const int& ndim [[buffer(8)]], uint3 index [[thread_position_in_grid]]) {
     
     size_m src_idx = index.x * src_strides[ndim-1] + index.y * src_strides[ndim-2];
     size_m dst_idx = index.x * dst_strides[ndim-1] + index.y * dst_strides[ndim-2];
     
     bool padding_rgion = false;
-    if (limits[0] > index.z || limits[1] <= index.z ||
-        limits[2] > index.y || limits[3] <= index.y ||
-        limits[4] > index.x || limits[5] <= index.x) {
+    if (limits[2*(ndim-2)] > index.y || limits[2*(ndim-2) + 1] <= index.y ||
+        limits[2*(ndim-1)] > index.x || limits[2*(ndim-1) + 1] <= index.x) {
         padding_rgion = true;
     }
     
     uint remA = index.z;
     for (int i = ndim-3; i >= 0; --i) {
-        if (limits[2*i] > (remA % src_shape[i]) || limits[2*i + 1] <= (remA % src_shape[i])) {
+        if (limits[2*i] > (remA % dst_shape[i]) || limits[2*i + 1] <= (remA % dst_shape[i])) {
             padding_rgion = true;
         }
-        src_idx += remA % src_shape[i] * src_strides[i];
-        dst_idx += remA % src_shape[i] * dst_strides[i];
-        remA /= src_shape[i];
+        src_idx += (remA % dst_shape[i]) * src_strides[i];
+        dst_idx += (remA % dst_shape[i]) * dst_strides[i];
+        remA /= dst_shape[i];
     }
     if (padding_rgion) {
         dst[dst_idx] = value;

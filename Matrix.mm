@@ -242,6 +242,23 @@ void broadcast_shapes_matmul(const array_descriptor &arr_desc1,
     
 //    array_desc1 => [....., M, K]
 //    array_desc2 => [....., N, K] from B.T
+    if (dim1 < 2 || dim2 < 2) {
+        throw std::invalid_argument("ValueError: matmul: Input operand does not have enough dimensions (has to be >= 2)");
+    }
+    if (shape1[dim1-1] != shape2[dim2-1]) {
+        auto format_shape = [](const size_m* shape, int dims) {
+            std::string res = "(";
+            for (int i = 0; i < dims; ++i) {
+                res += std::to_string(shape[i]);
+                if (i < dims - 1) res += ", ";
+                else if (dims == 1) res += ",";
+            }
+            res += ")";
+            return res;
+        };
+        std::string err = "ValueError: matmul: Input operand 1 has a mismatch in its core dimension 0, with gufunc signature (n?,k),(k,m?)->(n?,m?) (size " + std::to_string(shape2[dim2-1]) + " is different from " + std::to_string(shape1[dim1-1]) + "). Shapes are " + format_shape(shape1, dim1) + " and " + format_shape(shape2, dim2);
+        throw std::invalid_argument(err);
+    }
     shape_out[out_dim - 2] = shape1[dim1 - 2]; // M
     shape_out[out_dim - 1] = shape2[dim2 - 2]; // N
     
@@ -456,6 +473,35 @@ matrix matrix::unsqueeze(int axis) const {
     output.tape = new ReshapePrimitive(const_cast<matrix&>(*this), output.array_desc, output.dims, false);
     return output;
 }
+
+matrix matrix::unsqueeze(int insertion_axis, int num) const {
+    int axis = insertion_axis;
+    if (axis < 0) axis += dims+1;
+    matrix output(dims+num, type);
+    memcpy(output.shape(), shape(), axis * sizeof(size_m));
+    for (int i =0; i < num; i++) output.shape()[axis+i] = 1;
+    memcpy(output.shape() + axis + num, shape() + axis, (dims-axis) * sizeof(size_m));
+    if (flags & NON_CONTIGUOUS_FLAG) {
+        memcpy(output.strides(), strides(), axis * sizeof(size_m));
+        size_m base_stride = (axis < dims) ? strides()[axis] : 1;
+        for (int i = 0; i < num; i++) {
+            output.strides()[axis + i] = base_stride;
+        }
+        memcpy(output.strides() + axis + num, strides() + axis, (dims-axis) * sizeof(size_m));
+        output.flags = flags;
+        output.flags &= ~NON_OWNERSHIP_FLAG;
+    } else {
+        output.calcStrides();
+        output.flags = flags;
+        output.flags &= ~NON_CONTIGUOUS_FLAG;
+        output.flags &= ~NON_OWNERSHIP_FLAG;
+    }
+    output.total_size = total_size;
+
+    output.tape = new ReshapePrimitive(const_cast<matrix&>(*this), output.array_desc, output.dims, false);
+    return output;
+}
+
 
 matrix matrix::squeeze(int axis) const {
     if (axis < 0) axis += dims;
@@ -1577,6 +1623,29 @@ matrix matrix::eye(uint m, uint n, int k, dtype type ) {
     return output;
 }
 
+matrix matrix::leaf(std::initializer_list<size_m> shape, dtype type) {
+    matrix output = matrix::zeros(shape, type);
+    output.begin_refcount();
+    output.buildMetalBuffer();
+    output.tape = new LeafPrimitive(output);
+    return output;
+}
+
+matrix matrix::leaf(const std::vector<size_m>& shape, dtype type) {
+    matrix output = matrix::zeros(shape, type);
+    output.begin_refcount();
+    output.buildMetalBuffer();
+    output.tape = new LeafPrimitive(output);
+    return output;
+}
+
+void matrix::make_leaf() {
+    this->eval();
+    this->begin_refcount(); // Ensure the evaluated buffer is reference counted!
+    this->releaseTape();    // Free the old tape (e.g. RepeatPrimitive) so it doesn't leak
+    this->tape = new LeafPrimitive(*this);
+}
+
 matrix matrix::eye(uint m, dtype type ) {
     return matrix::eye(m, m, 0, type);
 }
@@ -1720,8 +1789,8 @@ matrix matrix::eye(uint m, dtype type ) {
 //        result.buildMetalBuffer();
 //        return result;
 //    }
-matrix matrix::slice(R slice_range, int slice_axis) {
-    update_from_trace();
+matrix matrix::slice(R slice_range, int slice_axis) const{
+    const_cast<matrix&>(*this).update_from_trace();
     uint32_t out_dims = slice_range.is_index ? dims - 1 : dims;
     
     matrix slicedMat = matrix(out_dims, type);
@@ -1771,8 +1840,8 @@ matrix matrix::slice(R slice_range, int slice_axis) {
 }
 
 
-matrix matrix::slice(array_descriptor slice_range, std::vector<size_m>& slice_indices, const std::vector<size_m>& unsqueeze_axis, size_t offset) {
-    update_from_trace();
+matrix matrix::slice(array_descriptor slice_range, std::vector<size_m>& slice_indices, const std::vector<size_m>& unsqueeze_axis, size_t offset) const {
+    const_cast<matrix&>(*this).update_from_trace();
     matrix slicedMat = matrix(dims, type);
 
     slicedMat.array_desc = slice_range;
@@ -1787,8 +1856,8 @@ matrix matrix::slice(array_descriptor slice_range, std::vector<size_m>& slice_in
 }
 
 
-matrix matrix::slice(std::initializer_list<std::optional<std::pair<size_m, size_m>>> slice_range) {
-    update_from_trace();
+matrix matrix::slice(std::initializer_list<std::optional<std::pair<size_m, size_m>>> slice_range) const {
+    const_cast<matrix&>(*this).update_from_trace();
     matrix slicedMat = matrix(dims, type);
     const size_m *src_shape = this->shape();
     const size_m *src_strides = this->strides();
@@ -1832,8 +1901,8 @@ matrix matrix::slice(std::initializer_list<std::optional<std::pair<size_m, size_
     return slicedMat;
 }
 
-matrix matrix::slice(std::initializer_list<R> slice_range) {
-    update_from_trace();
+matrix matrix::slice(std::initializer_list<R> slice_range) const {
+    const_cast<matrix&>(*this).update_from_trace();
     const size_m *src_shape = this->shape();
     const size_m *src_strides = this->strides();
 
@@ -1968,116 +2037,121 @@ matrix matrix::slice_assign(std::initializer_list<R> slice_range, const matrix& 
     
     return outMat;
 }
-
-void matrix::padding(std::initializer_list<std::pair<size_m, size_m>> padding_range, matrix& padded_mat, const matrix& value, EvalType eval_type) {
-    update_from_trace();
-    const size_m *src_shape = this->shape();
-    const size_m *src_strides = this->strides();
-    size_m *dst_shape = padded_mat.shape();
-    size_m *dst_strides = padded_mat.strides();
-    if (eval_type == EvalType::EVAL_AUTO) {
-        for (int i = 0; i < padding_range.size(); i++) {
-            dst_shape[i] = src_shape[i] + (padding_range.begin() + i)->first + (padding_range.begin() + i)->second;
+// fronted
+matrix matrix::pad(int left, int right, int axis, const matrix& val) const {
+    axis < 0 ? axis += dims : axis;
+    matrix output(dims, type);
+    memcpy(output.shape(), shape(), dims*sizeof(size_m));
+    output.shape()[axis] += left + right;
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+    std::vector<size_m> padding_range(2 * dims, 0);
+    for (int i = 0; i < dims; ++i) {
+        if (i == axis) {
+            padding_range[2 * i] = left;
+            padding_range[2 * i + 1] = left + shape()[i];
+        } else {
+            padding_range[2 * i] = 0;
+            padding_range[2 * i + 1] = shape()[i];
         }
-        memcpy(dst_shape + padding_range.size(), src_shape + padding_range.size(), (dims - padding_range.size()) * sizeof(size_m));
-        padded_mat.calcStrides();
-        size_t offset = 0;
-        for (int i = 0; i < padding_range.size(); i++) {
-            offset += (padding_range.begin() + i)->first * src_strides[i];
-        }
-        padded_mat.total_size = padded_mat.accumul(0, dims);
-        
-        std::vector<size_m> pad_flat(dims * 2, 0);
-        for (int i = 0; i < dims; i++ ) {
-            pad_flat[2 * i] = (padding_range.begin() + i)->first;
-            pad_flat[2 * i + 1] = (padding_range.begin() + i)->first + src_shape[i];
-        }
-        memcpy(pad_flat.data() + padding_range.size(), src_shape + padding_range.size(), (dims - padding_range.size()) * sizeof(size_m));
-//        memcpy(pad_flat.data(), padding_range.begin(), padding_range.size() * sizeof(std::pair<size_m, size_m>));
-        padded_mat.tape = new PaddingPrimitive(*this, const_cast<matrix&>(value), offset, pad_flat);
-        return;
     }
-    
-    PaddingPrimitive* prim = (PaddingPrimitive*)padded_mat.tape;
-    
-    
-    size_t elem_size = dtype_size(padded_mat.type);
-    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
-
-    uint8_t typeCode = static_cast<int>(padded_mat.type);
-    
-    uint32_t cdims = padded_mat.dims;
-    
-    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
-    
-    auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
-    auto _dispatchExecutionSize = MTLSizeMake(padded_mat.total_size, 1, 1);
-    setBufferOrBytes(commandEncoder, padded_mat, 0);
-    setBufferOrBytes(commandEncoder, *this, 1);
-    [commandEncoder setBytes:dst_strides length:cdims * sizeof(size_m) atIndex:2];
-    [commandEncoder setBytes:src_strides length:cdims * sizeof(size_m) atIndex:3];
-    [commandEncoder setBytes:prim->padding_range.data() length: 2 * cdims * sizeof(size_m) atIndex:4];
-    
-    [commandEncoder setBytes:&(prim->offset) length:sizeof(int) atIndex:5];
-    [commandEncoder setBytes:value.buffer length:dtype_size(value.type) atIndex:5];
-    if (cdims == 1) {
-        if (!GlobalGPUManager.CopyInplace[typeCode][0]) {
-            GlobalGPUManager.initPadding(typeCode, 0);
-        }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][0]];
-    } else if (cdims == 2) {
-        if (!GlobalGPUManager.CopyInplace[typeCode][1]) {
-            GlobalGPUManager.initPadding(typeCode, 1);
-        }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][1]];
-        _dispatchExecutionSize = MTLSizeMake(dst_shape[1], dst_shape[0], 1);
-
-    } else if (cdims == 3) {
-        if (!GlobalGPUManager.CopyInplace[typeCode][2]) {
-            GlobalGPUManager.initPadding(typeCode, 2);
-        }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][2]];
-        _dispatchExecutionSize = MTLSizeMake(dst_shape[2], dst_shape[1], dst_shape[0]);
-        
-    } else {
-        if (!GlobalGPUManager.CopyInplace[typeCode][3]) {
-            GlobalGPUManager.initPadding(typeCode, 3);
-        }
-        size_m acc = 1;
-        for (int i = 0; i < cdims - 2; i++) {
-            acc *= dst_shape[i];
-        }
-        _dispatchExecutionSize = MTLSizeMake(dst_shape[cdims - 1], dst_shape[cdims - 2], acc);
-        [commandEncoder setBytes:dst_shape length:cdims * sizeof(size_m) atIndex:5];
-        [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:6];
-        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][2]];
-    }
-    
-    [commandEncoder dispatchThreads:_dispatchExecutionSize
-              threadsPerThreadgroup:_threadsPerThreadgroup];
-    
+    output.tape = new PaddingPrimitive(*this, val, left * strides()[axis], padding_range, std::vector<size_m>(output.shape(), output.shape() + dims));
+    return output;
 }
 
-void matrix::padding(std::vector<size_m>& padding_range, matrix& padded_mat, const matrix& value, EvalType eval_type) {
+matrix matrix::pad(std::initializer_list<std::pair<size_m, size_m>> padding_range, const matrix& value) const {
+    matrix padded_mat(dims, type);
+    const size_m *src_shape = this->shape();
+    const size_m *src_strides = this->strides();
+    size_m *dst_shape = padded_mat.shape();
+    size_m *dst_strides = padded_mat.strides();
+    
+    for (int i = 0; i < padding_range.size(); i++) {
+        dst_shape[i] = src_shape[i] + (padding_range.begin() + i)->first + (padding_range.begin() + i)->second;
+    }
+    memcpy(dst_shape + padding_range.size(), src_shape + padding_range.size(), (dims - padding_range.size()) * sizeof(size_m));
+    padded_mat.calcStrides();
+    size_t offset = 0;
+    for (int i = 0; i < padding_range.size(); i++) {
+        offset += (padding_range.begin() + i)->first * src_strides[i];
+    }
+    padded_mat.total_size = padded_mat.accumul(0, dims);
+    
+    std::vector<size_m> pad_flat(dims * 2, 0);
+    for (int i = 0; i < dims; i++ ) {
+        if (i < padding_range.size()) {
+            pad_flat[2 * i] = (padding_range.begin() + i)->first;
+            pad_flat[2 * i + 1] = (padding_range.begin() + i)->first + src_shape[i];
+        } else {
+            pad_flat[2 * i] = 0;
+            pad_flat[2 * i + 1] = src_shape[i];
+        }
+    }
+    padded_mat.tape = new PaddingPrimitive(*this, value, offset, pad_flat, std::vector<size_m>(dst_shape, dst_shape + dims));
+    return padded_mat;
+}
+
+matrix matrix::pad(const std::vector<size_m>& padding_range, const matrix& value) const {
+    if (padding_range.size() != dims*2) {
+        throw std::runtime_error("Matrix: This padding overload takes padding along all axis");
+    }
+    matrix padded_mat(dims, type);
+    const size_m *src_shape = this->shape();
+    const size_m *src_strides = this->strides();
+    size_m *dst_shape = padded_mat.shape();
+    
+    for (int i = 0; i < dims; i++) {
+        dst_shape[i] = src_shape[i] + padding_range[2 * i] + padding_range[2 * i + 1];
+    }
+    padded_mat.calcStrides();
+    size_t offset = 0;
+    for (int i = 0; i < dims; i++) {
+        offset += padding_range[2 * i] * src_strides[i];
+    }
+    padded_mat.total_size = padded_mat.accumul(0, dims);
+    
+    std::vector<size_m> pad_flat(dims * 2, 0);
+    for (int i = 0; i < dims; ++i) {
+        pad_flat[2 * i] = padding_range[2 * i];
+        pad_flat[2 * i + 1] = padding_range[2 * i] + src_shape[i];
+    }
+    padded_mat.tape = new PaddingPrimitive(*this, value, offset, pad_flat, std::vector<size_m>(dst_shape, dst_shape + dims));
+    
+    return padded_mat;
+}
+
+matrix matrix::pad_range_normalised(const std::vector<size_m>& padding_range, const size_m* target_shape, const matrix& value) const {
+    if (padding_range.size() != dims*2) {
+        throw std::runtime_error("Matrix: This padding overload takes padding along all axis");
+    }
+    if (!target_shape) {
+        throw std::runtime_error("Matrix: target_shape must be provided for pad_range_normalised.");
+    }
+    
+    matrix padded_mat(dims, type);
+    const size_m *src_strides = this->strides();
+    size_m *dst_shape = padded_mat.shape();
+    
+    memcpy(dst_shape, target_shape, dims * sizeof(size_m));
+    padded_mat.calcStrides();
+    
+    size_t offset = 0;
+    for (int i = 0; i < dims; i++) {
+        offset += padding_range[2 * i] * src_strides[i];
+    }
+    padded_mat.total_size = padded_mat.accumul(0, dims);
+    padded_mat.tape = new PaddingPrimitive(*this, value, offset, padding_range, std::vector<size_m>(dst_shape, dst_shape + dims));
+    
+    return padded_mat;
+}
+
+
+void matrix::pad(std::vector<size_m>& padding_range, matrix& padded_mat, const matrix& value, ExecutionDevice exec_device) {
     update_from_trace();
     const size_m *src_shape = this->shape();
     const size_m *src_strides = this->strides();
     size_m *dst_shape = padded_mat.shape();
     size_m *dst_strides = padded_mat.strides();
-    if (eval_type == EvalType::EVAL_AUTO) {
-        for (int i = 0; i < padding_range.size(); i+=2) {
-            dst_shape[i] = src_shape[i] + padding_range[i] + padding_range[i+1];
-        }
-        memcpy(dst_shape + padding_range.size(), src_shape + padding_range.size(), (dims - padding_range.size()) * sizeof(size_m));
-        padded_mat.calcStrides();
-        size_t offset = 0;
-        for (int i = 0; i < padding_range.size(); i+=2) {
-            offset += padding_range[i] * src_strides[i];
-        }
-        padded_mat.total_size = padded_mat.accumul(0, dims);
-        padded_mat.tape = new PaddingPrimitive(*this, const_cast<matrix&>(value), offset, padding_range);
-        return;
-    }
     
     PaddingPrimitive* prim = (PaddingPrimitive*)padded_mat.tape;
     
@@ -2130,9 +2204,9 @@ void matrix::padding(std::vector<size_m>& padding_range, matrix& padded_mat, con
             acc *= dst_shape[i];
         }
         _dispatchExecutionSize = MTLSizeMake(dst_shape[cdims - 1], dst_shape[cdims - 2], acc);
-        [commandEncoder setBytes:dst_shape length:cdims * sizeof(size_m) atIndex:5];
-        [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:6];
-        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][2]];
+        [commandEncoder setBytes:dst_shape length:cdims * sizeof(size_m) atIndex:7];
+        [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:8];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][3]];
     }
     
     [commandEncoder dispatchThreads:_dispatchExecutionSize
@@ -2140,11 +2214,6 @@ void matrix::padding(std::vector<size_m>& padding_range, matrix& padded_mat, con
     
 }
 
-matrix matrix::padding(std::vector<size_m>& padding_range, const matrix& value) {
-    matrix padded_mat(dims, type);
-    padding(padding_range, padded_mat, value);
-    return padded_mat;
-}
 
 matrix matrix::broadcast_to(const size_m *target_shape, int target_dims) const {
     throw std::runtime_error("matrix: depreceated function use broadcast_toV2");
@@ -4433,6 +4502,7 @@ void matrix::exp(matrix& output, ExecutionDevice exec_device) {
 
 
 matrix matrix::dot(const matrix& b, bool transposeB) {
+    assert(this->dims >= 2 && b.dims >= 2 && "matrix::dot requires both matrices to be at least 2D");
     // 1. Graph Level Cache-Locality Optimization
     // The backend wants B transposed so it can read it linearly.
     // If the user didn't transpose B, we add a .transpose() node to the DAG!
@@ -5755,7 +5825,7 @@ void matrix::astype(matrix output, dtype type, EvalType eval_type, ExecutionDevi
 }
 
 void matrix::ensure_evaluated() const {
-    if (tape && !tape->evaluated) {
+    if (tape) {
         const_cast<matrix*>(this)->eval();
     }
 }
@@ -5775,6 +5845,10 @@ void matrix::eval_cpu() {
 }
 void matrix::eval_metal() {
     if (!tape) return;
+    if (tape->evaluated) {
+        update_from_trace();
+        return;
+    }
     id<MTLCommandBuffer> oldBuffer = GlobalGPUManager._thread_gCommandBuffer ? GlobalGPUManager.getCommandBuffer() : nullptr;
     tape->eval_metal(*this, EvalType::EVAL_INSTANTLY);
     
@@ -6115,7 +6189,9 @@ matrix &matrix::operator=(const matrix &other) {
         array_desc.shared_arr_desc = other.array_desc.shared_arr_desc;
         array_desc.shared_arr_desc->refCount.fetch_add(1, std::memory_order_relaxed);
     }
+    total_size = other.total_size;
     type = other.type;
+    this->releaseBuffer();
     releaseTape();
     tape = other.tape;
     if (tape) tape->primitive_refCount.fetch_add(1, std::memory_order_relaxed);
@@ -6124,20 +6200,17 @@ matrix &matrix::operator=(const matrix &other) {
     // if a mat has tape then if it is realised (meaning graph has been compiled or exectuted then it must be refcounted)
     if (other.tape) {
         if (other.buffer) {
-            this->releaseBuffer();
             refCount = other.refCount;
             refCount->fetch_add(1);
         }
         buffer = other.buffer;
         metalBuffer = other.metalBuffer;
-        total_size = other.total_size;
         flags = other.flags;
         return *this;
     }
 
     // for the times when mat isnt part of a graph and is ref counted
     if (other.refCount) {
-        this->releaseBuffer();
         buffer = other.buffer;
         metalBuffer = other.metalBuffer;
         refCount = other.refCount;
@@ -6146,8 +6219,6 @@ matrix &matrix::operator=(const matrix &other) {
     }
 
     // DEEP COPY
-    this->releaseBuffer();
-    total_size = other.total_size;
     buffer = new uint8_t[total_size * dtype_size(other.type)];
     calcStrides();
     flags = other.flags;
@@ -9931,7 +10002,7 @@ matrix matrix::max(int axis, bool keepdims) const {
     output.total_size = output.accumul(0, output.dims);
     
     MaxReductionPrimitive* prim = new MaxReductionPrimitive(const_cast<matrix&>(*this), axis, keepdims);
-    prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, INT32_MAX, keepdims);
+    prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, false, !keepdims, UINT32_MAX);
     prim->has_collapsed_dims = true;
     output.tape = prim;
     
@@ -10075,7 +10146,7 @@ matrix matrix::min(int axis, bool keepdims) const{
     output.total_size = output.accumul(0, output.dims);
 
     MinReductionPrimitive* prim = new MinReductionPrimitive(const_cast<matrix&>(*this), axis, keepdims);
-    prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, INT32_MAX, keepdims);
+    prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, false, !keepdims, UINT32_MAX);
     prim->has_collapsed_dims = true;
     output.tape = prim;
     
@@ -10218,7 +10289,7 @@ matrix matrix::sum(int axis, bool keepdims) const {
     output.total_size = output.accumul(0, output.dims);
     
     SumPrimitive* prim = new SumPrimitive(const_cast<matrix&>(*this), axis, keepdims);
-    prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, INT32_MAX, keepdims);
+    prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, false, !keepdims, UINT32_MAX);
     prim->has_collapsed_dims = true;
     output.tape = prim;
     
@@ -10230,21 +10301,27 @@ void matrix::sum(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
         exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
     }
     
-    size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
+    size_m reduce_axis_stride = strides()[axis];
     size_m noOfOpp = shape()[axis];
     
     SumPrimitive* primit = static_cast<SumPrimitive*>(output.tape);
     
     CollapsedDims_2 collapsed;
-    uint32_t cdims;
+    uint32_t cdims = 0;
     if (primit->has_collapsed_dims) {
         collapsed = primit->collapsed_dims;
         cdims = collapsed.out_dims;
     } else {
-        cdims = 1;
-        collapsed.stridesA[0] = 1;
-        collapsed.stridesB[0] = 1;
-        collapsed.shape[0] = 1;
+        cdims = dims > 0 ? dims - 1 : 0;
+        int idx = 0;
+        for (int i = 0; i < dims; i++) {
+            if (i != axis) {
+                collapsed.shape[idx] = shape()[i];
+                collapsed.stridesA[idx] = keepdims ? output.strides()[i] : output.strides()[idx];
+                collapsed.stridesB[idx] = strides()[i];
+                idx++;
+            }
+        }
     }
     
     if (cdims == 0) {
@@ -10527,5 +10604,177 @@ void matrix::take_backend(const matrix& index, matrix& output, int axis, Executi
                 dst_ptr[dst_idx] = src_ptr[src_idx];
             }
         }
+    }
+}
+
+matrix matrix::cross(const matrix& a, const matrix& b, int axis) {
+    matrix lhs = a;
+    matrix rhs = b;
+    
+    uint32_t out_dims = fmax(a.dims, b.dims);
+    dtype lhs_out_type = promote_types(lhs.type, dtype::Float16);
+    dtype rhs_out_type = promote_types(rhs.type, dtype::Float16);
+    dtype out_type= promote_types(lhs_out_type, rhs_out_type);
+    
+    matrix result(out_dims, out_type);
+    (axis < 0) ? axis += out_dims : axis;
+    
+
+    if (axis != out_dims-1) {
+        int a_axis = axis - (out_dims - lhs.dims);
+        if (a_axis < 0) lhs = lhs.unsqueeze(0, -a_axis); a_axis=0;
+        std::vector<size_m> new_axis_a(lhs.dims, 0);
+        int index = 0;
+        for (int i = 0; i < lhs.dims; i++) {
+            if (i==a_axis) {
+                index++;
+            }
+            new_axis_a[i] = index;
+            index++;
+        }
+        new_axis_a[lhs.dims-1] = a_axis;
+        lhs = lhs.transpose(new_axis_a);
+        
+        int b_axis = axis - (out_dims - rhs.dims);
+        if (b_axis < 0) { rhs = rhs.unsqueeze(0, -b_axis); b_axis = 0; }
+        std::vector<size_m> new_axis_b(rhs.dims, 0);
+        index = 0;
+        for (int i = 0; i < rhs.dims; i++) {
+            if (i==b_axis) {
+                index++;
+            }
+            new_axis_b[i] = index;
+            index++;
+        }
+        new_axis_b[rhs.dims-1] = b_axis;
+        rhs = rhs.transpose(new_axis_b);
+    }
+    
+    lhs = (lhs.shape()[lhs.dims-1] == 2) ? lhs.pad(0, 1, -1, matrix::scalar(0)) : lhs;
+    rhs = (rhs.shape()[rhs.dims-1] == 2) ? rhs.pad(0, 1, -1, matrix::scalar(0)) : rhs;
+    
+    bool lhs_axis_contig = (lhs.strides()[lhs.dims - 1] == 1);
+    bool rhs_axis_contig = (rhs.strides()[rhs.dims - 1] == 1);
+    
+    lhs = (!lhs_axis_contig || out_type != lhs.type) ? lhs.astype(out_type, true): lhs;
+    rhs = (!rhs_axis_contig || out_type != rhs.type) ? rhs.astype(out_type, true): rhs;
+
+    auto primit = new CrossPrimitive(lhs, rhs);
+    primit->desc_a = BroadcastDescriptor::create(result.dims);
+    primit->desc_b = BroadcastDescriptor::create(result.dims);
+    broadcast_shapes(lhs.array_desc, rhs.array_desc, result.array_desc,
+                     primit->desc_a, primit->desc_b, lhs.dims, rhs.dims);
+    primit->collapsed_dims_3 = collapse_dims_reduce(
+        primit->desc_a->shape(),
+        primit->desc_a->strides(result.dims),
+        primit->desc_b->strides(result.dims),
+        result.strides(), result.dims, result.dims-1, false, UINT32_MAX);
+    result.total_size = result.accumul(0, result.dims);
+    result.tape = primit;
+    
+    if (axis != out_dims-1) {
+        std::vector<size_m> new_axis_r(out_dims, 0);
+        int index = 0;
+        for (int i = 0; i < result.dims; i++) {
+            if (i==axis) {
+                continue;
+            }
+            new_axis_r[i] = index;
+            index++;
+        }
+        new_axis_r[axis] = result.dims-1;
+        result = result.transpose(new_axis_r);
+    }
+    
+    return result;
+
+}
+
+void matrix::cross_cpu_brodcasted(matrix &other, matrix &result) {
+    CrossPrimitive* primit = static_cast<CrossPrimitive*>(result.tape);
+    auto& collapsed_dims = primit->collapsed_dims_3;
+    
+    float* src_a = (float*)buffer;
+    float* src_b = (float*)other.buffer;
+    float* dst = (float*)result.buffer;
+    
+    size_t count = result.total_size / 3;
+    for (size_t i = 0; i < count; ++i) {
+        size_t rem = i;
+        size_t idx_a = 0;
+        size_t idx_b = 0;
+        size_t idx_r = 0;
+        
+        for (int d = collapsed_dims.out_dims - 1; d >= 0; --d) {
+            size_t mod = rem % collapsed_dims.shape[d];
+            idx_a += mod * collapsed_dims.stridesA[d];
+            idx_b += mod * collapsed_dims.stridesB[d];
+            idx_r += mod * collapsed_dims.stridesC[d];
+            rem /= collapsed_dims.shape[d];
+        }
+        
+        dst[idx_r]   = src_a[idx_a+1] * src_b[idx_b+2] - src_a[idx_a+2] * src_b[idx_b+1];
+        dst[idx_r+1] = src_a[idx_a+2] * src_b[idx_b]   - src_a[idx_a]   * src_b[idx_b+2];
+        dst[idx_r+2] = src_a[idx_a]   * src_b[idx_b+1] - src_a[idx_a+1] * src_b[idx_b];
+    }
+}
+
+void matrix::cross_gpu_brodcasted(matrix &other, matrix &result) {
+    CrossPrimitive* primit = static_cast<CrossPrimitive*>(result.tape);
+    auto& collapsed_dims = primit->collapsed_dims_3;
+    
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    
+    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, *this, 1);
+    setBufferOrBytes(commandEncoder, other, 2);
+    
+    [commandEncoder setBytes:collapsed_dims.stridesC length:sizeof(size_m)*10 atIndex:3];
+    [commandEncoder setBytes:collapsed_dims.stridesA length:sizeof(size_m)*10 atIndex:4];
+    [commandEncoder setBytes:collapsed_dims.stridesB length:sizeof(size_m)*10 atIndex:5];
+    
+    int typeCode = (int)type;
+    int dimSpecialiation = collapsed_dims.out_dims;
+    
+    if (dimSpecialiation == 1) {
+        dimSpecialiation = 0;
+    } else if (dimSpecialiation == 2) {
+        dimSpecialiation = 1;
+    } else if (dimSpecialiation == 3) {
+        dimSpecialiation = 2;
+    } else {
+        dimSpecialiation = 3;
+        [commandEncoder setBytes:&collapsed_dims.out_dims length:sizeof(int) atIndex:6];
+    }
+    
+    if (!GlobalGPUManager.BrodcastedCrossInit[typeCode][dimSpecialiation]) {
+        GlobalGPUManager.initBrodcastedCrossInit(typeCode, dimSpecialiation);
+    }
+    [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedCrossComputeState[typeCode][dimSpecialiation]];
+    
+    NSUInteger max_threads = [GlobalGPUManager.BrodcastedCrossComputeState[typeCode][dimSpecialiation] maxTotalThreadsPerThreadgroup];
+    MTLSize _dispatchExecutionSize;
+    if (dimSpecialiation == 0) {
+        _dispatchExecutionSize = MTLSizeMake(collapsed_dims.shape[0], 1, 1);
+    } else if (dimSpecialiation == 1) {
+        _dispatchExecutionSize = MTLSizeMake(collapsed_dims.shape[1], collapsed_dims.shape[0], 1);
+    } else if (dimSpecialiation == 2) {
+        _dispatchExecutionSize = MTLSizeMake(collapsed_dims.shape[2], collapsed_dims.shape[1], collapsed_dims.shape[0]);
+    } else {
+        _dispatchExecutionSize = MTLSizeMake(result.total_size / 3, 1, 1);
+    }
+    
+    NSUInteger threadsPerGrid = _dispatchExecutionSize.width * _dispatchExecutionSize.height * _dispatchExecutionSize.depth;
+    NSUInteger w = MIN(max_threads, threadsPerGrid);
+    MTLSize _threadsPerThreadgroup = MTLSizeMake(w, 1, 1);
+    if (dimSpecialiation == 1) {
+        _threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+    } else if (dimSpecialiation == 2) {
+        _threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+    }
+    
+    if (threadsPerGrid > 0) {
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
     }
 }

@@ -74,6 +74,25 @@ enum class EvalType {
     EXEC_TRACE = 3,
 };
 
+enum class MouseEvent {
+    Drag = 0,
+    Hover = 1,
+    Zoom = 2,
+    Scroll = 3,
+    Tap = 4
+};
+
+struct ViewerEvent {
+    MouseEvent type;
+    simd_float2 normalized_pos;
+    simd_float2 delta;
+    float zoom_magnitude;
+    simd_float3 ray_origin;
+    simd_float3 ray_dir;
+    simd_float3 prev_ray_origin;
+    simd_float3 prev_ray_dir;
+};
+
 enum Flags : unsigned int {
     NON_OWNERSHIP_FLAG = 1u << 0,  // Bit 0
     NON_CONTIGUOUS_FLAG = 1u << 1,  // Bit 1
@@ -125,8 +144,11 @@ CollapsedDims_3 collapse_dims(const size_m shape[], const size_m stridesA[], con
 CollapsedDims_2 collapse_dims(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const uint32_t dims, const size_t SIZE_CAP);
 CollapsedDims collapse_dims(const size_m shape[], const size_m strides[], const uint32_t dims, const size_t SIZE_CAP);
 CollapsedDims_3 collapse_dims_matmul(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const size_m stridesC[], const uint32_t dims, const size_t SIZE_CAP);
-CollapsedDims_2 collapse_dims_reduce(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const uint32_t dims, const int reduce_axis, const size_t SIZE_CAP, bool keepdims);
+CollapsedDims_2 collapse_dims_reduces(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const uint32_t dims, const int reduce_axis, const size_t SIZE_CAP, bool keepdims);
 
+CollapsedDims collapse_dims_reduce(const size_m shape[], const size_m strides[], const uint32_t dims, int axis, bool keep_dims, const size_t SIZE_CAP);
+CollapsedDims_2 collapse_dims_reduce(const size_m shape[], const size_m stridesO[], const size_m stridesI[], const uint32_t dims, int axis, bool keep_dims, bool outer_collapsed, const size_t SIZE_CAP);
+CollapsedDims_3 collapse_dims_reduce( const size_m shape[], const size_m stridesA[], const size_m stridesB[], const size_m stridesC[], const uint32_t dims, int axis, bool keep_dims, const size_t SIZE_CAP);
 template <typename T>
 void TypedPatternFill(T* destination, const T pattern, uint32_t n) {
     uint32_t patternSize = sizeof(T);
@@ -238,7 +260,7 @@ std::ostream& operator<<(std::ostream& os,
                          const std::vector<uint8_t>& vec);
 
 
-
+std::ostream& operator<<(std::ostream& os, const simd_float4x4& m);
 
 void write_string(const std::string& s, std::vector<uint8_t>& data);
 void write_attr(std::vector<uint8_t>& data,

@@ -6,9 +6,9 @@ This document outlines the architecture of the compute engine and the required s
 Every new mathematical operation added to the engine is structurally split across 3 distinct phases to ensure a clean separation between graph topology, memory management, and hardware execution.
 
 ### Phase 1: Frontend (Graph Building & Dimension Collapsing)
-- **Role:** The frontend participates in graph building. It always outputs a new matrix node and takes in inputs.
+- **Role:** The frontend participates in graph building. It always outputs a new matrix node and takes in inputs. **Frontend functions are mathematical graph builders and MUST NOT take execution parameters like `EvalType` or `ExecutionDevice`.**
 - **Responsibilities:** Handles shape inference, broadcasting logic, stride calculations, and **Dimension Collapsing**.
-- **Dimension Collapsing:** The frontend uses `collapse_dims` and contiguous checks to heavily reduce the operation down to the simplest possible 1D or 2D iteration space. It attaches these collapsed dimensions to the primitive. This significantly speeds up backend execution by maximizing memory contiguity.
+- **Dimension Collapsing & Contiguity:** The frontend uses `collapse_dims` and contiguous checks to heavily reduce the operation down to the simplest possible 1D or 2D iteration space. **Crucially, we only need the operating axis to be contiguous in memory, not the entire metadata.** For operations like `cross`, check if just the operating axis is contiguous (`strides[axis] == 1`). If it is, use `collapse_dims_reduce` to handle the remaining dimensions instead of forcing an expensive full-matrix `.astype()` contiguous copy.
 
 ### Phase 2: Primitive (Memory Allocation & Backend Invocation)
 - **Role:** The primitive is responsible for allocating memory, holding references to input dependencies (building the DAG), implementing auto-differentiation (JVP/VJP), and calling the backend execution function.
@@ -18,8 +18,8 @@ Every new mathematical operation added to the engine is structurally split acros
   - **Hybrid Primitives:** (e.g., Reshape) Act as a virtual primitive if the input memory is perfectly contiguous (sharing the buffer), but fallback to acting as a real primitive (allocating new memory and executing a backend copy) if the input is non-contiguous.
 
 ### Phase 3: Backend (Execution)
-- **Role:** Pure execution. The backend does **not** participate in graph building or lazy node instantiation.
-- **Responsibilities:** Takes all operational parameters along with the Execution Device (CPU/Metal). It casts the Primitive pointer to retrieve the collapsed dimensions and executes the compute loop.
+- **Role:** Pure execution. The backend does **not** participate in graph building or lazy node instantiation. **It is an execution backend and should only take `ExecutionDevice` (if necessary) as input, never `EvalType`.**
+- **Responsibilities:** Takes basic operational parameters and executes the compute loop. **Backend functions MUST NOT accept metadata structures (e.g., `CollapsedDims_3`) as function arguments.** Instead, the backend should extract these directly from the graph node by downcasting the tape (e.g., `CrossPrimitive* primit = static_cast<CrossPrimitive*>(result.tape);`).
 - **Splitting:** For massive operations, the backend function can be cleanly split into two separate files/functions: one dedicated to CPU scalar/vector execution, and one dedicated to GPU Metal encoding.
 - **Thread Group Reduction (TGR):** Reduction backend operations (like `sum`, `max`, `min`) leverage specialized Thread Group Reduce (TGR) kernels. These launch highly optimized thread groups per output element that utilize shared memory and SIMD groups to perform massive parallel accumulation.
 
@@ -39,7 +39,7 @@ When actively writing the code for a new operation, follow this 5-step implement
 
 4. **JVP / VJP Implementation (Auto-Differentiation)**
    Inside your Primitive, implement `jvp` (Jacobian-Vector Product) for forward-mode autodiff, or `vjp` (Vector-Jacobian Product) for backward-mode autodiff. This defines how gradients flow backwards through your specific operation.
-   *Note: Returning a non-scalar output natively seeds the backward pass with a matrix of `ones`, unlike strict scalar-only frameworks.*
+   *Note: We use a modernized JAX-like functional interface. We do NOT perform VJPs using stateful `.backward()` calls or mutating `.grad` tensors. VJPs must purely return a mathematical graph of operations.*
 
 5. **Execution Dispatching**
    Implement `eval_cpu` and `eval_metal` to perform the actual compute. 
@@ -98,6 +98,10 @@ Always follow the specific naming sequence when unrolling spatial dimensions in 
 - 1D: `x` = length
 - 2D: `y` = height, `x` = width
 - 3D: `z` = depth, `y` = height, `x` = width
+
+### 5.4 Kernel Instantiation and Templating
+Metal compute kernels for operations MUST use generic C++ templates (e.g., `template <typename T>`) rather than hardcoded types like `float`.
+These templated kernels **must be explicitly instantiated** at the absolute bottom of the `.metal` file using macros (like `INSTANTIATE_FROM_TYPE(src_idx, type)`), mapped accurately to `matrix`'s internal type codes (e.g., `0` for `float`, `1` for `half`). **Do not add any other logic outside of this instantiation.**
 
 ---
 

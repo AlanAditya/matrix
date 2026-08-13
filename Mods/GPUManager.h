@@ -138,12 +138,14 @@ public:
     id<MTLComputePipelineState> BrodcastedDivComputeState[4][4];
     id<MTLComputePipelineState> BrodcastedMaxComputeState[4][4];
     id<MTLComputePipelineState> BrodcastedMinComputeState[4][4];
+    id<MTLComputePipelineState> BrodcastedCrossComputeState[4][4];
     bool BrodcastedAddInit[4][4] = {{false}};
     bool BrodcastedSubInit[4][4] = {{false}};
     bool BrodcastedMulInit[4][4] = {{false}};
     bool BrodcastedDivInit[4][4] = {{false}};
     bool BrodcastedMaxInit[4][4] = {{false}};
     bool BrodcastedMinInit[4][4] = {{false}};
+    bool BrodcastedCrossInit[4][4] = {{false}};
     
     bool Concat_2M[4];
     id<MTLComputePipelineState> Concat_2M_ComputeState[4];
@@ -645,6 +647,13 @@ public:
         id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedAddGPU_%i_%i", typeCode, dimSpecialiation]];
         BrodcastedAddComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         BrodcastedAddInit[typeCode][dimSpecialiation] = true;
+    }
+    
+    void initBrodcastedCrossInit(int typeCode, int dimSpecialiation) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedCrossGPU_%i_%i", typeCode, dimSpecialiation]];
+        BrodcastedCrossComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        BrodcastedCrossInit[typeCode][dimSpecialiation] = true;
     }
     
     void initBrodcastedSubInit(int typeCode, int dimSpecialiation) {

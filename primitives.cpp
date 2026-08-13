@@ -4,7 +4,10 @@
 
 #include <vector>
 #include <iostream>
+#include <atomic>
 #include "matrix.h"
+
+
 
 
 static matrix ensure_graph_ready(const matrix& m) {
@@ -39,6 +42,7 @@ public:
     std::atomic<uint32_t> primitive_refCount{1};
     bool evaluated = false;
     bool traced = false;
+    uint64_t version = 1;
     int64_t last_visited_pass_id = 0;
     uint8_t* out_buffer = nullptr;
     std::atomic<uint32_t>* out_refcount = nullptr;
@@ -93,10 +97,8 @@ public:
         if (out_refcount) out_refcount->fetch_add(1, std::memory_order_relaxed);
     }
 
-    void eval_cpu(matrix &out, EvalType eval_type) override {
-    };
-    void eval_metal(matrix &out, EvalType eval_type) override {
-    }
+    void eval_cpu(matrix &out, EvalType eval_type) override { evaluated = true; }
+    void eval_metal(matrix &out, EvalType eval_type) override { evaluated = true; }
 
 
     std::vector<matrix> vjp(matrix& grad_out) override {
@@ -108,9 +110,39 @@ public:
         return matrix::scalar(1.0f);
 
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -219,12 +251,70 @@ public:
         return nullptr;
     }
 
+    // Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
-        if (kernel.tape && kernel.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+        if (kernel.tape) {
+            if (kernel.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (kernel.tape->version > this->version) inv = true;
+            new_version = std::max(kernel.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -333,12 +423,49 @@ public:
         matrix total_derivative = tangents[0] + tangents[1];
         return total_derivative;
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (a.tape && a.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
-        if (b.tape && b.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (a.tape->version > this->version) inv = true;
+            new_version = std::max(a.tape->version, new_version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (b.tape->version > this->version) inv = true;
+            new_version = std::max(b.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -438,12 +565,49 @@ class SubtractionPrimitive : public Primitive {
         matrix total_derivative = tangents[0] - tangents[1];
         return total_derivative;
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (a.tape && a.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
-        if (b.tape && b.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (a.tape->version > this->version) inv = true;
+            new_version = std::max(a.tape->version, new_version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (b.tape->version > this->version) inv = true;
+            new_version = std::max(b.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -548,12 +712,49 @@ class MultiplicationPrimitive : public Primitive {
         matrix total_derivative = b * tangents[0] + a * tangents[1];
         return total_derivative;
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (a.tape && a.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
-        if (b.tape && b.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (a.tape->version > this->version) inv = true;
+            new_version = std::max(a.tape->version, new_version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (b.tape->version > this->version) inv = true;
+            new_version = std::max(b.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -656,12 +857,49 @@ class DivisionPrimitive : public Primitive {
         matrix total_derivative = (b * tangents[0] - a * tangents[1]) / (b * b);
         return total_derivative;
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (a.tape && a.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
-        if (b.tape && b.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (a.tape->version > this->version) inv = true;
+            new_version = std::max(a.tape->version, new_version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (b.tape->version > this->version) inv = true;
+            new_version = std::max(b.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -768,12 +1006,45 @@ public:
         matrix::stack(tangents,total_derivative, axis);
         return total_derivative;
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
         for (size_t i = 0; i < inputs.size(); i++) {
-            if (inputs[i].tape && inputs[i].tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+            if (inputs[i].tape) {
+                if (inputs[i].tape->invalidate_pass(current_pass_id)) { inv = true; }
+                if (inputs[i].tape->version > this->version) inv = true;
+                new_version = std::max(inputs[i].tape->version, new_version);
+            }
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
         }
         return false;
     }
@@ -875,12 +1146,45 @@ public:
         // we need to find the total derivative of c so (da/.. , db/...)
         return matrix::concat(tangents, axis);;
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
         for (size_t i = 0; i < inputs.size(); i++) {
-            if (inputs[i].tape && inputs[i].tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+            if (inputs[i].tape) {
+                if (inputs[i].tape->invalidate_pass(current_pass_id)) { inv = true; }
+                if (inputs[i].tape->version > this->version) inv = true;
+                new_version = std::max(inputs[i].tape->version, new_version);
+            }
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
         }
         return false;
     }
@@ -906,7 +1210,7 @@ public:
     std::vector<size_m> unsqeeze_mask;
     size_t slice_size;
     size_t offset;
-    SlicePrimitive(matrix& input_mat, array_descriptor& input_slice_desc, const std::vector<size_m>& input_slice_indices, const std::vector<size_m>& input_unsqueeze_mask, size_t input_slice_size, size_t input_offset ):
+    SlicePrimitive(const matrix& input_mat, array_descriptor& input_slice_desc, const std::vector<size_m>& input_slice_indices, const std::vector<size_m>& input_unsqueeze_mask, size_t input_slice_size, size_t input_offset ):
     input(ensure_graph_ready(input_mat)),
     slice_desc(input_slice_desc),
     slice_indices(input_slice_indices),
@@ -1006,18 +1310,51 @@ public:
         // a is vectors a[.., .., ...]=>c soo J = (dc/da, dc/db) = Identity padded with zeros for the orignal matrix values that were'nt in the slice
         // offset = ind[0] * strides[0] + ind[1] * strides[1] ... + ind[n-1] * strides[n-1];
         matrix padded_grad_out(input.dims, input.type);
-        grad_out.unsqueeze(unsqeeze_mask.data(), unsqeeze_mask.size()).padding(slice_indices, padded_grad_out, {0});
+        grad_out.unsqueeze(unsqeeze_mask.data(), unsqeeze_mask.size()).pad(slice_indices, padded_grad_out, {0});
         return {padded_grad_out};
     }
     matrix jvp(std::vector<matrix>& tangents) override {
         // a are vectors a[.., .., ...]=>c soo J = (dc/da, dc/db)=>J=(1, 1) and only return the slice of the incoming derivative
         return tangents[0].slice(slice_desc, slice_indices, unsqeeze_mask, offset);
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -1131,14 +1468,50 @@ public:
         return tangents[0].slice_assign(slice_desc, slice_indices, offset, tangents[1]);
     }
 
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
+
         bool inv = false;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; inv = true; }
-        if (rhs.tape && rhs.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; inv = true; }
-        return inv;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+        if (rhs.tape) {
+            if (rhs.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (rhs.tape->version > this->version) inv = true;
+            new_version = std::max(rhs.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
     }
 
     void clear_trace_checks() override {
@@ -1229,11 +1602,44 @@ public:
 
         return matrix(0, dtype::UInt8);
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -1324,11 +1730,44 @@ public:
 
         return matrix(0, dtype::UInt8);
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -1424,12 +1863,49 @@ public:
     matrix jvp(std::vector<matrix>& tangents) override {
         return matrix(0, dtype::UInt8);
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (a.tape && a.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
-        if (b.tape && b.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (a.tape->version > this->version) inv = true;
+            new_version = std::max(a.tape->version, new_version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (b.tape->version > this->version) inv = true;
+            new_version = std::max(b.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -1521,12 +1997,49 @@ public:
     matrix jvp(std::vector<matrix>& tangents) override {
         return matrix(0, dtype::UInt8);
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (a.tape && a.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
-        if (b.tape && b.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (a.tape->version > this->version) inv = true;
+            new_version = std::max(a.tape->version, new_version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (b.tape->version > this->version) inv = true;
+            new_version = std::max(b.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -1558,7 +2071,6 @@ public:
                 out.metalBuffer = out.tape->out_metal_buffer;
                 out.refCount = out.tape->out_refcount;
                 out.refCount->fetch_add(1);
-                if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
@@ -1587,7 +2099,6 @@ public:
                 out.metalBuffer = out.tape->out_metal_buffer;
                 out.refCount = out.tape->out_refcount;
                 out.refCount->fetch_add(1);
-                if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
@@ -1620,11 +2131,44 @@ public:
 
         return tangents[0].sum(axis, NoRed);
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -1645,7 +2189,8 @@ public:
     matrix value;
     size_t offset;
     std::vector<size_m> padding_range;
-    PaddingPrimitive(matrix& input_mat, matrix& input_value, size_t input_offset, std::vector<size_m>& input_padding_range): input(input_mat), value(input_value), offset(input_offset), padding_range(input_padding_range) {
+    std::vector<size_m> out_shape;
+    PaddingPrimitive(const matrix& input_mat, const matrix& input_value, size_t input_offset, const std::vector<size_m>& input_padding_range, const const std::vector<size_m>& output_shape): input(input_mat), value(input_value), offset(input_offset), padding_range(input_padding_range), out_shape(output_shape) {
     }
     void eval_cpu(matrix &out, EvalType eval_type) override {
         if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); };
@@ -1672,7 +2217,7 @@ public:
         }
         if (evaluated) {return;} else {evaluated = true;}
 
-        input.padding( padding_range, out, value, eval_type) ;
+        input.pad( padding_range, out, value, ExecutionDevice::CPU);
 
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
@@ -1701,7 +2246,7 @@ public:
         }
         if (evaluated) {return;} else {evaluated = true;}
 
-        input.padding( padding_range, out, value, eval_type);
+        input.pad( padding_range, out, value, ExecutionDevice::METAL);
 
     }
 
@@ -1716,13 +2261,46 @@ public:
         // tangents are coming from the inputs so tangents are {da/.., db/...}
         // we need to find the total derivative of c so (da/.. , db/...)
 
-        return tangents[0].padding(padding_range, value);
+        return tangents[0].pad(padding_range, value);
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -1836,11 +2414,44 @@ public:
         // tangents are coming from the inputs so tangents are {da/..,} so we need to broadcast them.
         return tangents[0].broadcast_toV2((broadcasted_dims < SBO_MAX_DIMS ? brodcast_desc.inline_buffer : brodcast_desc.shared_arr_desc->shape()), input.dims);
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -1983,11 +2594,44 @@ public:
         return tangents[0].reshape(reshape_desc, reshape_dim);
 
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -2075,11 +2719,44 @@ public:
         return tangents[0].astype(new_type);
 
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -2203,11 +2880,44 @@ public:
         return tangents[0].transpose(transpose_desc);
 
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -2344,11 +3054,44 @@ public:
         return matrix::scalar(1.0f);
 
     }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (outer_input.tape && outer_input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (outer_input.tape) {
+            if (outer_input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (outer_input.tape->version > this->version) inv = true;
+            new_version = std::max(outer_input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -2528,12 +3271,45 @@ public:
 
     std::vector<matrix> vjp(matrix& grad_out) override { return {}; }
     matrix jvp(std::vector<matrix>& tangents) override { return matrix(0, dtype::UInt8); }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        for (auto& o_in : outer_inputs) {
-            if (o_in.tape && o_in.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        for (size_t i = 0; i < outer_inputs.size(); i++) {
+            if (outer_inputs[i].tape) {
+                if (outer_inputs[i].tape->invalidate_pass(current_pass_id)) { inv = true; }
+                if (outer_inputs[i].tape->version > this->version) inv = true;
+                new_version = std::max(outer_inputs[i].tape->version, new_version);
+            }
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
         }
         return false;
     }
@@ -2625,14 +3401,48 @@ public:
         return matrix(0, dtype::Float);
     }
 
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
+        if (!evaluated) return;
         evaluated = false;
         if (input.tape && input.tape->evaluated) { input.tape->clear_trace_checks(); }
     }
@@ -2714,14 +3524,48 @@ public:
         return tangents[0] * (input / matrix::abs(input));
     }
 
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
+        if (!evaluated) return;
         evaluated = false;
         if (input.tape && input.tape->evaluated) { input.tape->clear_trace_checks(); }
     }
@@ -2795,14 +3639,48 @@ public:
         return {input};
     }
     
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
+        if (!evaluated) return;
         evaluated = false;
         if (input.tape && input.tape->evaluated) { input.tape->clear_trace_checks(); }
     }
@@ -2887,14 +3765,48 @@ public:
         return tangents[0] * matrix::cos(input);
     }
 
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
+        if (!evaluated) return;
         evaluated = false;
         if (input.tape && input.tape->evaluated) { input.tape->clear_trace_checks(); }
     }
@@ -2972,14 +3884,48 @@ public:
         return tangents[0] * (matrix::sin(input) * -1.0f);
     }
 
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
+        if (!evaluated) return;
         evaluated = false;
         if (input.tape && input.tape->evaluated) { input.tape->clear_trace_checks(); }
     }
@@ -3059,11 +4005,44 @@ public:
         return tangents[0] / (cos_val * cos_val);
     }
 
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -3145,11 +4124,44 @@ public:
         return tangents[0] * (1/2) * (1/matrix::sqrt(input));
     }
 
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -3231,11 +4243,44 @@ public:
         return tangents[0] * matrix::exp(input);
     }
 
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -3344,12 +4389,49 @@ public:
         return tangents[0].dot(b_transposed, true) + a.dot(tangents[1], true);
     }
 
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (a.tape && a.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
-        if (b_transposed.tape && b_transposed.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (a.tape->version > this->version) inv = true;
+            new_version = std::max(a.tape->version, new_version);
+        }
+        if (b_transposed.tape) {
+            if (b_transposed.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (b_transposed.tape->version > this->version) inv = true;
+            new_version = std::max(b_transposed.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     void clear_trace_checks() override {
@@ -3460,11 +4542,44 @@ public:
         return {input};
     }
     
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (input.tape && input.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     
@@ -3552,13 +4667,49 @@ public:
         return tangents[0];
     }
     
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        if (!this->evaluated) return true;
-        if (source.tape && source.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
-        if (indices.tape && indices.tape->invalidate_pass(current_pass_id)) { this->evaluated = false; return true; }
 
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (source.tape) {
+            if (source.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (source.tape->version > this->version) inv = true;
+            new_version = std::max(source.tape->version, new_version);
+        }
+        if (indices.tape) {
+            if (indices.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (indices.tape->version > this->version) inv = true;
+            new_version = std::max(indices.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
     
@@ -3574,5 +4725,202 @@ public:
     
     std::vector<matrix> get_inputs() override {
         return {source, indices};
+    }
+};
+
+class CrossPrimitive : public Primitive {
+public:
+    matrix a;
+    matrix b;
+    BroadcastDescriptor* desc_a = nullptr;
+    BroadcastDescriptor* desc_b = nullptr;
+    CollapsedDims_3 collapsed_dims_3;
+    
+    ~CrossPrimitive() {
+        if (desc_a) BroadcastDescriptor::destroy(desc_a);
+        if (desc_b) BroadcastDescriptor::destroy(desc_b);
+    }
+    
+    CrossPrimitive(const matrix& a, const matrix& b) : a(ensure_graph_ready(a)), b(ensure_graph_ready(b)) {
+    }
+    
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_cpu(a, eval_type); }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_cpu(b, eval_type); }
+        a.update_from_trace();
+        b.update_from_trace();
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return; else evaluated = true;
+        a.cross_cpu_brodcasted(b, out);
+    }
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); }
+        a.update_from_trace();
+        b.update_from_trace();
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return; else evaluated = true;
+        a.cross_gpu_brodcasted(b, out);
+    }
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        // grad_a = b x grad_out
+        // grad_b = grad_out x a
+        return {matrix::cross(b, grad_out, -1), matrix::cross(grad_out, a, -1)};
+    }
+    matrix jvp(std::vector<matrix>& tangents) override {
+        // d(a x b) = da x b + a x db
+        return matrix::cross(tangents[0], b, -1) + matrix::cross(a, tangents[1], -1);
+    }
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (a.tape->version > this->version) inv = true;
+            new_version = std::max(a.tape->version, new_version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (b.tape->version > this->version) inv = true;
+            new_version = std::max(b.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (a.tape) { a.tape->clear_trace_checks(); }
+        if (b.tape) { b.tape->clear_trace_checks(); }
+    }
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+    
+    std::vector<matrix> get_inputs() override {
+        return {a, b};
+    }
+};
+
+class LeafPrimitive : public Primitive {
+public:
+    LeafPrimitive(matrix& output) {
+        out_buffer = (uint8_t*)output.buffer;
+        out_metal_buffer = output.metalBuffer;
+        out_refcount = output.refCount;
+        if (out_refcount) out_refcount->fetch_add(1, std::memory_order_relaxed);
+    }
+    void eval_cpu(matrix &out, EvalType eval_type) override { evaluated = true; }
+    void eval_metal(matrix &out, EvalType eval_type) override { evaluated = true; }
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        return { grad_out };
+    }
+    
+    matrix jvp(std::vector<matrix>& tangents) override {
+        return matrix::scalar(1.0f);
+    }
+    
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
+    }
+    
+    void clear_trace_checks() override {
+        evaluated = false;
+    }
+    
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+    
+    std::vector<matrix> get_inputs() override {
+        return {};
     }
 };

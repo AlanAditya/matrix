@@ -239,9 +239,49 @@ template <typename T> struct init_list_base<std::initializer_list<T>> {
     using type = typename init_list_base<T>::type;
 };
 
+#include <atomic>
+
+inline std::atomic<uint64_t> global_epoch{1};
+
 class Primitive;
 class StackPrimitive;
-
+struct data {
+    void *buffer = nullptr;
+    id<MTLBuffer> metalBuffer = nil;
+    std::atomic<uint32_t> *refCount = nil;
+    data(){}
+    static data allocate(size_t num_elements, dtype type) {
+        data d;
+        d.buffer = new uint8_t[num_elements * dtype_size(type)];
+        d.metalBuffer = [GlobalGPUManager.metalDevice newBufferWithBytesNoCopy:d.buffer length:num_elements * dtype_size(type) options:MTLResourceStorageModeShared deallocator:^(void *_Nonnull pointer, NSUInteger length){
+        }];
+        d.refCount = new std::atomic<uint32_t>(1);
+        return d;
+    }
+    static data just_allocate(size_t num_elements, dtype type) {
+        data d;
+        d.buffer = new uint8_t[num_elements * dtype_size(type)];
+        return d;
+    }
+    data(const data& other) {
+        buffer = other.buffer;
+        
+    }
+    ~data() {
+        if (refCount) {
+            // if has refcount meaning it is a realised node and realised nodes must have a buffer
+            if (refCount->fetch_sub(1) == 1) {
+                delete [] (uint8_t*)buffer;
+            }
+        } else {
+            // if it doesnt have a refcount meaning its either a unrealised node or a leaf node without refcount
+            // NON_OWNERSHIP Flag support is done by matrix
+            if (buffer) {
+                delete [] (uint8_t*)buffer;
+            }
+        }
+    }
+};
 class matrix {
 public:
     array_descriptor array_desc;
@@ -296,6 +336,11 @@ public:
     
     inline simd_float4x4& SIMD_MAT(int i) {
         eval();
+        if (i >= shape()[0]) {
+            throw std::invalid_argument(
+                std::format("matrix: Index {} out of bounds for the axis shape {}", i, shape()[0])
+            );
+        }
         return *(simd_float4x4*)((uint8_t*)buffer + i * sizeof(simd_float4x4));
     }
     
@@ -455,7 +500,7 @@ public:
     }
     
     void print() const;
-    void printShape(bool verbose = true) const {
+    __attribute__((used)) void printShape(bool verbose = true) const {
         if (verbose == true) { std::cout << "Shape is [ "; }
         const size_m* shape_ptr = shape();
         for (int i=0; i<dims; i++) {
@@ -465,7 +510,7 @@ public:
         
     }
     
-    void printStrides(bool verbose = true) const {
+    __attribute__((used)) void printStrides(bool verbose = true) const {
         if (verbose == true) { std::cout << "Strides are [ "; }
         const size_m* stride_ptr = strides();
         for (int i=0; i<dims; i++) {
@@ -480,6 +525,18 @@ public:
     static matrix zeros(std::initializer_list<size_m> shapeI, dtype type = dtype::Float) {
         matrix output((uint32_t)shapeI.size(), type);
         memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+        output.calcStrides();
+        output.total_size = output.accumul(0, output.dims);
+        output.buffer = new uint8_t[output.total_size * dtype_size(type)];
+        if (output.total_size > 10) {
+            output.buildMetalBuffer();
+        }
+        memset(output.buffer, 0, output.total_size * dtype_size(type));
+        return output;
+    }
+    static matrix zeros(const std::vector<size_m>& shapeI, dtype type = dtype::Float) {
+        matrix output((uint32_t)shapeI.size(), type);
+        memcpy(output.shape(), shapeI.data(), output.dims * sizeof(size_m));
         output.calcStrides();
         output.total_size = output.accumul(0, output.dims);
         output.buffer = new uint8_t[output.total_size * dtype_size(type)];
@@ -569,15 +626,23 @@ public:
     static matrix eye(uint m, uint n, int k, dtype type = dtype::Float);
     static matrix eye(uint m, dtype type = dtype::Float);
     
+    static matrix leaf(std::initializer_list<size_m> shape, dtype type = dtype::Float);
+    static matrix leaf(const std::vector<size_m>& shape, dtype type = dtype::Float);
+    void make_leaf();
+    
     matrix ones() const;
     matrix zeros() const;
 
     static matrix stack(const std::vector<matrix>& mats, int axis);
 
     static void stack(const std::vector<matrix>& mats, matrix& output, int axis = 0, ExecutionDevice exec_device = ExecutionDevice::AUTO);
-    void padding(std::initializer_list<std::pair<size_m, size_m>> padding_range, matrix& padded_mat, const matrix& value, EvalType eval_type = EvalType::EVAL_AUTO);
-    void padding(std::vector<size_m>& padding_range, matrix& padded_mat, const matrix& value, EvalType eval_type = EvalType::EVAL_AUTO);
-    matrix padding(std::vector<size_m>& padding_range, const matrix& value);
+    matrix pad(std::initializer_list<std::pair<size_m, size_m>> padding_range, const matrix& value) const;
+    
+    void pad(std::vector<size_m>& padding_range, matrix& padded_mat, const matrix& value, ExecutionDevice exec_device = ExecutionDevice::AUTO);
+    matrix pad(int left, int right, int axis, const matrix& val) const;
+    matrix pad(const std::vector<size_m>& padding_range, const matrix& value) const;
+    matrix pad_range_normalised(const std::vector<size_m>& padding_range, const size_m* target_shape, const matrix& value) const;
+    
     matrix broadcast_toV2(size_m* broadcasted_shape, int broadcasted_dim) const;
     matrix broadcast_toV2(std::initializer_list<size_m> inp_broadcasted_shape) const;
     matrix broadcast_to_impl(const size_m* broadcasted_shape, int broadcasted_dim) const;
@@ -590,6 +655,7 @@ public:
     matrix reshape(array_descriptor reshape_desc, size_t reshape_dims);
     matrix unsqueeze(int axis) const;
     matrix unsqueeze(uint32_t* axes, uint32_t num_axes) const;
+    matrix unsqueeze(int insertion_axis, int num) const;
     matrix squeeze(int axis) const;
     matrix squeeze() const;
     
@@ -733,10 +799,10 @@ public:
 }
     
     matrix slice(std::initializer_list<std::optional<std::pair<size_m, size_m>>>
-                 slice_range);
-    matrix slice(std::initializer_list<R> slice_range);
-    matrix slice(R slice_range, int slice_axis);
-    matrix slice(array_descriptor slice_range, std::vector<size_m>& slice_indices, const std::vector<size_m>& unsqueeze_axis, size_t offset);
+                 slice_range) const;
+    matrix slice(std::initializer_list<R> slice_range) const;
+    matrix slice(R slice_range, int slice_axis) const;
+    matrix slice(array_descriptor slice_range, std::vector<size_m>& slice_indices, const std::vector<size_m>& unsqueeze_axis, size_t offset) const;
 
     matrix slice_assign(std::initializer_list<std::optional<std::pair<size_m, size_m>>> slice_range, const matrix& rhs);
     matrix slice_assign(std::initializer_list<R> slice_range, const matrix& rhs);
@@ -1318,6 +1384,10 @@ public:
     void subtract_gpu( matrix &other, matrix &result, EvalType evalType = EvalType::EVAL_AUTO) ;
     void divide_gpu( matrix &other, matrix &result, EvalType evalType = EvalType::EVAL_AUTO) ;
     
+    static matrix cross(const matrix& a, const matrix& b, int axis = -1);
+    void cross_impl(matrix &other, matrix &result);
+    void cross_cpu_brodcasted(matrix& other, matrix& result);
+    void cross_gpu_brodcasted(matrix& other, matrix& result);
     static matrix sin(const matrix& input);
     void sin(matrix& output, ExecutionDevice exec_device);
 
@@ -1371,7 +1441,7 @@ public:
         if (this->dims != N) {
             throw std::runtime_error("Matrix rank mismatch in at().");
         }
-        if (this->type != dtype_from_type<T>()) {
+        if (this->type != dtype_from_type<T>() && !std::is_same_v<T, simd_float3> && !std::is_same_v<T, simd_float2> && !std::is_same_v<T, simd_float4> && !std::is_same_v<T, simd_float4>) {
             throw std::runtime_error("Type mismatch in at().");
         }
         
@@ -1381,7 +1451,16 @@ public:
         if constexpr (N > 0) {
             size_m indices[N] = { static_cast<size_m>(args)... };
             const size_m* str = this->strides();
+            const size_m* shp = this->shape();
+            
             for (size_t d = 0; d < N; ++d) {
+                if (indices[d] >= shp[d]) {
+                    throw std::out_of_range(
+                        "at(): index " + std::to_string(indices[d]) +
+                        " out of bounds for dimension " + std::to_string(d) +
+                        " with shape " + std::to_string(shp[d])
+                    );
+                }
                 offset += indices[d] * str[d];
             }
         }

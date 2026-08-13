@@ -251,7 +251,7 @@ CollapsedDims_3 collapse_dims_matmul(const size_m shape[], const size_m stridesA
     return result;
 }
 
-CollapsedDims_2 collapse_dims_reduce(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const uint32_t dims, const int reduce_axis, const size_t SIZE_CAP, bool keepdims) {
+CollapsedDims_2 collapse_dims_reduces(const size_m shape[], const size_m stridesA[], const size_m stridesB[], const uint32_t dims, const int reduce_axis, const size_t SIZE_CAP, bool keepdims) {
     size_m reduced_shape[32];
     size_m reduced_stridesA[32];
     size_m reduced_stridesB[32];
@@ -266,6 +266,175 @@ CollapsedDims_2 collapse_dims_reduce(const size_m shape[], const size_m stridesA
     }
     return collapse_dims(reduced_shape, reduced_stridesA, reduced_stridesB, idx, SIZE_CAP);
 }
+
+CollapsedDims collapse_dims_reduce(const size_m shape[], const size_m stridesO[], const uint32_t dims, int axis, bool keep_dims, const size_t SIZE_CAP) {
+    CollapsedDims result;
+    result.out_dims = 0;
+
+    if (dims == 0) {
+        return result;
+    }
+
+    int last_index = -1;
+    bool prevent_collapse = false; // Forces the next dimension to start a new slot
+
+    for (int i = 0; i < dims; i++) {
+        // 1. Handle the reduction axis explicitly
+        if (i == axis) {
+            if (keep_dims) {
+                last_index++;
+                result.shape[last_index] = shape[i];
+                result.strides[last_index] = stridesO[i];
+            }
+            // Even if keep_dims is false, this axis marks a hard split.
+            // The next valid dimension MUST start a new slot and cannot merge backwards.
+            prevent_collapse = true;
+            continue;
+        }
+
+        // 2. Safely skip unit dimensions that aren't the reduction axis
+        if (shape[i] == 1) {
+            continue;
+        }
+        // 3. Try to collapse into the previous dimension if allowed
+        if (!prevent_collapse &&
+            last_index >= 0 &&
+            result.strides[last_index] == stridesO[i] * shape[i] &&
+            result.shape[last_index] * shape[i] <= SIZE_CAP) {
+
+            result.shape[last_index] *= shape[i];
+            result.strides[last_index] = stridesO[i]; // Inner stride takes over
+        }
+        // 4. Otherwise, start a new uncollapsed dimension slot
+        else {
+            last_index++;
+            result.shape[last_index] = shape[i];
+            result.strides[last_index] = stridesO[i]; // Inner stride takes over
+            prevent_collapse = false; // Reset the flag once we've established a new slot
+        }
+    }
+
+    result.out_dims = (uint32_t)(last_index + 1);
+    return result;
+}
+
+CollapsedDims_2 collapse_dims_reduce(const size_m shape[], const size_m stridesO[], const size_m stridesI[], const uint32_t dims, int axis, bool keep_dims, bool outer_collapsed, const size_t SIZE_CAP) {
+    CollapsedDims_2 result;
+    result.out_dims = 0;
+
+    if (dims == 0) {
+        return result;
+    }
+
+    int last_index = -1;
+    bool prevent_collapse = false; // Forces the next dimension to start a new slot
+
+    for (int i = 0; i < dims; i++) {
+        // 1. Handle the reduction axis explicitly
+        if (i == axis) {
+            if (keep_dims) {
+                last_index++;
+                result.shape[last_index] = shape[i];
+                result.stridesA[last_index] = stridesO[i];
+                result.stridesB[last_index] = stridesI[i];
+            }
+            // Even if keep_dims is false, this axis marks a hard split.
+            // The next valid dimension MUST start a new slot and cannot merge backwards.
+            prevent_collapse = true;
+            continue;
+        }
+
+        // 2. Safely skip unit dimensions that aren't the reduction axis
+        if (shape[i] == 1) {
+            continue;
+        }
+        int out_idx = i;
+        if (outer_collapsed && axis < i) out_idx-=1;
+        // 3. Try to collapse into the previous dimension if allowed
+        if (!prevent_collapse &&
+            last_index >= 0 &&
+            result.stridesA[last_index] == stridesO[out_idx] * shape[i] &&
+            result.stridesB[last_index] == stridesI[i] * shape[i] &&
+            result.shape[last_index] * shape[i] <= SIZE_CAP) {
+
+            result.shape[last_index] *= shape[i];
+            result.stridesA[last_index] = stridesO[out_idx]; // Inner stride takes over
+            result.stridesB[last_index] = stridesI[i];
+            }
+        // 4. Otherwise, start a new uncollapsed dimension slot
+        else {
+            last_index++;
+            result.shape[last_index] = shape[i];
+            result.stridesA[last_index] = stridesO[out_idx]; // Inner stride takes over
+            result.stridesB[last_index] = stridesI[i];
+            prevent_collapse = false; // Reset the flag once we've established a new slot
+        }
+    }
+
+    result.out_dims = (uint32_t)(last_index + 1);
+    return result;
+}
+
+CollapsedDims_3 collapse_dims_reduce(const size_m shape[], const size_m stridesO[], const size_m stridesB[], const size_m stridesC[], const uint32_t dims, int axis, bool keep_dims, const size_t SIZE_CAP) {
+    CollapsedDims_3 result;
+    result.out_dims = 0;
+
+    if (dims == 0) {
+        return result;
+    }
+
+    int last_index = -1;
+    bool prevent_collapse = false; // Forces the next dimension to start a new slot
+
+    for (int i = 0; i < dims; i++) {
+        // 1. Handle the reduction axis explicitly
+        if (i == axis) {
+            if (keep_dims) {
+                last_index++;
+                result.shape[last_index] = shape[i];
+                result.stridesA[last_index] = stridesO[i];
+                result.stridesB[last_index] = stridesB[i];
+                result.stridesC[last_index] = stridesC[i];
+            }
+            // Even if keep_dims is false, this axis marks a hard split.
+            // The next valid dimension MUST start a new slot and cannot merge backwards.
+            prevent_collapse = true;
+            continue;
+        }
+
+        // 2. Safely skip unit dimensions that aren't the reduction axis
+        if (shape[i] == 1) {
+            continue;
+        }
+        // 3. Try to collapse into the previous dimension if allowed
+        if (!prevent_collapse &&
+            last_index >= 0 &&
+            result.stridesA[last_index] == stridesO[i] * shape[i] &&
+            result.stridesB[last_index] == stridesB[i] * shape[i] &&
+            result.stridesC[last_index] == stridesC[i] * shape[i] &&
+            result.shape[last_index] * shape[i] <= SIZE_CAP) {
+
+            result.shape[last_index] *= shape[i];
+            result.stridesA[last_index] = stridesO[i]; // Inner stride takes over
+            result.stridesB[last_index] = stridesB[i];
+            result.stridesC[last_index] = stridesC[i];
+        }
+        // 4. Otherwise, start a new uncollapsed dimension slot
+        else {
+            last_index++;
+            result.shape[last_index] = shape[i];
+            result.stridesA[last_index] = stridesO[i]; // Inner stride takes over
+            result.stridesB[last_index] = stridesB[i];
+            result.stridesC[last_index] = stridesC[i];
+            prevent_collapse = false; // Reset the flag once we've established a new slot
+        }
+    }
+
+    result.out_dims = (uint32_t)(last_index + 1);
+    return result;
+}
+
+
 
 void PatternFill(void* destination, const void* pattern, size_t patternSize, uint32_t n) {
     uint32_t exp = 0;
@@ -390,5 +559,21 @@ std::ostream& operator<<(std::ostream& os, const std::vector<uint8_t>& vec) {
 
     os << std::dec;
 
+    return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const simd_float4x4& m) {
+    // simd_float4x4 is column-major: m.columns[col][row]
+    // print as a readable row-major grid
+    os << "simd_float4x4(\n";
+    for (int row = 0; row < 4; ++row) {
+        os << "  [";
+        for (int col = 0; col < 4; ++col) {
+            os << m.columns[col][row];
+            if (col < 3) os << ", ";
+        }
+        os << "]\n";
+    }
+    os << ")";
     return os;
 }
