@@ -577,3 +577,19 @@ std::ostream& operator<<(std::ostream& os, const simd_float4x4& m) {
     os << ")";
     return os;
 }
+
+std::ostream& operator<<(std::ostream& os, const simd_float3x3& m) {
+    // simd_float4x4 is column-major: m.columns[col][row]
+    // print as a readable row-major grid
+    os << "simd_float3x3(\n";
+    for (int row = 0; row < 3; ++row) {
+        os << "  [";
+        for (int col = 0; col < 3; ++col) {
+            os << m.columns[col][row];
+            if (col < 2) os << ", ";
+        }
+        os << "]\n";
+    }
+    os << ")";
+    return os;
+}

@@ -156,6 +156,36 @@ public:
     bool PaddingInit[6][4];
     id<MTLComputePipelineState> Padding_ComputeState[6][4];
     
+    // LEGACY: PCG-based RNG (ComputeShaders/Random.metal). Superseded by the
+    // Threefry-based kernels below. Kept for this iteration only - phase out next.
+    bool RandintInit_Legacy[7];
+    id<MTLComputePipelineState> RandintComputeState_Legacy[7];
+    bool RandInit_Legacy[7];
+    id<MTLComputePipelineState> RandComputeState_Legacy[7];
+    bool RandnInit_Legacy[7];
+    id<MTLComputePipelineState> RandnComputeState_Legacy[7];
+
+    bool RandintInit[7];
+    id<MTLComputePipelineState> RandintComputeState[7];
+    bool RandInit[7];
+    id<MTLComputePipelineState> RandComputeState[7];
+    bool RandnInit[7];
+    id<MTLComputePipelineState> RandnComputeState[7];
+
+    bool FillOnesInit[7];
+    id<MTLComputePipelineState> FillOnesComputeState[7];
+
+    // gaussian() supports Float and Float16 output (kDTypeTag indices 0/1) - only those two
+    // slots are ever populated, but this reuses the same per-dtype array shape as FillOnes.
+    bool GaussianFillInit[7];
+    id<MTLComputePipelineState> GaussianFillComputeState[7];
+    bool GaussianNormalizeInit[7];
+    id<MTLComputePipelineState> GaussianNormalizeComputeState[7];
+
+    // perlin() output is always Float too - single slot, no per-dtype array.
+    bool PerlinInit = false;
+    id<MTLComputePipelineState> PerlinComputeState;
+
     NSMutableDictionary<NSString*, NSNumber*>* shaderNameToIndex;
     NSMutableArray<id<MTLComputePipelineState>>* customComputeShader;
     
@@ -257,6 +287,17 @@ public:
             for (int k = 0; k < 4; k++) {
                 PaddingInit[i][k] = false;
             }
+        }
+        for (int i = 0; i < 7; i++) {
+            RandintInit_Legacy[i] = false;
+            RandInit_Legacy[i] = false;
+            RandnInit_Legacy[i] = false;
+            RandintInit[i] = false;
+            RandInit[i] = false;
+            RandnInit[i] = false;
+            FillOnesInit[i] = false;
+            GaussianFillInit[i] = false;
+            GaussianNormalizeInit[i] = false;
         }
     }
     
@@ -600,6 +641,80 @@ public:
         SqrtInit[i] = true;
     }
     
+    // LEGACY: see RandintComputeState_Legacy above - phase out next iteration.
+    void initRandint_Legacy(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"fill_randint_legacy_%i", i]];
+        RandintComputeState_Legacy[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        RandintInit_Legacy[i] = true;
+    }
+
+    void initRand_Legacy(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"fill_rand_legacy_%i", i]];
+        RandComputeState_Legacy[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        RandInit_Legacy[i] = true;
+    }
+
+    void initRandn_Legacy(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"fill_randn_legacy_%i", i]];
+        RandnComputeState_Legacy[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        RandnInit_Legacy[i] = true;
+    }
+
+    // dtype -> type tag used by random_kernel.metal and Fill.metal (Float, Float16, UInt8, Int32, Int16, UInt32, UInt16)
+    inline static constexpr const char* kDTypeTag[7] = {"f32", "f16", "u8", "i32", "i16", "u32", "u16"};
+
+    void initRandint(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"randint_%s", kDTypeTag[i]]];
+        RandintComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        RandintInit[i] = true;
+    }
+
+    void initRand(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"rand_%s", kDTypeTag[i]]];
+        RandComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        RandInit[i] = true;
+    }
+
+    void initRandn(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"randn_%s", kDTypeTag[i]]];
+        RandnComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        RandnInit[i] = true;
+    }
+
+    void initFillOnes(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"fill_ones_%s", kDTypeTag[i]]];
+        FillOnesComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        FillOnesInit[i] = true;
+    }
+
+    void initGaussianFill(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"fill_gaussian_%s", kDTypeTag[i]]];
+        GaussianFillComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        GaussianFillInit[i] = true;
+    }
+
+    void initGaussianNormalize(int i) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"normalize_by_sum_%s", kDTypeTag[i]]];
+        GaussianNormalizeComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        GaussianNormalizeInit[i] = true;
+    }
+
+    void initPerlin() {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:@"fill_perlin_f32"];
+        PerlinComputeState = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        PerlinInit = true;
+    }
+
     void initConvolve_All(int i) {
         NSError* error = nil;
         id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ConvolveGPU_%i", i]];
@@ -801,12 +916,5 @@ public:
     }
 };
 
-//simd_float4x4 DAMM() {
-//    simd_float4 row0 = {1.0f, 0.0f, 0.0f, 0.0f};
-//    simd_float4 row1 = {0.0f, 1.0f, 0.0f, 0.0f};
-//    simd_float4 row2 = {0.0f, 0.0f, 1.0f, 0.0f};
-//    simd_float4 row3 = {0.0f, 0.0f, 0.0f, 1.0f};
-//    return simd_matrix(row0, row1, row2, row3);
-//}
 
 inline GPUManager GlobalGPUManager = GPUManager();

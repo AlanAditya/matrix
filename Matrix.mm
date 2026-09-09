@@ -22,6 +22,7 @@
 #include <atomic>
 #include <iomanip>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <type_traits>
 #include <vector>
@@ -1140,7 +1141,7 @@ std::function<matrix(matrix)> matrix::grad_graph_gpu(std::function<matrix(matrix
     
     matrix grad_output = matrix::build_grad_graph(output, sample);
     grad_output.compile_metal();
-    
+
     return [sample, grad_output](matrix input) mutable -> matrix {
         if (!input.tape) {
             input.begin_refcount();
@@ -1599,8 +1600,485 @@ matrix matrix::zeros() const {
     return output;
 }
 
+matrix matrix::zeros(std::initializer_list<size_m> shapeI, dtype type) {
+    matrix output((uint32_t)shapeI.size(), type);
+    memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    output.tape = new GeneratorPrimitive(
+        [](matrix& out) {
+            memset(out.buffer, 0, out.total_size * dtype_size(out.type));
+        },
+        [](matrix& out) {
+            // Zero is the one fill value that's the same byte pattern for every dtype,
+            // so this can be a real device-side blit instead of a CPU write.
+            id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+            GlobalGPUManager.endCommandEncoding();
+            id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+            [blitEncoder fillBuffer:out.metalBuffer range:NSMakeRange(0, out.total_size * dtype_size(out.type)) value:0];
+            [blitEncoder endEncoding];
+        });
+    return output;
+}
+
+matrix matrix::zeros(const std::vector<size_m>& shapeI, dtype type) {
+    matrix output((uint32_t)shapeI.size(), type);
+    memcpy(output.shape(), shapeI.data(), output.dims * sizeof(size_m));
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    output.tape = new GeneratorPrimitive(
+        [](matrix& out) {
+            memset(out.buffer, 0, out.total_size * dtype_size(out.type));
+        },
+        [](matrix& out) {
+            id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+            GlobalGPUManager.endCommandEncoding();
+            id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+            [blitEncoder fillBuffer:out.metalBuffer range:NSMakeRange(0, out.total_size * dtype_size(out.type)) value:0];
+            [blitEncoder endEncoding];
+        });
+    return output;
+}
+
+matrix matrix::ones(std::initializer_list<size_m> shapeI, dtype type) {
+    matrix output((uint32_t)shapeI.size(), type);
+    memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    // Unlike zero, "one" is a different bit pattern per dtype, so there's no single-byte
+    // blit fill available.
+    auto fill_ones_cpu = [](matrix& out) {
+        dispatch_type(out.type, out.buffer, [&](auto* data) {
+            std::fill(data, data + out.total_size, static_cast<std::decay_t<decltype(*data)>>(1));
+        });
+    };
+    auto fill_ones_gpu = [](matrix& out) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)out.type;
+        if (!GlobalGPUManager.FillOnesInit[typeCode]) {
+            GlobalGPUManager.initFillOnes(typeCode);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.FillOnesComputeState[typeCode]];
+        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        uint size = (uint)out.total_size;
+        [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
+
+        auto dispatchSize = MTLSizeMake(size, 1, 1);
+        auto threadsPerGroup = MTLSizeMake((size < 256 ? size : 256), 1, 1);
+        [commandEncoder dispatchThreads:dispatchSize threadsPerThreadgroup:threadsPerGroup];
+    };
+    output.tape = new GeneratorPrimitive(fill_ones_cpu, fill_ones_gpu);
+    return output;
+}
+
+matrix matrix::gaussian(std::initializer_list<size_m> shapeI, float std_dev, bool normalize, dtype type) {
+    if (type != dtype::Float && type != dtype::Float16) {
+        throw std::invalid_argument("matrix::gaussian: only Float and Float16 are supported");
+    }
+
+    matrix output((uint32_t)shapeI.size(), type);
+    memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    auto fill_gaussian = [std_dev, normalize](matrix& out) {
+        dispatch_type(out.type, out.buffer, [&](auto* buf) {
+            using T = std::decay_t<decltype(*buf)>;
+            float sum = 0.0f;
+
+            if (out.dims == 1) {
+                float c0 = (out.shape()[0] - 1) / 2.0f;
+                for (size_m i = 0; i < out.shape()[0]; ++i) {
+                    float dx = i - c0;
+                    float val = std::exp(-(dx*dx) / (2 * std_dev * std_dev));
+                    buf[i] = (T)val;
+                    sum += val;
+                }
+            } else if (out.dims == 2) {
+                float c0 = (out.shape()[0] - 1) / 2.0f;
+                float c1 = (out.shape()[1] - 1) / 2.0f;
+                for (size_m i = 0; i < out.shape()[0]; ++i) {
+                    for (size_m j = 0; j < out.shape()[1]; ++j) {
+                        float dx = i - c0;
+                        float dy = j - c1;
+                        float val = std::exp(-(dx*dx + dy*dy) / (2 * std_dev * std_dev));
+                        buf[i * out.strides()[0] + j] = (T)val;
+                        sum += val;
+                    }
+                }
+            } else if (out.dims == 3) {
+                float c0 = (out.shape()[0] - 1) / 2.0f;
+                float c1 = (out.shape()[1] - 1) / 2.0f;
+                float c2 = (out.shape()[2] - 1) / 2.0f;
+                for (size_m i = 0; i < out.shape()[0]; ++i) {
+                    for (size_m j = 0; j < out.shape()[1]; ++j) {
+                        for (size_m k = 0; k < out.shape()[2]; ++k) {
+                            float dx = i - c0;
+                            float dy = j - c1;
+                            float dz = k - c2;
+                            float val = std::exp(-(dx*dx + dy*dy + dz*dz) / (2 * std_dev * std_dev));
+                            buf[i * out.strides()[0] + j * out.strides()[1] + k] = (T)val;
+                            sum += val;
+                        }
+                    }
+                }
+            }
+
+            if (normalize && sum > 0.0f) {
+                for (size_t i = 0; i < out.total_size; ++i) {
+                    buf[i] = (T)((float)buf[i] / sum);
+                }
+            }
+        });
+    };
+    auto gpu_gen = [std_dev, normalize](matrix& out) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)out.type;
+        if (!GlobalGPUManager.GaussianFillInit[typeCode]) {
+            GlobalGPUManager.initGaussianFill(typeCode);
+        }
+
+        // Padded to 3 entries: an unused trailing dim gets shape=1/stride=0, which pins its
+        // index to 0 in the kernel and zeroes its (dx/dy/dz) term, so one kernel body covers
+        // the 1D/2D/3D cases without branching on dims (mirrors the CPU loop above).
+        simd_uint3 shape3 = simd_make_uint3(
+            (uint32_t)out.shape()[0],
+            out.dims >= 2 ? (uint32_t)out.shape()[1] : 1,
+            out.dims >= 3 ? (uint32_t)out.shape()[2] : 1);
+        simd_uint3 strides3 = simd_make_uint3(
+            (uint32_t)out.strides()[0],
+            out.dims >= 2 ? (uint32_t)out.strides()[1] : 0,
+            out.dims >= 3 ? (uint32_t)out.strides()[2] : 0);
+
+        // Scratch buffer for the running sum (only consumed when normalizing). Kept float
+        // regardless of out.type since summing in half would lose too much precision.
+        // Safe to zero straight from the CPU since no GPU command has touched it yet.
+        id<MTLBuffer> sumBuffer = [GlobalGPUManager.metalDevice newBufferWithLength:sizeof(float)
+                                                                             options:MTLResourceStorageModeShared];
+        memset(sumBuffer.contents, 0, sizeof(float));
+
+        [commandEncoder setComputePipelineState:GlobalGPUManager.GaussianFillComputeState[typeCode]];
+        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        [commandEncoder setBuffer:sumBuffer offset:0 atIndex:1];
+        uint size = (uint)out.total_size;
+        [commandEncoder setBytes:&size length:sizeof(uint) atIndex:2];
+        [commandEncoder setBytes:&shape3 length:sizeof(simd_uint3) atIndex:3];
+        [commandEncoder setBytes:&strides3 length:sizeof(simd_uint3) atIndex:4];
+        [commandEncoder setBytes:&std_dev length:sizeof(float) atIndex:5];
+
+        auto dispatchSize = MTLSizeMake(size, 1, 1);
+        auto threadsPerGroup = MTLSizeMake((size < 256 ? size : 256), 1, 1);
+        [commandEncoder dispatchThreads:dispatchSize threadsPerThreadgroup:threadsPerGroup];
+
+        if (normalize) {
+            // Same encoder, same buffers: Metal's resource hazard tracking serializes this
+            // dispatch after the fill above, so it always sees the completed sum/fill - the
+            // same assumption every chained op in this graph already relies on.
+            if (!GlobalGPUManager.GaussianNormalizeInit[typeCode]) {
+                GlobalGPUManager.initGaussianNormalize(typeCode);
+            }
+            [commandEncoder setComputePipelineState:GlobalGPUManager.GaussianNormalizeComputeState[typeCode]];
+            [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+            [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
+            [commandEncoder setBuffer:sumBuffer offset:0 atIndex:2];
+            [commandEncoder dispatchThreads:dispatchSize threadsPerThreadgroup:threadsPerGroup];
+        }
+    };
+    output.tape = new GeneratorPrimitive(fill_gaussian, gpu_gen);
+    return output;
+}
+
+// Classic improved-Perlin (Ken Perlin, 2002), ported from the CPU reference in
+// MatrixH.mm's noise_texture(). grad()/fade()/lerp() all take the full x/y/z of the
+// sample point, so every axis of shapeI (up to 3) correlates identically - a 2D or 1D
+// output is a real fixed-z (or fixed-y,z) slice of one coherent 3D field, not a 1D
+// noise line reshaped into more dimensions.
+matrix matrix::perlin(std::initializer_list<size_m> shapeI, float scale, int octaves, float persistence, float lacunarity) {
+    matrix output((uint32_t)shapeI.size(), dtype::Float);
+    memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    // Same rationale as randint()/rand(): draw once at graph-build time so the CPU and
+    // GPU closures (only one of which ever fires) agree, and re-evaluating this node
+    // later (lazy eval) doesn't depend on unrelated rand() calls in between.
+    std::mt19937 seed_rng((uint32_t)std::rand());
+    std::uniform_real_distribution<float> seed_dist(0.0f, 1000.0f);
+    simd_float3 seed_offset = simd_make_float3(seed_dist(seed_rng), seed_dist(seed_rng), seed_dist(seed_rng));
+
+    auto fill_perlin_cpu = [scale, octaves, persistence, lacunarity, seed_offset](matrix& out) {
+        static constexpr int p[512] = {
+            151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,
+            8,99,37,240,21,10,23,190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,
+            35,11,32,57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,74,165,71,
+            134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,105,92,41,
+            55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,
+            18,169,200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,
+            250,124,123,5,202,38,147,118,126,255,82,85,212,207,206,59,227,47,16,58,17,182,
+            189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,153,101,155,167,43,
+            172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,
+            228,251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,
+            107,49,192,214,31,181,199,106,157,184,84,204,176,115,121,50,45,127,4,150,254,
+            138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180,
+            151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,
+            8,99,37,240,21,10,23,190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,
+            35,11,32,57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,74,165,71,
+            134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,105,92,41,
+            55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,
+            18,169,200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,
+            250,124,123,5,202,38,147,118,126,255,82,85,212,207,206,59,227,47,16,58,17,182,
+            189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,153,101,155,167,43,
+            172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,
+            228,251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,
+            107,49,192,214,31,181,199,106,157,184,84,204,176,115,121,50,45,127,4,150,254,
+            138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180
+        };
+        auto fade = [](float t) { return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f); };
+        auto lerp = [](float t, float a, float b) { return a + t * (b - a); };
+        auto grad = [](int hash, float x, float y, float z) {
+            int h = hash & 15;
+            float u = h < 8 ? x : y;
+            float v = h < 4 ? y : (h == 12 || h == 14 ? x : z);
+            return ((h & 1) == 0 ? u : -u) + ((h & 2) == 0 ? v : -v);
+        };
+        auto perlin3d = [&](float x, float y, float z) -> float {
+            int X = (int)std::floor(x) & 255;
+            int Y = (int)std::floor(y) & 255;
+            int Z = (int)std::floor(z) & 255;
+            x -= std::floor(x); y -= std::floor(y); z -= std::floor(z);
+            float u = fade(x), v = fade(y), w = fade(z);
+            int A = p[X] + Y, AA = p[A] + Z, AB = p[A + 1] + Z;
+            int B = p[X + 1] + Y, BA = p[B] + Z, BB = p[B + 1] + Z;
+            return lerp(w, lerp(v, lerp(u, grad(p[AA], x, y, z), grad(p[BA], x - 1, y, z)),
+                                    lerp(u, grad(p[AB], x, y - 1, z), grad(p[BB], x - 1, y - 1, z))),
+                           lerp(v, lerp(u, grad(p[AA + 1], x, y, z - 1), grad(p[BA + 1], x - 1, y, z - 1)),
+                                    lerp(u, grad(p[AB + 1], x, y - 1, z - 1), grad(p[BB + 1], x - 1, y - 1, z - 1))));
+        };
+        auto fbm = [&](float x, float y, float z) -> float {
+            float value = 0.0f, amplitude = 1.0f, frequency = 1.0f, max_value = 0.0f;
+            for (int o = 0; o < octaves; ++o) {
+                value += perlin3d(x * frequency, y * frequency, z * frequency) * amplitude;
+                max_value += amplitude;
+                amplitude *= persistence;
+                frequency *= lacunarity;
+            }
+            float noise_val = max_value > 0.0f ? value / max_value : 0.0f;
+            // perlin3d/fbm is signed, roughly in [-1, 1] - remap to [0, 1] for display,
+            // matching the original CPU reference in MatrixH.mm's noise_texture().
+            return std::max(0.0f, std::min(1.0f, noise_val * 0.5f + 0.5f));
+        };
+
+        float* buf = (float*)out.buffer;
+        if (out.dims == 1) {
+            for (size_m i = 0; i < out.shape()[0]; ++i) {
+                float x = (float(i) / float(out.shape()[0])) * scale + seed_offset.x;
+                buf[i] = fbm(x, seed_offset.y, seed_offset.z);
+            }
+        } else if (out.dims == 2) {
+            for (size_m i = 0; i < out.shape()[0]; ++i) {
+                float x = (float(i) / float(out.shape()[0])) * scale + seed_offset.x;
+                for (size_m j = 0; j < out.shape()[1]; ++j) {
+                    float y = (float(j) / float(out.shape()[1])) * scale + seed_offset.y;
+                    buf[i * out.strides()[0] + j] = fbm(x, y, seed_offset.z);
+                }
+            }
+        } else if (out.dims == 3) {
+            for (size_m i = 0; i < out.shape()[0]; ++i) {
+                float x = (float(i) / float(out.shape()[0])) * scale + seed_offset.x;
+                for (size_m j = 0; j < out.shape()[1]; ++j) {
+                    float y = (float(j) / float(out.shape()[1])) * scale + seed_offset.y;
+                    for (size_m k = 0; k < out.shape()[2]; ++k) {
+                        float z = (float(k) / float(out.shape()[2])) * scale + seed_offset.z;
+                        buf[i * out.strides()[0] + j * out.strides()[1] + k] = fbm(x, y, z);
+                    }
+                }
+            }
+        }
+    };
+
+    auto fill_perlin_gpu = [scale, octaves, persistence, lacunarity, seed_offset](matrix& out) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        if (!GlobalGPUManager.PerlinInit) {
+            GlobalGPUManager.initPerlin();
+        }
+
+        // Same padding trick as fill_gaussian_f32: unused trailing axes get shape=1/stride=0.
+        simd_uint3 shape3 = simd_make_uint3(
+            (uint32_t)out.shape()[0],
+            out.dims >= 2 ? (uint32_t)out.shape()[1] : 1,
+            out.dims >= 3 ? (uint32_t)out.shape()[2] : 1);
+        simd_uint3 strides3 = simd_make_uint3(
+            (uint32_t)out.strides()[0],
+            out.dims >= 2 ? (uint32_t)out.strides()[1] : 0,
+            out.dims >= 3 ? (uint32_t)out.strides()[2] : 0);
+
+        [commandEncoder setComputePipelineState:GlobalGPUManager.PerlinComputeState];
+        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        uint size = (uint)out.total_size;
+        [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
+        [commandEncoder setBytes:&shape3 length:sizeof(simd_uint3) atIndex:2];
+        [commandEncoder setBytes:&strides3 length:sizeof(simd_uint3) atIndex:3];
+        [commandEncoder setBytes:&scale length:sizeof(float) atIndex:4];
+        [commandEncoder setBytes:&seed_offset length:sizeof(simd_float3) atIndex:5];
+        int oct = octaves;
+        [commandEncoder setBytes:&oct length:sizeof(int) atIndex:6];
+        [commandEncoder setBytes:&persistence length:sizeof(float) atIndex:7];
+        [commandEncoder setBytes:&lacunarity length:sizeof(float) atIndex:8];
+
+        auto dispatchSize = MTLSizeMake(size, 1, 1);
+        auto threadsPerGroup = MTLSizeMake((size < 256 ? size : 256), 1, 1);
+        [commandEncoder dispatchThreads:dispatchSize threadsPerThreadgroup:threadsPerGroup];
+    };
+
+    output.tape = new GeneratorPrimitive(fill_perlin_cpu, fill_perlin_gpu);
+    return output;
+}
+
+matrix matrix::randint(int low, int high, std::initializer_list<size_m> shapeI, dtype type) {
+    matrix output((uint32_t)shapeI.size(), type);
+    memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    // Drawn once at graph-build time so both closures (only one of which ever fires) agree,
+    // and so re-running this node (e.g. a JIT-compiled graph resetting `evaluated`) is reproducible.
+    simd_uint2 key = simd_make_uint2((uint32_t)std::rand(), (uint32_t)std::rand());
+
+    auto cpu_gen = [low, high, key](matrix& out) {
+        // Seeded from the captured key, not the global std::rand() stream: eval() can fire an
+        // arbitrary amount of time after this node was built (lazy), so drawing from the shared,
+        // mutable global RNG here would make the output depend on unrelated rand() calls that
+        // happened to run in between, rather than on this node's own key.
+        std::mt19937 rng(key.x ^ (key.y * 0x9E3779B9u));
+        std::uniform_int_distribution<int> dist(low, high - 1);
+        dispatch_type(out.type, out.buffer, [&](auto* data) {
+            for (size_t i = 0; i < out.total_size; i++) {
+                data[i] = dist(rng);
+            }
+        });
+    };
+
+    auto gpu_gen = [low, high, key](matrix& out) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)out.type;
+        if (!GlobalGPUManager.RandintInit[typeCode]) {
+            GlobalGPUManager.initRandint(typeCode);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.RandintComputeState[typeCode]];
+        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        uint size = (uint)out.total_size;
+        [commandEncoder setBytes:&key length:sizeof(simd_uint2) atIndex:1];
+        [commandEncoder setBytes:&size length:sizeof(uint) atIndex:2];
+
+        int l = low;
+        uint32_t range = (uint32_t)(high - low);
+        [commandEncoder setBytes:&l length:sizeof(int) atIndex:3];
+        [commandEncoder setBytes:&range length:sizeof(uint32_t) atIndex:4];
+
+        uint threadCount = (size + 1) / 2;   // each thread fills 2 elements
+        auto dispatchSize = MTLSizeMake(threadCount, 1, 1);
+        auto threadsPerGroup = MTLSizeMake((threadCount < 256 ? threadCount : 256), 1, 1);
+        [commandEncoder dispatchThreads:dispatchSize threadsPerThreadgroup:threadsPerGroup];
+    };
+
+    output.tape = new GeneratorPrimitive(cpu_gen, gpu_gen);
+    return output;
+}
+
+matrix matrix::rand(std::initializer_list<size_m> shapeI, dtype type) {
+    matrix output((uint32_t)shapeI.size(), type);
+    memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    simd_uint2 key = simd_make_uint2((uint32_t)std::rand(), (uint32_t)std::rand());
+
+    auto cpu_gen = [key](matrix& out) {
+        // Same rationale as randint(): seed from the captured key, not the global rand() stream.
+        std::mt19937 rng(key.x ^ (key.y * 0x9E3779B9u));
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        dispatch_type(out.type, out.buffer, [&](auto* data) {
+            for (size_t i = 0; i < out.total_size; i++) {
+                data[i] = dist(rng);
+            }
+        });
+    };
+
+    auto gpu_gen = [key](matrix& out) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)out.type;
+        if (!GlobalGPUManager.RandInit[typeCode]) {
+            GlobalGPUManager.initRand(typeCode);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.RandComputeState[typeCode]];
+        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        uint size = (uint)out.total_size;
+        [commandEncoder setBytes:&key length:sizeof(simd_uint2) atIndex:1];
+        [commandEncoder setBytes:&size length:sizeof(uint) atIndex:2];
+
+        uint threadCount = (size + 1) / 2;   // each thread fills 2 elements
+        auto dispatchSize = MTLSizeMake(threadCount, 1, 1);
+        auto threadsPerGroup = MTLSizeMake((threadCount < 256 ? threadCount : 256), 1, 1);
+        [commandEncoder dispatchThreads:dispatchSize threadsPerThreadgroup:threadsPerGroup];
+    };
+
+    output.tape = new GeneratorPrimitive(cpu_gen, gpu_gen);
+    return output;
+}
+
+matrix matrix::randn(std::initializer_list<size_m> shapeI, dtype type) {
+    matrix output((uint32_t)shapeI.size(), type);
+    memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    simd_uint2 key = simd_make_uint2((uint32_t)std::rand(), (uint32_t)std::rand());
+
+    auto cpu_gen = [key](matrix& out) {
+        // Same rationale as randint(): seed from the captured key, not the global rand() stream.
+        std::mt19937 rng(key.x ^ (key.y * 0x9E3779B9u));
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        dispatch_type(out.type, out.buffer, [&](auto* data) {
+            for (size_t i = 0; i < out.total_size; i += 2) {
+                float u1 = dist(rng);
+                float u2 = dist(rng);
+                float z0 = std::sqrt(-2.0f * std::log(u1 + 1e-7f)) * std::cos(2.0f * (float)M_PI * u2);
+                data[i] = z0;
+                if (i + 1 < out.total_size) {
+                    float z1 = std::sqrt(-2.0f * std::log(u1 + 1e-7f)) * std::sin(2.0f * (float)M_PI * u2);
+                    data[i+1] = z1;
+                }
+            }
+        });
+    };
+
+    auto gpu_gen = [key](matrix& out) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)out.type;
+        if (!GlobalGPUManager.RandnInit[typeCode]) {
+            GlobalGPUManager.initRandn(typeCode);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.RandnComputeState[typeCode]];
+        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        uint size = (uint)out.total_size;
+        [commandEncoder setBytes:&key length:sizeof(simd_uint2) atIndex:1];
+        [commandEncoder setBytes:&size length:sizeof(uint) atIndex:2];
+
+        auto dispatchSize = MTLSizeMake(size, 1, 1);   // fill_normal: 1 output/thread
+        auto threadsPerGroup = MTLSizeMake((size < 256 ? size : 256), 1, 1);
+        [commandEncoder dispatchThreads:dispatchSize threadsPerThreadgroup:threadsPerGroup];
+    };
+
+    output.tape = new GeneratorPrimitive(cpu_gen, gpu_gen);
+    return output;
+}
+
 matrix matrix::eye(uint m, uint n, int k, dtype type ) {
     matrix output = matrix::zeros({ m, n }, type);
+    output.eval(); // zeros() is now lazy; need the zero-filled buffer materialized before writing the diagonal directly
     uint iteration = MIN(m, n-std::abs(k));
     dispatch_type(type, output.buffer, [&](auto *outBuff) {
         
@@ -1625,16 +2103,18 @@ matrix matrix::eye(uint m, uint n, int k, dtype type ) {
 
 matrix matrix::leaf(std::initializer_list<size_m> shape, dtype type) {
     matrix output = matrix::zeros(shape, type);
-    output.begin_refcount();
-    output.buildMetalBuffer();
+    output.eval(); // zeros() is now lazy; materialize (and refcount) the buffer before wrapping it as a leaf
+    if (!output.metalBuffer) output.buildMetalBuffer();
+    output.releaseTape(); // drop the GeneratorPrimitive tape before attaching LeafPrimitive
     output.tape = new LeafPrimitive(output);
     return output;
 }
 
 matrix matrix::leaf(const std::vector<size_m>& shape, dtype type) {
     matrix output = matrix::zeros(shape, type);
-    output.begin_refcount();
-    output.buildMetalBuffer();
+    output.eval();
+    if (!output.metalBuffer) output.buildMetalBuffer();
+    output.releaseTape();
     output.tape = new LeafPrimitive(output);
     return output;
 }
@@ -2984,12 +3464,14 @@ void matrix::stack(const std::vector<matrix>& mats, matrix& output, int axis, Ex
         for (int i = 0; i < mats.size(); i++) {
             View.buffer = mats[i].buffer;
             View.metalBuffer = mats[i].metalBuffer;
+            View.type = mats[i].type;
             copyGPUinplace(output, View, i * offset, Execution::Encode);
         }
     } else {
         for (int i = 0; i < mats.size(); i++) {
             View.buffer = mats[i].buffer;
             View.metalBuffer = mats[i].metalBuffer;
+            View.type = mats[i].type;
             copyCPUinplace(output, View, i * offset);
         }
     }
@@ -3041,6 +3523,7 @@ void matrix::concat(const std::vector<matrix>& mats, matrix& output, int axis, E
             View.total_size = mats[i].total_size;
             View.buffer = mats[i].buffer;
             View.metalBuffer = mats[i].metalBuffer;
+            View.type = mats[i].type;
             output.shape()[axis] = View.shape()[axis];
             output.total_size = View.total_size;
             copyGPUinplace(output, View, offset, Execution::Encode);
@@ -3052,6 +3535,7 @@ void matrix::concat(const std::vector<matrix>& mats, matrix& output, int axis, E
             View.total_size = mats[i].total_size;
             View.buffer = mats[i].buffer;
             View.metalBuffer = mats[i].metalBuffer;
+            View.type = mats[i].type;
             output.shape()[axis] = View.shape()[axis];
             output.total_size = View.total_size;
             copyCPUinplace(output, View, offset);
@@ -4647,9 +5131,12 @@ void matrix::dot_gpu(matrix& b_transposed, matrix& result) {
     auto _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
     
     // Bind Buffers
-    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
-    [commandEncoder setBuffer:this->metalBuffer offset:0 atIndex:1];
-    [commandEncoder setBuffer:b_transposed.metalBuffer offset:0 atIndex:2];
+//    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+//    [commandEncoder setBuffer:this->metalBuffer offset:0 atIndex:1];
+//    [commandEncoder setBuffer:b_transposed.metalBuffer offset:0 atIndex:2];
+    setBufferOrBytes(commandEncoder, result, 0);
+    setBufferOrBytes(commandEncoder, *this, 1);
+    setBufferOrBytes(commandEncoder, b_transposed, 2);
     
     // Bind Shapes
     [commandEncoder setBytes:this->shape() length:this->dims * sizeof(size_m) atIndex:3];
@@ -5842,6 +6329,8 @@ void matrix::eval() {
 
 void matrix::eval_cpu() {
     if (tape) tape->eval_cpu(*this, EvalType::EVAL_INSTANTLY);
+    update_from_trace();
+
 }
 void matrix::eval_metal() {
     if (!tape) return;
@@ -5851,6 +6340,8 @@ void matrix::eval_metal() {
     }
     id<MTLCommandBuffer> oldBuffer = GlobalGPUManager._thread_gCommandBuffer ? GlobalGPUManager.getCommandBuffer() : nullptr;
     tape->eval_metal(*this, EvalType::EVAL_INSTANTLY);
+    update_from_trace();
+
     
     if (GlobalGPUManager._thread_gCommandBuffer && oldBuffer == nullptr) {
         GlobalGPUManager.endCommandEncoding();
@@ -10777,4 +11268,170 @@ void matrix::cross_gpu_brodcasted(matrix &other, matrix &result) {
     if (threadsPerGrid > 0) {
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
     }
+}
+
+matrix matrix::argmax(int axis, bool keepdims) const {
+    if (dims == 0) {
+        return matrix::zeros({}, dtype::Int32);
+    }
+    int outputDims = keepdims ? dims : dims - 1;
+    matrix output(outputDims, dtype::Int32);
+    
+    if (axis < 0) axis += dims;
+    
+    if (keepdims) {
+        memcpy(output.shape(), shape(), output.dims * sizeof(size_m));
+        output.shape()[axis] = 1;
+    } else {
+        if (axis > 0) {
+            memcpy(output.shape(), shape(), axis * sizeof(size_m));
+        }
+        if (axis < dims - 1) {
+            memcpy(output.shape() + axis, shape() + axis + 1, (output.dims - axis) * sizeof(size_m));
+        }
+    }
+    
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+    
+    ArgMaxPrimitive* prim = new ArgMaxPrimitive(const_cast<matrix&>(*this), axis, keepdims);
+    prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, false, !keepdims, UINT32_MAX);
+    prim->has_collapsed_dims = true;
+    output.tape = prim;
+    
+    return output;
+}
+
+void matrix::argmax(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device) const {
+    size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
+    size_m noOfOpp = shape()[axis];
+    
+    ArgMaxPrimitive* primit = static_cast<ArgMaxPrimitive*>(output.tape);
+    
+    CollapsedDims_2 collapsed;
+    uint32_t cdims;
+    if (primit->has_collapsed_dims) {
+        collapsed = primit->collapsed_dims;
+        cdims = collapsed.out_dims;
+    } else {
+        cdims = 1;
+        collapsed.stridesA[0] = 1;
+        collapsed.stridesB[0] = 1;
+        collapsed.shape[0] = 1;
+    }
+    
+    if (cdims == 0) {
+        cdims = 1;
+        collapsed.stridesA[0] = 1;
+        collapsed.stridesB[0] = 1;
+        collapsed.shape[0] = 1;
+    }
+
+    dispatch_type(type, buffer, [&](auto *in_data) {
+        using T = std::decay_t<decltype(*in_data)>;
+        int32_t* out_data = (int32_t*)output.buffer;
+        size_t total_out = output.total_size;
+        
+        for (size_t gid = 0; gid < total_out; gid++) {
+            size_t AxisOffset = 0;
+            size_t remaining = gid;
+            for (size_t i = 0; i < cdims; i++) {
+                AxisOffset += (remaining / collapsed.stridesA[i]) * collapsed.stridesB[i];
+                remaining %= collapsed.stridesA[i];
+            }
+            T current_max = std::numeric_limits<T>::lowest();
+            int32_t current_argmax = 0;
+            for (size_t i = 0; i < noOfOpp; i++) {
+                T val = in_data[AxisOffset + i * reduce_axis_stride];
+                if (val > current_max) {
+                    current_max = val;
+                    current_argmax = (int32_t)i;
+                }
+            }
+            out_data[gid] = current_argmax;
+        }
+    });
+}
+
+matrix matrix::argmin(int axis, bool keepdims) const {
+    if (dims == 0) {
+        return matrix::zeros({}, dtype::Int32);
+    }
+    int outputDims = keepdims ? dims : dims - 1;
+    matrix output(outputDims, dtype::Int32);
+    
+    if (axis < 0) axis += dims;
+    
+    if (keepdims) {
+        memcpy(output.shape(), shape(), output.dims * sizeof(size_m));
+        output.shape()[axis] = 1;
+    } else {
+        if (axis > 0) {
+            memcpy(output.shape(), shape(), axis * sizeof(size_m));
+        }
+        if (axis < dims - 1) {
+            memcpy(output.shape() + axis, shape() + axis + 1, (output.dims - axis) * sizeof(size_m));
+        }
+    }
+    
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+    
+    ArgMinPrimitive* prim = new ArgMinPrimitive(const_cast<matrix&>(*this), axis, keepdims);
+    prim->collapsed_dims = collapse_dims_reduce(shape(), output.strides(), strides(), dims, axis, false, !keepdims, UINT32_MAX);
+    prim->has_collapsed_dims = true;
+    output.tape = prim;
+    
+    return output;
+}
+
+void matrix::argmin(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device) const {
+    size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
+    size_m noOfOpp = shape()[axis];
+    
+    ArgMinPrimitive* primit = static_cast<ArgMinPrimitive*>(output.tape);
+    
+    CollapsedDims_2 collapsed;
+    uint32_t cdims;
+    if (primit->has_collapsed_dims) {
+        collapsed = primit->collapsed_dims;
+        cdims = collapsed.out_dims;
+    } else {
+        cdims = 1;
+        collapsed.stridesA[0] = 1;
+        collapsed.stridesB[0] = 1;
+        collapsed.shape[0] = 1;
+    }
+    
+    if (cdims == 0) {
+        cdims = 1;
+        collapsed.stridesA[0] = 1;
+        collapsed.stridesB[0] = 1;
+        collapsed.shape[0] = 1;
+    }
+
+    dispatch_type(type, buffer, [&](auto *in_data) {
+        using T = std::decay_t<decltype(*in_data)>;
+        int32_t* out_data = (int32_t*)output.buffer;
+        size_t total_out = output.total_size;
+        
+        for (size_t gid = 0; gid < total_out; gid++) {
+            size_t AxisOffset = 0;
+            size_t remaining = gid;
+            for (size_t i = 0; i < cdims; i++) {
+                AxisOffset += (remaining / collapsed.stridesA[i]) * collapsed.stridesB[i];
+                remaining %= collapsed.stridesA[i];
+            }
+            T current_min = std::numeric_limits<T>::max();
+            int32_t current_argmin = 0;
+            for (size_t i = 0; i < noOfOpp; i++) {
+                T val = in_data[AxisOffset + i * reduce_axis_stride];
+                if (val < current_min) {
+                    current_min = val;
+                    current_argmin = (int32_t)i;
+                }
+            }
+            out_data[gid] = current_argmin;
+        }
+    });
 }

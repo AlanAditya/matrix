@@ -63,3 +63,4 @@ template <typename T>
 
 INSTANTIATE_TAKE_ND(0, float)
 INSTANTIATE_TAKE_ND(1, half)
+INSTANTIATE_TAKE_ND(2, uint8_t)

@@ -3022,7 +3022,7 @@ public:
         // outer input gives its buffer to leading node
         outer_input.shareBuffer(sample_parameter);
         // out gives its buffer to the last node of comiled graph
-        
+
         matrix* owning_node = &output_graph;
         while (owning_node->tape) {
             matrix* borrowed = owning_node->tape->get_borrowed_input();
@@ -3032,7 +3032,7 @@ public:
                 break;
             }
         }
-        
+
         if (owning_node->tape && typeid(*owning_node->tape) != typeid(SwapLeafPrimitive) && owning_node->buffer != sample_parameter.buffer) {
             out.shareBuffer(*owning_node);
         } else {
@@ -4381,7 +4381,6 @@ public:
             axes[grad_out.dims - 1] = grad_out.dims - 2;
         }
         matrix grad_b = grad_out.transpose(axes).dot(a, false);
-        
         return {grad_a.unbroadcast_shape(a.shape(), a.dims), grad_b.unbroadcast_shape(b_transposed.shape(), b_transposed.dims)};
     }
 
@@ -4919,8 +4918,273 @@ public:
     }
     
     matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
-    
+
     std::vector<matrix> get_inputs() override {
         return {};
     }
 };
+
+// Backs every data-free factory (zeros, ones, gaussian, rand, randn, randint, ...).
+// One shared Primitive parameterised by a CPU closure and a GPU closure, rather than a
+// subclass per generator, since the shape of the work (allocate output, fill it, done) never
+// changes across generators. A generator is a leaf: it has no input matrices, so vjp/jvp/
+// get_inputs are all empty/zero and invalidate_pass can never be dirtied from below.
+class GeneratorPrimitive : public Primitive {
+public:
+    std::function<void(matrix&)> cpu_gen;
+    std::function<void(matrix&)> gpu_gen;
+
+    GeneratorPrimitive(std::function<void(matrix&)> cpu_gen, std::function<void(matrix&)> gpu_gen)
+        : cpu_gen(std::move(cpu_gen)), gpu_gen(std::move(gpu_gen)) {}
+
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+                
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) { return; } else { evaluated = true; }
+        cpu_gen(out);
+    }
+
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) { return; } else { evaluated = true; }
+        gpu_gen(out);
+    }
+
+    // A generator has no inputs, so there is nothing for a gradient to flow into.
+    std::vector<matrix> vjp(matrix& grad_out) override { return {}; }
+    // Constant w.r.t. every variable: contributes zero to any total derivative it's summed into.
+    matrix jvp(std::vector<matrix>& tangents) override { return matrix::scalar(0.0f); }
+
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+        // Leaf: nothing upstream can ever mark this dirty.
+        return false;
+    }
+
+    void clear_trace_checks() override {
+        evaluated = false;
+    }
+
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+
+    std::vector<matrix> get_inputs() override {
+        return {};
+    }
+};
+
+class ArgMaxPrimitive : public Primitive {
+public:
+    matrix input;
+    int axis;
+    bool keepdims;
+    
+    CollapsedDims_2 collapsed_dims;
+    bool has_collapsed_dims = false;
+
+    ArgMaxPrimitive(matrix& input_mat, int input_axis, bool input_keepdims) 
+        : input(input_mat), axis(input_axis), keepdims(input_keepdims) {}
+
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); };
+        input.update_from_trace();
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) {return;}
+        if (evaluated) {return;} else {evaluated = true;}
+        input.argmax(out, axis, keepdims, ExecutionDevice::CPU);
+    }
+
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
+        input.update_from_trace();
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) {return;}
+        if (evaluated) {return;} else {evaluated = true;}
+        input.argmax(out, axis, keepdims, ExecutionDevice::CPU); // Fallback to CPU
+    }
+    std::vector<matrix> vjp(matrix& grad_out) override { return {}; }
+    matrix jvp(std::vector<matrix>& tangents) override { return matrix(0, dtype::UInt8); }
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (input.tape) {input.tape->clear_trace_checks(); }
+    };
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override {
+        return {input};
+    }
+};
+
+class ArgMinPrimitive : public Primitive {
+public:
+    matrix input;
+    int axis;
+    bool keepdims;
+    
+    CollapsedDims_2 collapsed_dims;
+    bool has_collapsed_dims = false;
+
+    ArgMinPrimitive(matrix& input_mat, int input_axis, bool input_keepdims) 
+        : input(input_mat), axis(input_axis), keepdims(input_keepdims) {}
+
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); };
+        input.update_from_trace();
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) {return;}
+        if (evaluated) {return;} else {evaluated = true;}
+        input.argmin(out, axis, keepdims, ExecutionDevice::CPU);
+    }
+
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
+        input.update_from_trace();
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) {return;}
+        if (evaluated) {return;} else {evaluated = true;}
+        input.argmin(out, axis, keepdims, ExecutionDevice::CPU); // Fallback to CPU
+    }
+    std::vector<matrix> vjp(matrix& grad_out) override { return {}; }
+    matrix jvp(std::vector<matrix>& tangents) override { return matrix(0, dtype::UInt8); }
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (input.tape) {input.tape->clear_trace_checks(); }
+    };
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override {
+        return {input};
+    }
+};
+

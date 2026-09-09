@@ -101,12 +101,12 @@ constexpr size_t dtype_size(dtype d) {
 //                    Float  Float16  UInt8  Int32  Int16  UInt32  UInt16
 constexpr dtype type_rules[7][7] = {
 /*Float  */ { dtype::Float,  dtype::Float,   dtype::Float,  dtype::Float,   dtype::Float,  dtype::Float,   dtype::Float  },
-/*Float16*/ { dtype::Float,  dtype::Float16, dtype::Float16,dtype::Float16, dtype::Float16,dtype::Float16, dtype::Float16},
-/*UInt8  */ { dtype::Float,  dtype::Float16, dtype::UInt8,  dtype::Int32,   dtype::Int16,  dtype::UInt32,  dtype::UInt16 },
-/*Int32  */ { dtype::Float,  dtype::Float16, dtype::Int32,  dtype::Int32,   dtype::Int32,  dtype::Int32,   dtype::Int32  },
-/*Int16  */ { dtype::Float,  dtype::Float16, dtype::Int16,  dtype::Int32,   dtype::Int16,  dtype::Int32,   dtype::Int32  },
-/*UInt32 */ { dtype::Float,  dtype::Float16, dtype::UInt32, dtype::Int32,   dtype::Int32,  dtype::UInt32,  dtype::UInt32 },
-/*UInt16 */ { dtype::Float,  dtype::Float16, dtype::UInt16, dtype::Int32,   dtype::Int32,  dtype::UInt32,  dtype::UInt16 },
+/*Float16*/ { dtype::Float,  dtype::Float16, dtype::Float,  dtype::Float,   dtype::Float,  dtype::Float,   dtype::Float  },
+/*UInt8  */ { dtype::Float,  dtype::Float,   dtype::UInt8,  dtype::Int32,   dtype::Int16,  dtype::UInt32,  dtype::UInt16 },
+/*Int32  */ { dtype::Float,  dtype::Float,   dtype::Int32,  dtype::Int32,   dtype::Int32,  dtype::Int32,   dtype::Int32  },
+/*Int16  */ { dtype::Float,  dtype::Float,   dtype::Int16,  dtype::Int32,   dtype::Int16,  dtype::Int32,   dtype::Int32  },
+/*UInt32 */ { dtype::Float,  dtype::Float,   dtype::UInt32, dtype::Int32,   dtype::Int32,  dtype::UInt32,  dtype::UInt32 },
+/*UInt16 */ { dtype::Float,  dtype::Float,   dtype::UInt16, dtype::Int32,   dtype::Int32,  dtype::UInt32,  dtype::UInt16 },
 };
 
 dtype promote_types(dtype a, dtype b);
@@ -196,7 +196,7 @@ inline void dispatch_type(dtype type, void *buffer, Func &&function_to_run) {
             function_to_run(static_cast<float *>(buffer));
             break;
         case dtype::Float16:
-            function_to_run(static_cast<uint16_t *>(buffer));
+            function_to_run(static_cast<float16_t *>(buffer));
             break;
         case dtype::Int32:
             function_to_run(static_cast<int32_t *>(buffer));
@@ -522,103 +522,162 @@ public:
     
     friend void setBufferOrBytes(id<MTLComputeCommandEncoder> commandEncoder, const matrix &tensor, NSUInteger index);
     
-    static matrix zeros(std::initializer_list<size_m> shapeI, dtype type = dtype::Float) {
+    // Lazy generators: no data/GPU work happens here. Each attaches a GeneratorPrimitive
+    // (defined in primitives.cpp, not visible from this header) as its tape, so the buffer
+    // is only allocated and filled on the first .eval()/.eval_cpu()/.eval_metal(). Defined
+    // out-of-line in Matrix.mm, the file that includes primitives.cpp.
+    static matrix zeros(std::initializer_list<size_m> shapeI, dtype type = dtype::Float);
+    static matrix zeros(const std::vector<size_m>& shapeI, dtype type = dtype::Float);
+
+    static matrix ones(std::initializer_list<size_m> shapeI, dtype type = dtype::Float);
+
+    static matrix gaussian(std::initializer_list<size_m> shapeI, float std_dev = 1.0f, bool normalize = true, dtype type = dtype::Float);
+
+    // Classic improved-Perlin (Ken Perlin, 2002): every axis of shapeI (up to 3) is a real
+    // spatial axis of one coherent noise field, so cells correlate along every axis the same
+    // way - not a 1D noise field reshaped into more dimensions. `scale` is how many lattice
+    // cells span each axis; `octaves`/`persistence`/`lacunarity` layer in fractal (fBm) detail.
+    // Always Float output (like gaussian()) - there's only an f32 GPU kernel, so a type
+    // parameter here would let eval_metal() write raw float bits into a differently-typed buffer.
+    static matrix perlin(std::initializer_list<size_m> shapeI, float scale = 5.0f, int octaves = 1, float persistence = 0.5f, float lacunarity = 2.0f);
+
+    static matrix randint(int low, int high, std::initializer_list<size_m> shapeI, dtype type = dtype::Int32);
+
+    // LEGACY: PCG-based backend, for benchmarking against randint() (Threefry). Phase out next iteration.
+    static matrix randint_legacy(int low, int high, std::initializer_list<size_m> shapeI, dtype type = dtype::Int32) {
         matrix output((uint32_t)shapeI.size(), type);
         memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
         output.calcStrides();
         output.total_size = output.accumul(0, output.dims);
         output.buffer = new uint8_t[output.total_size * dtype_size(type)];
+
+        uint32_t seed = (uint32_t)std::rand();
+
         if (output.total_size > 10) {
             output.buildMetalBuffer();
-        }
-        memset(output.buffer, 0, output.total_size * dtype_size(type));
-        return output;
-    }
-    static matrix zeros(const std::vector<size_m>& shapeI, dtype type = dtype::Float) {
-        matrix output((uint32_t)shapeI.size(), type);
-        memcpy(output.shape(), shapeI.data(), output.dims * sizeof(size_m));
-        output.calcStrides();
-        output.total_size = output.accumul(0, output.dims);
-        output.buffer = new uint8_t[output.total_size * dtype_size(type)];
-        if (output.total_size > 10) {
-            output.buildMetalBuffer();
-        }
-        memset(output.buffer, 0, output.total_size * dtype_size(type));
-        return output;
-    }
-    
-    static matrix ones(std::initializer_list<size_m> shapeI, dtype type = dtype::Float) {
-        matrix output((uint32_t)shapeI.size(), type);
-        memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
-        output.calcStrides();
-        output.total_size = output.accumul(0, output.dims);
-        output.buffer = new uint8_t[output.total_size * dtype_size(type)];
-        if (output.total_size > 10) {
-            output.buildMetalBuffer();
-        }
-        dispatch_type(type, output.buffer, [&](auto* data) {
-            std::fill(data, data + output.total_size, static_cast<std::decay_t<decltype(*data)>>(1));
-        });
-        return output;
-    }
-    
-    static matrix gaussian(std::initializer_list<size_m> shapeI, float std_dev = 1.0f, bool normalize = true) {
-        matrix output((uint32_t)shapeI.size(), dtype::Float);
-        memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
-        output.calcStrides();
-        output.total_size = output.accumul(0, output.dims);
-        output.buffer = new uint8_t[output.total_size * dtype_size(dtype::Float)];
-        float* buf = (float*)output.buffer;
-        float sum = 0.0f;
-        
-        if (output.dims == 1) {
-            float c0 = (output.shape()[0] - 1) / 2.0f;
-            for (size_m i = 0; i < output.shape()[0]; ++i) {
-                float dx = i - c0;
-                float val = std::exp(-(dx*dx) / (2 * std_dev * std_dev));
-                buf[i] = val;
-                sum += val;
+            id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+            id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getNewCommandEncoder();
+            int typeCode = (int)type;
+            uint size = output.total_size;
+            if (!GlobalGPUManager.RandintInit_Legacy[typeCode]) {
+                GlobalGPUManager.initRandint_Legacy(typeCode);
             }
-        } else if (output.dims == 2) {
-            float c0 = (output.shape()[0] - 1) / 2.0f;
-            float c1 = (output.shape()[1] - 1) / 2.0f;
-            for (size_m i = 0; i < output.shape()[0]; ++i) {
-                for (size_m j = 0; j < output.shape()[1]; ++j) {
-                    float dx = i - c0;
-                    float dy = j - c1;
-                    float val = std::exp(-(dx*dx + dy*dy) / (2 * std_dev * std_dev));
-                    buf[i * output.strides()[0] + j] = val;
-                    sum += val;
+            [commandEncoder setComputePipelineState:GlobalGPUManager.RandintComputeState_Legacy[typeCode]];
+            [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+            [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
+            [commandEncoder setBytes:&seed length:sizeof(uint) atIndex:2];
+
+            int l = low; int h = high;
+            [commandEncoder setBytes:&l length:sizeof(int) atIndex:3];
+            [commandEncoder setBytes:&h length:sizeof(int) atIndex:4];
+
+            auto _dispatchExecutionSize = MTLSizeMake(size, 1, 1);
+            auto _threadsPerThreadgroup = MTLSizeMake((size < 256 ? size : 256), 1, 1);
+            [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+            GlobalGPUManager.endCommandEncoding();
+            GlobalGPUManager.commitCommandBuffer();
+            [commandBuffer waitUntilCompleted];
+            GlobalGPUManager.setCommandBuffer(nil);
+        } else {
+            dispatch_type(type, output.buffer, [&](auto* data) {
+                for (size_t i = 0; i < output.total_size; i++) {
+                    data[i] = low + (std::rand() % (high - low));
                 }
+            });
+        }
+        return output;
+    }
+
+    static matrix rand(std::initializer_list<size_m> shapeI, dtype type = dtype::Float);
+
+    // LEGACY: PCG-based backend, for benchmarking against rand() (Threefry). Phase out next iteration.
+    static matrix rand_legacy(std::initializer_list<size_m> shapeI, dtype type = dtype::Float) {
+        matrix output((uint32_t)shapeI.size(), type);
+        memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+        output.calcStrides();
+        output.total_size = output.accumul(0, output.dims);
+        output.buffer = new uint8_t[output.total_size * dtype_size(type)];
+
+        uint32_t seed = (uint32_t)std::rand();
+
+        if (output.total_size > 10) {
+            output.buildMetalBuffer();
+            id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+            id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getNewCommandEncoder();
+            int typeCode = (int)type;
+            uint size = output.total_size;
+            if (!GlobalGPUManager.RandInit_Legacy[typeCode]) {
+                GlobalGPUManager.initRand_Legacy(typeCode);
             }
-        } else if (output.dims == 3) {
-            float c0 = (output.shape()[0] - 1) / 2.0f;
-            float c1 = (output.shape()[1] - 1) / 2.0f;
-            float c2 = (output.shape()[2] - 1) / 2.0f;
-            for (size_m i = 0; i < output.shape()[0]; ++i) {
-                for (size_m j = 0; j < output.shape()[1]; ++j) {
-                    for (size_m k = 0; k < output.shape()[2]; ++k) {
-                        float dx = i - c0;
-                        float dy = j - c1;
-                        float dz = k - c2;
-                        float val = std::exp(-(dx*dx + dy*dy + dz*dz) / (2 * std_dev * std_dev));
-                        buf[i * output.strides()[0] + j * output.strides()[1] + k] = val;
-                        sum += val;
+            [commandEncoder setComputePipelineState:GlobalGPUManager.RandComputeState_Legacy[typeCode]];
+            [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+            [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
+            [commandEncoder setBytes:&seed length:sizeof(uint) atIndex:2];
+
+            auto _dispatchExecutionSize = MTLSizeMake(size, 1, 1);
+            auto _threadsPerThreadgroup = MTLSizeMake((size < 256 ? size : 256), 1, 1);
+            [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+            GlobalGPUManager.endCommandEncoding();
+            GlobalGPUManager.commitCommandBuffer();
+            [commandBuffer waitUntilCompleted];
+            GlobalGPUManager.setCommandBuffer(nil);
+        } else {
+            dispatch_type(type, output.buffer, [&](auto* data) {
+                for (size_t i = 0; i < output.total_size; i++) {
+                    data[i] = (float)std::rand() / RAND_MAX;
+                }
+            });
+        }
+        return output;
+    }
+
+    static matrix randn(std::initializer_list<size_m> shapeI, dtype type = dtype::Float);
+
+    // LEGACY: PCG-based backend, for benchmarking against randn() (Threefry). Phase out next iteration.
+    static matrix randn_legacy(std::initializer_list<size_m> shapeI, dtype type = dtype::Float) {
+        matrix output((uint32_t)shapeI.size(), type);
+        memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
+        output.calcStrides();
+        output.total_size = output.accumul(0, output.dims);
+        output.buffer = new uint8_t[output.total_size * dtype_size(type)];
+
+        uint32_t seed = (uint32_t)std::rand();
+
+        if (output.total_size > 10) {
+            output.buildMetalBuffer();
+            id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+            id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getNewCommandEncoder();
+            int typeCode = (int)type;
+            uint size = output.total_size;
+            if (!GlobalGPUManager.RandnInit_Legacy[typeCode]) {
+                GlobalGPUManager.initRandn_Legacy(typeCode);
+            }
+            [commandEncoder setComputePipelineState:GlobalGPUManager.RandnComputeState_Legacy[typeCode]];
+            [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+            [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
+            [commandEncoder setBytes:&seed length:sizeof(uint) atIndex:2];
+
+            auto _dispatchExecutionSize = MTLSizeMake(size, 1, 1);
+            auto _threadsPerThreadgroup = MTLSizeMake((size < 256 ? size : 256), 1, 1);
+            [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+            GlobalGPUManager.endCommandEncoding();
+            GlobalGPUManager.commitCommandBuffer();
+            [commandBuffer waitUntilCompleted];
+            GlobalGPUManager.setCommandBuffer(nil);
+        } else {
+            dispatch_type(type, output.buffer, [&](auto* data) {
+                for (size_t i = 0; i < output.total_size; i += 2) {
+                    float u1 = (float)std::rand() / RAND_MAX;
+                    float u2 = (float)std::rand() / RAND_MAX;
+                    float z0 = std::sqrt(-2.0f * std::log(u1 + 1e-7f)) * std::cos(2.0f * (float)M_PI * u2);
+                    data[i] = z0;
+                    if (i + 1 < output.total_size) {
+                        float z1 = std::sqrt(-2.0f * std::log(u1 + 1e-7f)) * std::sin(2.0f * (float)M_PI * u2);
+                        data[i+1] = z1;
                     }
                 }
-            }
+            });
         }
-        
-        if (normalize && sum > 0.0f) {
-            for (size_t i = 0; i < output.total_size; ++i) {
-                buf[i] /= sum;
-            }
-        }
-        
-        if (output.total_size > 10) {
-            output.buildMetalBuffer();
-        }
-        
         return output;
     }
 
@@ -839,6 +898,11 @@ public:
     matrix rms(int axis, bool keepdims = false) const;
     matrix rms(int start, int end = -1, bool keepdims = false) const;
     matrix rms() const; // global rms
+
+    matrix argmax(int axis, bool keepdims = false) const;
+    void argmax(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device = ExecutionDevice::AUTO) const;
+    matrix argmin(int axis, bool keepdims = false) const;
+    void argmin(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device = ExecutionDevice::AUTO) const;
 
     matrix max(int axis, bool keepdims = false) const;
     void max(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device = ExecutionDevice::AUTO);

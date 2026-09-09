@@ -48,6 +48,72 @@ When actively writing the code for a new operation, follow this 5-step implement
 
 ---
 
+## 2.5 Worked Examples: Legacy vs. Modern Pattern Compliance
+
+The 5-step pipeline above is the target architecture, but the codebase currently has two styles living side by side. **New ops should be written in the Modern style (Sin/Cos), not copied from the Legacy style (Addition/Subtraction/Multiply/Divide)**, even though the legacy ops are correct and shipped. The broadcasted arithmetic ops are on the list to be ported to the modern pattern eventually — low priority since they work, but do not use them as a template.
+
+### Legacy pattern (Addition, Subtraction, Multiply, Divide) — do not imitate
+
+`operator+` (`Matrix.mm`) builds the graph node correctly (promote dtypes, allocate empty result, `new AdditionPrimitive(lhs, rhs)`, compute `BroadcastDescriptor`s via `broadcast_shapes`, `collapse_dims` into `collapsed_dims_3`, attach `result.tape`). So far this matches Phase 1/2.
+
+The violation is in Phase 3. `matrix::add_cpu_brodcasted` / `matrix::add_gpu_brodcasted` are **dual-purpose**: called with `EvalType::EVAL_AUTO` they re-do the exact same graph-building work as `operator+` (allocate a *second* `AdditionPrimitive`, recompute `BroadcastDescriptor`s and `collapse_dims`), and called with any other `EvalType` they become the actual backend executor, pulling `collapsed_dims_3` off `result.tape` and running the compute loop. One function is simultaneously a frontend graph-builder and a backend executor selected by a runtime flag, which is exactly what the Phase-1/Phase-3 split above is meant to prevent — a backend function must not take `EvalType` or duplicate graph-building logic. This is legacy debt from before the phase separation existed; the ops still work correctly and are exercised in production, they're just structurally tangled and are lower priority to unwind since correctness isn't at stake.
+
+### Modern pattern (Sin, Cos, Tan, Sqrt, Exp, ...) — copy this structure for new ops
+
+`matrix::sin(const matrix& input)` (static, `Matrix.mm`) is **pure Phase 1**: promotes dtype, allocates the empty `output` node, runs `collapse_dims` once and caches it on `SinPrimitive::collapsed_dims`, sets `output.tape`, returns. It takes no `EvalType`/`ExecutionDevice` — it cannot execute anything, only build graph.
+
+`SinPrimitive` (`primitives.cpp`) is **pure Phase 2**: `eval_cpu`/`eval_metal` do the standard allocate-or-adopt-`out_buffer` dance, bail on `COMPILE_TRACE`, guard on `evaluated`, then delegate to `input.sin(out, ExecutionDevice::CPU/METAL)`. `vjp` is a one-liner (`{ grad_out * matrix::cos(input) }`) — gradients are just more graph nodes, never raw buffer math.
+
+`matrix::sin(matrix& output, ExecutionDevice exec_device)` (instance method, `Matrix.mm`) is **pure Phase 3**: takes only `ExecutionDevice`, never `EvalType`. It downcasts `output.tape` to `SinPrimitive*` to read the cached `collapsed_dims` (never recomputes it), and branches internally on `exec_device` to either encode a Metal dispatch (lazily compiling the pipeline state via `GlobalGPUManager.initSin_nd(typeCode, kernel_code)` on first use) or run the `dispatch_type` CPU loop. One function, one job, clean separation — this is the shape every new op should take.
+
+### 2.6 The `eval_cpu`/`eval_metal` Body Structure (the "allocate-or-adopt" dance)
+
+Every real primitive's `eval_cpu(matrix& out, EvalType eval_type)` follows the same fixed structure, in this order. Understanding *why* each step exists matters more than copying the shape:
+
+1. **Recurse into each input, then unconditionally re-sync it:**
+   ```cpp
+   if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); }
+   input.update_from_trace();
+   ```
+   The `!evaluated` guard exists purely to stop recomputation when a tape is shared by multiple parents (a diamond dependency / shared subexpression) — the first parent to reach it does the real work and flips `evaluated = true`; every later parent must skip re-running the compute. But the guard also skips the *entire* function call when it's false, including whatever buffer-adoption logic lives inside it (step 2 below). Since `input` here is frequently a distinct `matrix` object per parent (its own copy from `ensure_graph_ready`) rather than the exact instance that did the computing, its own `buffer` field can still be null even though `input.tape->out_buffer` is already valid. `update_from_trace()` is called *unconditionally*, outside the guard, specifically to un-stale this instance regardless of whether the guarded call actually ran. This is not optional boilerplate — skip it and shared-subexpression graphs silently read null/stale buffers.
+
+2. **Adopt-or-allocate the output buffer**, unconditionally, before checking `evaluated`:
+   ```cpp
+   if (!out.buffer) {
+       if (out.tape->out_buffer) {
+           // adopt: another matrix instance sharing this tape already allocated
+           out.buffer = out.tape->out_buffer;
+           out.metalBuffer = out.tape->out_metal_buffer;
+           out.refCount = out.tape->out_refcount;
+           out.refCount->fetch_add(1);
+       } else {
+           // allocate fresh, and publish into the tape's cache for siblings to adopt later
+           out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+           out.begin_refcount();
+           out.buildMetalBuffer();
+           out.tape->out_buffer = (uint8_t*)out.buffer;
+           out.tape->out_metal_buffer = out.metalBuffer;
+           out.tape->out_refcount = out.refCount;
+           out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+       }
+   }
+   ```
+   This block is why `matrix::eval_cpu()`'s own trailing `update_from_trace()` call is a no-op for most primitives when called at the top level (no `!evaluated` guard sits above the root call, so this block always runs) — it only matters at the root for primitive types that skip this block entirely (`LeafPrimitive`, `SwapLeafPrimitive`), or after a `SwapLeafPrimitive` hot-swap leaves a stale pointer behind.
+
+   **Current known issue (planned fix, not yet done):** the "allocate fresh" branch unconditionally calls `out.buildMetalBuffer()`, i.e. every primitive currently creates a Metal buffer even for a pure CPU-only `eval_cpu()` call that will never touch the GPU. This is wasteful and will be changed in a future commit so Metal buffer creation is lazy/only-when-needed rather than mandatory on every primitive.
+
+3. **Bail early for `COMPILE_TRACE`:** `if (eval_type == EvalType::COMPILE_TRACE) { return; }` — compile-only passes want the buffer allocated/wired up (steps 1-2) but must not execute the backend or mark the node `evaluated`.
+
+4. **Guard the actual compute:** `if (evaluated) { return; } else { evaluated = true; }` — this is the second, narrower `evaluated` check (compute-only, not buffer-sync), separate from the caller-side guard in step 1.
+
+5. **Dispatch to the Phase-3 backend** (e.g. `input.sin(out, ExecutionDevice::CPU)`).
+
+### Layer below Phase 3: the Metal kernel itself
+
+For GPU-backed ops, Phase 3 ends by dispatching a compute pipeline state that is lazily compiled and cached in `GPUManager.h` (a `[dtype][dimSpecialization]` grid, e.g. `SinComputeState_nd` / `BrodcastedAddComputeState`), which resolves by name to a templated kernel in a dedicated `ComputeShaders/*.metal` file (e.g. `ComputeShaders/BrodcastedAdd.metal` defines `BrodcastedAddGPU_1Dgg/_2Dgg/_3Dgg/_NDgg` per collapsed-dim count, instantiated per dtype at the bottom via `instantiate_kernel(...)` macros). This layer is identical in shape for both legacy and modern ops — the split only breaks down in the C++ dispatch layer above it, not in Metal.
+
+---
+
 ## 3. Zero-Copy Execution and Memory Management
 The engine is heavily optimized to avoid deep copies. It decouples Graph Building (Topology) and Memory Allocation from actual Execution. 
 

@@ -25,6 +25,12 @@ struct Point3D {
     simd_float4 colour;
 };
 
+struct CameraIntrinsics {
+    matrix_float3x3 intrinsicMatrix;
+    float referenceWidth;
+    float referenceHeight;
+};
+
 enum class RenderPipelineType {
     Predefined = 0,
     Custom = 1,
@@ -261,6 +267,7 @@ std::ostream& operator<<(std::ostream& os,
 
 
 std::ostream& operator<<(std::ostream& os, const simd_float4x4& m);
+std::ostream& operator<<(std::ostream& os, const simd_float3x3& m);
 
 void write_string(const std::string& s, std::vector<uint8_t>& data);
 void write_attr(std::vector<uint8_t>& data,
