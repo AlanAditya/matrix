@@ -11002,12 +11002,13 @@ void matrix::take_backend(const matrix& index, matrix& output, int axis, Executi
     if (exec_device == ExecutionDevice::METAL) {
         id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
         int typeCode = (int)type;
+        int idxTypeCode = (int)index.type;
         int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
 
-        if (!GlobalGPUManager.TakeInit_nd[typeCode][kernel_code]) {
-            GlobalGPUManager.initTake_nd(typeCode, kernel_code);
+        if (!GlobalGPUManager.TakeInit_nd[typeCode][kernel_code][idxTypeCode]) {
+            GlobalGPUManager.initTake_nd(typeCode, kernel_code, idxTypeCode);
         }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.TakeComputeState_nd[typeCode][kernel_code]];
+        [commandEncoder setComputePipelineState:GlobalGPUManager.TakeComputeState_nd[typeCode][kernel_code][idxTypeCode]];
 
         [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // dst
         setBufferOrBytes(commandEncoder, *this, 1); // src
@@ -11070,31 +11071,31 @@ void matrix::take_backend(const matrix& index, matrix& output, int axis, Executi
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
     } else {
         // CPU Execution Fallback
-        int typeCode = (int)type;
-        if (typeCode == (int)dtype::Float) {
-            float* dst_ptr = (float*)output.buffer;
-            float* src_ptr = (float*)buffer;
-            int* idx_ptr = (int*)index.buffer;
-            
-            size_m src_axis_stride = strides()[axis];
-            
-            for (size_t i = 0; i < output.total_size; ++i) {
-                size_m remA = i;
-                size_m dst_idx = 0;
-                size_m idx_idx = 0;
-                size_m src_idx = 0;
-                for (int d = cdims - 1; d >= 0; --d) {
-                    size_m mod = remA % output.shape()[d];
-                    dst_idx += mod * output.strides()[d];
-                    idx_idx += mod * eff_idx_strides[d];
-                    src_idx += mod * eff_src_strides[d];
-                    remA /= output.shape()[d];
+        size_m src_axis_stride = strides()[axis];
+
+        dispatch_type(type, buffer, [&](auto *src_ptr) {
+            using T = std::decay_t<decltype(*src_ptr)>;
+            T* dst_ptr = (T*)output.buffer;
+
+            dispatch_type(index.type, index.buffer, [&](auto *idx_ptr) {
+                for (size_t i = 0; i < output.total_size; ++i) {
+                    size_m remA = i;
+                    size_m dst_idx = 0;
+                    size_m idx_idx = 0;
+                    size_m src_idx = 0;
+                    for (int d = cdims - 1; d >= 0; --d) {
+                        size_m mod = remA % output.shape()[d];
+                        dst_idx += mod * output.strides()[d];
+                        idx_idx += mod * eff_idx_strides[d];
+                        src_idx += mod * eff_src_strides[d];
+                        remA /= output.shape()[d];
+                    }
+                    auto idx_val = idx_ptr[idx_idx];
+                    src_idx += idx_val * src_axis_stride;
+                    dst_ptr[dst_idx] = src_ptr[src_idx];
                 }
-                int idx_val = idx_ptr[idx_idx];
-                src_idx += idx_val * src_axis_stride;
-                dst_ptr[dst_idx] = src_ptr[src_idx];
-            }
-        }
+            });
+        });
     }
 }
 

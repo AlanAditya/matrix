@@ -114,8 +114,11 @@ public:
     bool ExpInit_nd[4][4];
     id<MTLComputePipelineState> ExpComputeState_nd[4][4];
     
-    bool TakeInit_nd[4][4];
-    id<MTLComputePipelineState> TakeComputeState_nd[4][4];
+    // Take is templated over both the source/value dtype (axis 0, all 7 dtype codes
+    // instantiated) and the index dtype (axis 2, all 7 dtype codes reserved though only
+    // the 5 integer ones -- UInt8/Int32/Int16/UInt32/UInt16 -- are actually instantiated).
+    bool TakeInit_nd[7][4][7];
+    id<MTLComputePipelineState> TakeComputeState_nd[7][4][7];
     
     bool ConvolveInit[3];
     id<MTLComputePipelineState> ConvolveComputeState[3];
@@ -264,7 +267,13 @@ public:
                 SqrtInit_nd[i][j] = false;
                 ExpInit_nd[i][j] = false;
                 ClampInit_nd[i][j] = false;
-                TakeInit_nd[i][j] = false;
+            }
+        }
+        for (int i = 0; i < 7; i++) {
+            for (int j = 0; j < 4; j++) {
+                for (int k = 0; k < 7; k++) {
+                    TakeInit_nd[i][j][k] = false;
+                }
             }
         }
         for (int i = 0; i < 3; i++) {
@@ -883,11 +892,11 @@ public:
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
     }
 
-    void initTake_nd(int type_code, int cdims) {
+    void initTake_nd(int type_code, int cdims, int idx_type_code) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TakeGPU_nd_%i_%i", type_code, cdims]];
-        TakeComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
-        TakeInit_nd[type_code][cdims] = true;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TakeGPU_nd_%i_%i_%i", type_code, cdims, idx_type_code]];
+        TakeComputeState_nd[type_code][cdims][idx_type_code] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        TakeInit_nd[type_code][cdims][idx_type_code] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
     }
     
