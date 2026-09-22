@@ -1495,7 +1495,26 @@ public:
     static matrix conv1d(const matrix& input, const matrix& kernel, int padding = 0, int stride = 1, int dilation = 1, int groups = 1);
     static matrix conv2d(const matrix& input, const matrix& kernel, int pad_h = 0, int pad_w = 0, int stride_h = 1, int stride_w = 1, int dilation_h = 1, int dilation_w = 1, int groups = 1);
     static matrix conv3d(const matrix& input, const matrix& kernel, int pad_d = 0, int pad_h = 0, int pad_w = 0, int stride_d = 1, int stride_h = 1, int stride_w = 1, int dilation_d = 1, int dilation_h = 1, int dilation_w = 1, int groups = 1);
-    
+
+    // useAccelerateCPU opts the CPU tail path into Accelerate/vImage when the tail
+    // shape qualifies (leading_rank==2, tail_size in {1,4}, Float/UInt8, packed rows --
+    // see resample_try_vimage_tail() in Matrix.mm). Off by default: vImage uses its
+    // own resampling convention, not this file's align-corners math, so it's a real
+    // numeric behavior change, not just a speed one -- opt in deliberately.
+    // A 0-D (scalar) input is a special case: it has no rank to preserve and no
+    // spatial content to interpolate, so `new_shape` may be any rank and the result
+    // is just that scalar broadcast to it (zero-copy view; mode/useAccelerateCPU
+    // are ignored). Every other input rank keeps new_shape.size() == input.dims.
+    static matrix resample(const matrix& input, const std::vector<size_m>& new_shape, ResampleMode mode, bool useAccelerateCPU = false);
+    void resample(matrix& output, ExecutionDevice exec_device);
+    // General (no identity tail) backends, split by device -- see Matrix.mm.
+    void resample_backend_cpu(matrix& output);
+    void resample_backend_gpu(matrix& output);
+    // Identity-tail backends: used when a maximal trailing run of axes is untouched
+    // and contiguously packed (e.g. an image's [H,W,C] channel block). See Matrix.mm.
+    void resample_tail_backend_cpu(matrix& output, uint32_t leading_rank, size_m tail_size, size_m in_tail_stride, size_m out_tail_stride);
+    void resample_tail_backend_gpu(matrix& output, uint32_t leading_rank, size_m tail_size, size_m in_tail_stride, size_m out_tail_stride);
+
     void abs(matrix& output, ExecutionDevice exec_device);
     void log(matrix& output, ExecutionDevice exec_device);
     void conv1d_gpu(const matrix& kernel, matrix& output);

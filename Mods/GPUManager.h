@@ -135,6 +135,24 @@ public:
     bool ConvolveFullInit[3];
     id<MTLComputePipelineState> ConvolveFullComputeState[3];
     
+    // Resample preserves the input dtype exactly (nearest: pure gather; linear: promoted
+    // to float internally, cast back on write), so unlike Sin/Cos it's templated over all
+    // 7 dtype codes, same axis sizing as Take's source/value axis.
+    bool ResampleNearestInit_nd[7][4];
+    id<MTLComputePipelineState> ResampleNearestComputeState_nd[7][4];
+    bool ResampleLinearInit_nd[7][4];
+    id<MTLComputePipelineState> ResampleLinearComputeState_nd[7][4];
+
+    // "Tail" variants: used when the trailing axis is untouched by the resample
+    // (in_shape == out_shape, e.g. an RGBA channel axis). The grid spans only the
+    // leading (resampled) axes, and each thread loops the identity axis internally,
+    // reusing the interpolation weights it computed once instead of recomputing them
+    // per channel. Bucketed the same way, but by leading-axis rank (dims-1).
+    bool ResampleNearestTailInit_nd[7][4];
+    id<MTLComputePipelineState> ResampleNearestTailComputeState_nd[7][4];
+    bool ResampleLinearTailInit_nd[7][4];
+    id<MTLComputePipelineState> ResampleLinearTailComputeState_nd[7][4];
+
     id<MTLComputePipelineState> BrodcastedAddComputeState[4][4];
     id<MTLComputePipelineState> BrodcastedSubComputeState[4][4];
     id<MTLComputePipelineState> BrodcastedMulComputeState[4][4];
@@ -281,6 +299,14 @@ public:
             Conv1dInit[i] = false;
             Conv2dInit[i] = false;
             Conv3dInit[i] = false;
+        }
+        for (int i = 0; i < 7; i++) {
+            for (int j = 0; j < 4; j++) {
+                ResampleNearestInit_nd[i][j] = false;
+                ResampleLinearInit_nd[i][j] = false;
+                ResampleNearestTailInit_nd[i][j] = false;
+                ResampleLinearTailInit_nd[i][j] = false;
+            }
         }
         for (int i = 0; i < 4; i++) {
             Concat_2M[i] = false;
@@ -900,6 +926,38 @@ public:
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
     }
     
+    void initResampleNearest_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ResampleNearestGPU_nd_%i_%i", type_code, cdims]];
+        ResampleNearestComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        ResampleNearestInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+
+    void initResampleLinear_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ResampleLinearGPU_nd_%i_%i", type_code, cdims]];
+        ResampleLinearComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        ResampleLinearInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+
+    void initResampleNearestTail_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ResampleNearestTailGPU_nd_%i_%i", type_code, cdims]];
+        ResampleNearestTailComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        ResampleNearestTailInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+
+    void initResampleLinearTail_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ResampleLinearTailGPU_nd_%i_%i", type_code, cdims]];
+        ResampleLinearTailComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        ResampleLinearTailInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+
     void initConcat_2M_GPU(int i) {
         NSError* error = nil;
         id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"concatGPU_2M_%i", i]];

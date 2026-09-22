@@ -4727,6 +4727,131 @@ public:
     }
 };
 
+class ResamplePrimitive : public Primitive {
+public:
+    matrix input;
+    ResampleMode mode;
+    // Opt-in: lets the CPU tail backend try Accelerate/vImage when the tail shape
+    // qualifies (see resample_try_vimage_tail() in Matrix.mm). Off by default because
+    // vImage's resampling convention doesn't match this file's align-corners math, so
+    // it's a real numeric behavior change, not just a speed one -- the caller has to
+    // ask for it explicitly via matrix::resample()'s useAccelerateCPU parameter.
+    bool useAccelerateCPU;
+    // Per-axis mapping from an output coordinate to a continuous input coordinate:
+    // in_coord = out_idx * scale[axis]. Computed once at graph-build time (Phase 1)
+    // from linspace(0, in_shape[axis]-1, out_shape[axis]) semantics.
+    float scale[MAX_TENSOR_DIMS];
+
+    ResamplePrimitive(const matrix& input_in, ResampleMode mode_in, bool useAccelerateCPU_in)
+        : input(ensure_graph_ready(input_in)), mode(mode_in), useAccelerateCPU(useAccelerateCPU_in) {}
+
+    matrix* get_borrowed_input() override { return nullptr; } // Allocates new memory
+
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); }
+        input.update_from_trace();
+
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return; else evaluated = true;
+
+        input.resample(out, ExecutionDevice::CPU);
+    }
+
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return; else evaluated = true;
+
+        input.resample(out, ExecutionDevice::METAL);
+    }
+
+    // Resample is a pure gather (nearest: one source cell per output cell; linear: a
+    // fixed weighted blend of 2^ndims source cells). Its gradient is a scatter-add back
+    // into the input's shape, which has no existing primitive to build on -- there is no
+    // ScatterAdd op in the graph yet (see TakePrimitive::vjp above, which is itself just
+    // a stub, and ConvolvePrimitive::vjp/jvp, which throw for the same reason). Matching
+    // that precedent rather than faking a gradient.
+    matrix jvp(std::vector<matrix>& tangents) override {
+        throw std::runtime_error("JVP not implemented for ResamplePrimitive");
+    }
+
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        throw std::runtime_error("VJP not implemented for ResamplePrimitive");
+    }
+
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
+    }
+
+    void clear_trace_checks() override {
+        if (!evaluated) return;
+        evaluated = false;
+        if (input.tape && input.tape->evaluated) { input.tape->clear_trace_checks(); }
+    }
+
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+
+    std::vector<matrix> get_inputs() override {
+        return {input};
+    }
+};
+
 class CrossPrimitive : public Primitive {
 public:
     matrix a;

@@ -15,6 +15,7 @@
 #include "primitives.cpp"
 #include <CoreGraphics/CoreGraphics.h>
 #include <ImageIO/ImageIO.h>
+#import <Accelerate/Accelerate.h>
 #import <Metal/Metal.h>
 #include <algorithm>
 #include <arm_fp16.h>
@@ -10243,6 +10244,821 @@ void matrix::conv_gpu(const matrix& kernel, matrix& output) {
     [commandEncoder setBytes:&kernel_dot_totalsize length:sizeof(int) atIndex:14];
     
     [commandEncoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+}
+
+// MARK: Resample (generic ND nearest / N-linear resize)
+
+// Scans backward from the last axis and returns the smallest index `k` such that every
+// axis in [k, ndims-1] is both untouched by the resize (in_shape == out_shape) and
+// contiguously packed in *both* the input and the output -- same collapsibility test
+// collapse_dims() uses (Mods/Utils.mm), just walked from the inner axis outward instead
+// of outer-to-inner, and checked against two independent stride arrays instead of one.
+// A multi-axis identity tail (e.g. a packed [H,W,C] block, or separate trailing axes
+// that just happen to also be contiguous) collapses to a single flat run this way, so
+// resample_tail_backend_{cpu,gpu}() can loop it with one stride, same as a single-axis
+// tail. Returns `ndims` when even the last axis alone isn't an eligible tail.
+static uint32_t resample_collapsed_tail_start(const matrix& input, const matrix& output, uint32_t ndims) {
+    if (ndims < 2) return ndims;
+    if (input.shape()[ndims-1] != output.shape()[ndims-1]) return ndims;
+
+    uint32_t k = ndims - 1;
+    while (k > 0) {
+        uint32_t i = k - 1;
+        if (input.shape()[i] != output.shape()[i]) break;
+        if (input.strides()[i] != input.strides()[k] * input.shape()[k]) break;
+        if (output.strides()[i] != output.strides()[k] * output.shape()[k]) break;
+        k = i;
+    }
+    return k;
+}
+
+// Opt-in fast path for resample_tail_backend_cpu()'s most common real case: a
+// [H, W, C] image with C untouched. Only tried when the caller passes
+// useAccelerateCPU=true to matrix::resample() (see ResamplePrimitive::useAccelerateCPU)
+// -- never attempted by default. Apple Silicon's Accelerate/vImage offloads 2D
+// resampling to the AMX matrix co-processor, which is dramatically faster than any
+// hand-rolled scalar loop here. Returns false (caller falls through to the normal
+// specialized loops) whenever the shape/dtype/layout isn't something vImage handles:
+// vImageScale_<fmt> only exists for 1-channel and 4-channel images (no 3-channel/RGB
+// variant -- see Accelerate/vImage's Geometry.h), and only for Float/UInt8 here since
+// those are matrix's two image dtypes.
+//
+// CAVEAT (this is a real behavior difference, not just an implementation detail):
+// vImageScale_<fmt> uses its own internal resampling grid convention, which is NOT
+// the align-corners convention (out_idx * (in_size-1)/(out_size-1)) the rest of this
+// file uses -- Apple's docs don't specify it exactly and there's no flag to select
+// align-corners. So results from this path are a correct, good-quality resize, but
+// will NOT bit-match the general/tail CPU loops or the Metal kernels for the same
+// input. If exact cross-device/cross-path parity matters more than CPU throughput,
+// force ExecutionDevice::METAL for image resamples, or extend the guard below to
+// reject the case entirely.
+static bool resample_try_vimage_tail(const matrix& input, matrix& output, ResampleMode mode, uint32_t leading_rank, size_m tail_size) {
+    if (mode != ResampleMode::Linear) return false; // vImageScale has no true nearest-neighbor mode
+    if (leading_rank != 2) return false;             // only a plain [H, W, tail] shape
+    if (tail_size != 1 && tail_size != 4) return false; // vImage only has Planar (1) / ARGB (4) scalers
+    if (input.type != dtype::Float && input.type != dtype::UInt8) return false;
+    if (output.type != input.type) return false; // resample() never changes dtype; be defensive anyway
+    // Rows must be pixel-packed (no per-pixel gaps) for both src and dst -- vImage's
+    // rowBytes covers padding *between* rows, not gaps *within* a row.
+    if (input.strides()[1] != tail_size || output.strides()[1] != tail_size) return false;
+
+    size_t elem_size = dtype_size(input.type);
+    vImage_Buffer src_buf = {
+        (void*)input.buffer,
+        (vImagePixelCount)input.shape()[0],
+        (vImagePixelCount)input.shape()[1],
+        (size_t)input.strides()[0] * elem_size,
+    };
+    vImage_Buffer dst_buf = {
+        (void*)output.buffer,
+        (vImagePixelCount)output.shape()[0],
+        (vImagePixelCount)output.shape()[1],
+        (size_t)output.strides()[0] * elem_size,
+    };
+
+    // kvImageNoFlags (not kvImageHighQualityResampling): vImageScale's docs call this
+    // the cheaper/faster of the two, closer in spirit to a plain bilinear filter --
+    // matches both this being a speed optimization and ResampleMode::Linear's intent
+    // better than the pricier, more Lanczos-like high-quality mode would. Passing no
+    // edging flag still gets defined kvImageEdgeExtend behavior for vImageScale_<fmt>
+    // specifically (unlike vImage's rotate/warp functions, where it'd be undefined).
+    vImage_Flags flags = kvImageNoFlags;
+    vImage_Error err;
+    if (tail_size == 1) {
+        err = (input.type == dtype::Float)
+            ? vImageScale_PlanarF(&src_buf, &dst_buf, nullptr, flags)
+            : vImageScale_Planar8(&src_buf, &dst_buf, nullptr, flags);
+    } else {
+        err = (input.type == dtype::Float)
+            ? vImageScale_ARGBFFFF(&src_buf, &dst_buf, nullptr, flags)
+            : vImageScale_ARGB8888(&src_buf, &dst_buf, nullptr, flags);
+    }
+    return err == kvImageNoError;
+}
+
+matrix matrix::resample(const matrix& input, const std::vector<size_m>& new_shape, ResampleMode mode, bool useAccelerateCPU) {
+    if (input.dims == 0) {
+        // A 0-D scalar has no spatial content to interpolate -- nearest and linear
+        // are indistinguishable for a constant field, so "resampling" a scalar to
+        // any target shape is just broadcasting it there: every output element reads
+        // the same value. Route to the existing lazy broadcast machinery
+        // (BrodcastPrimitive, zero-copy stride-0 view) instead of matrix::repeating(),
+        // which eagerly materializes a full copy -- resample() otherwise never
+        // allocates until eval_cpu()/eval_metal() actually runs, so this keeps that
+        // contract instead of being a special-cased exception to it. `mode` and
+        // `useAccelerateCPU` are meaningless here (nothing to interpolate) and ignored.
+        std::vector<size_m> target_shape = new_shape;
+        return input.broadcast_toV2(target_shape.data(), (int)target_shape.size());
+    }
+    if ((int)new_shape.size() != (int)input.dims) {
+        throw std::invalid_argument("matrix::resample: new_shape rank must match input rank");
+    }
+    if (input.dims > MAX_TENSOR_DIMS) {
+        throw std::invalid_argument("matrix::resample: input rank must be within [1, MAX_TENSOR_DIMS]");
+    }
+
+    matrix output(input.dims, input.type);
+    for (int i = 0; i < input.dims; i++) {
+        output.shape()[i] = new_shape[i];
+    }
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    ResamplePrimitive* prim = new ResamplePrimitive(input, mode, useAccelerateCPU);
+    for (int i = 0; i < input.dims; i++) {
+        size_m in_s = input.shape()[i];
+        size_m out_s = new_shape[i];
+        // Matches linspace(0, in_s-1, out_s): out_idx * scale == the continuous
+        // source coordinate. Degenerates to 0 whenever either side is a single element.
+        prim->scale[i] = (in_s > 1 && out_s > 1) ? (float)(in_s - 1) / (float)(out_s - 1) : 0.0f;
+    }
+    output.tape = prim;
+    return output;
+}
+
+// Thin dispatcher: picks the identity-tail fast path or the general path, then the
+// CPU or GPU backend for whichever one applies. All the actual work lives in
+// resample_backend_{cpu,gpu}() and resample_tail_backend_{cpu,gpu}() below.
+void matrix::resample(matrix& output, ExecutionDevice exec_device) {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = output.total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+
+    uint32_t ndims = dims;
+
+    // Collapse the maximal trailing run of untouched, contiguously-packed axes (e.g. a
+    // packed [H,W,C] channel block, not just a single channel axis) into one flat tail.
+    // Every element along that flattened run shares the exact same leading-axis
+    // interpolation coordinates/weights, so they're computed once per leading position
+    // and reused across the whole tail, instead of every element along it (and, for
+    // linear mode, both the "floor" and identical "ceil" sample) redoing that math
+    // independently like the general path does.
+    uint32_t tail_start = resample_collapsed_tail_start(*this, output, ndims);
+    size_m tail_size = 1;
+    for (uint32_t i = tail_start; i < ndims; i++) { tail_size *= shape()[i]; }
+    bool identity_tail = (tail_start < ndims) && (tail_start >= 1) && (tail_size > 1);
+
+    if (identity_tail) {
+        size_m in_tail_stride = strides()[ndims-1];
+        size_m out_tail_stride = output.strides()[ndims-1];
+        if (exec_device == ExecutionDevice::METAL) {
+            resample_tail_backend_gpu(output, tail_start, tail_size, in_tail_stride, out_tail_stride);
+        } else {
+            resample_tail_backend_cpu(output, tail_start, tail_size, in_tail_stride, out_tail_stride);
+        }
+        return;
+    }
+
+    if (exec_device == ExecutionDevice::METAL) {
+        resample_backend_gpu(output);
+    } else {
+        resample_backend_cpu(output);
+    }
+}
+
+void matrix::resample_backend_gpu(matrix& output) {
+    ResamplePrimitive* primit = static_cast<ResamplePrimitive*>(output.tape);
+    ResampleMode mode = primit->mode;
+    float* scale = primit->scale;
+    uint32_t ndims = dims;
+
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    int typeCode = (int)type;
+    int kernel_code = ndims > 3 ? 3 : ((int)ndims - 1);
+    bool linear = (mode == ResampleMode::Linear);
+
+    if (linear) {
+        if (!GlobalGPUManager.ResampleLinearInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initResampleLinear_nd(typeCode, kernel_code);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.ResampleLinearComputeState_nd[typeCode][kernel_code]];
+    } else {
+        if (!GlobalGPUManager.ResampleNearestInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initResampleNearest_nd(typeCode, kernel_code);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.ResampleNearestComputeState_nd[typeCode][kernel_code]];
+    }
+
+    setBufferOrBytes(commandEncoder, output, 0); // dst
+    setBufferOrBytes(commandEncoder, *this, 1); // src
+
+    auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+    auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+    if (ndims == 1) {
+        size_m out_stride = output.strides()[0];
+        size_m in_stride = strides()[0];
+        size_m in_shape0 = shape()[0];
+        [commandEncoder setBytes:&out_stride length:sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:&in_stride length:sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:&in_shape0 length:sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:scale length:sizeof(float) atIndex:5];
+        _dispatchExecutionSize = MTLSizeMake(output.shape()[0], 1, 1);
+    } else if (ndims == 2) {
+        [commandEncoder setBytes:output.strides() length:2 * sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:strides() length:2 * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:shape() length:2 * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:scale length:2 * sizeof(float) atIndex:5];
+        _dispatchExecutionSize = MTLSizeMake(output.shape()[1], output.shape()[0], 1);
+    } else if (ndims == 3) {
+        [commandEncoder setBytes:output.strides() length:3 * sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:strides() length:3 * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:shape() length:3 * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:scale length:3 * sizeof(float) atIndex:5];
+        _dispatchExecutionSize = MTLSizeMake(output.shape()[2], output.shape()[1], output.shape()[0]);
+    } else {
+        [commandEncoder setBytes:output.strides() length:ndims * sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:strides() length:ndims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:shape() length:ndims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:scale length:ndims * sizeof(float) atIndex:5];
+        [commandEncoder setBytes:output.shape() length:ndims * sizeof(size_m) atIndex:6];
+        int ndim_i = (int)ndims;
+        [commandEncoder setBytes:&ndim_i length:sizeof(int) atIndex:7];
+
+        size_m threads_x = output.shape()[ndims-1];
+        size_m threads_y = output.shape()[ndims-2];
+        size_m threads_z = output.total_size / (threads_x * threads_y);
+        _dispatchExecutionSize = MTLSizeMake(threads_x, threads_y, threads_z);
+    }
+
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+}
+
+// CPU backend for the general (no identity tail) resample path. Rank-specialized like
+// SinPrimitive's CPU backend (matrix::sin's CPU branch): a plain unrolled for-loop per
+// rank up to 3, each hoisting the outer axes' index/weight math out of the inner loops
+// instead of recomputing it, so there's no per-element modulo/division chain. Rank 4+
+// falls back to the one generic modular-decomposition loop, which is what every rank
+// used to run through -- still correct, just not worth hand-specializing further.
+void matrix::resample_backend_cpu(matrix& output) {
+    ResamplePrimitive* primit = static_cast<ResamplePrimitive*>(output.tape);
+    ResampleMode mode = primit->mode;
+    float* scale = primit->scale;
+    uint32_t ndims = dims;
+
+    dispatch_type(type, output.buffer, [&](auto *out_data) {
+        using T = std::decay_t<decltype(*out_data)>;
+        T* in_data = (T*)buffer;
+        const size_m* out_shape_ = output.shape();
+        const size_m* out_strides_ = output.strides();
+        const size_m* in_shape_ = shape();
+        const size_m* in_strides_ = strides();
+
+        if (mode == ResampleMode::Nearest) {
+            if (ndims == 1) {
+                size_m out_s0 = out_strides_[0], in_s0 = in_strides_[0], in_sh0 = in_shape_[0];
+                float sc0 = scale[0];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    size_m in_i = (size_m) std::lround((double)i * sc0);
+                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    out_data[i * out_s0] = in_data[in_i * in_s0];
+                }
+            } else if (ndims == 2) {
+                size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1];
+                size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1];
+                size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1];
+                float sc0 = scale[0], sc1 = scale[1];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    size_m in_i = (size_m) std::lround((double)i * sc0);
+                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    size_m out_row = i * out_s0, in_row = in_i * in_s0;
+                    for (size_m j = 0; j < out_shape_[1]; j++) {
+                        size_m in_j = (size_m) std::lround((double)j * sc1);
+                        if (in_j >= in_sh1) in_j = in_sh1 - 1;
+                        out_data[out_row + j * out_s1] = in_data[in_row + in_j * in_s1];
+                    }
+                }
+            } else if (ndims == 3) {
+                size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1], out_s2 = out_strides_[2];
+                size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1], in_s2 = in_strides_[2];
+                size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1], in_sh2 = in_shape_[2];
+                float sc0 = scale[0], sc1 = scale[1], sc2 = scale[2];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    size_m in_i = (size_m) std::lround((double)i * sc0);
+                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    size_m out_plane = i * out_s0, in_plane = in_i * in_s0;
+                    for (size_m j = 0; j < out_shape_[1]; j++) {
+                        size_m in_j = (size_m) std::lround((double)j * sc1);
+                        if (in_j >= in_sh1) in_j = in_sh1 - 1;
+                        size_m out_row = out_plane + j * out_s1, in_row = in_plane + in_j * in_s1;
+                        for (size_m k = 0; k < out_shape_[2]; k++) {
+                            size_m in_k = (size_m) std::lround((double)k * sc2);
+                            if (in_k >= in_sh2) in_k = in_sh2 - 1;
+                            out_data[out_row + k * out_s2] = in_data[in_row + in_k * in_s2];
+                        }
+                    }
+                }
+            } else {
+                for (size_t gid = 0; gid < output.total_size; gid++) {
+                    size_m rem = (size_m)gid;
+                    size_m out_off = 0;
+                    size_m in_off = 0;
+                    for (int i = (int)ndims - 1; i >= 0; i--) {
+                        size_m out_idx = rem % out_shape_[i];
+                        rem /= out_shape_[i];
+                        out_off += out_idx * out_strides_[i];
+                        size_m in_idx = (size_m) std::lround((double)out_idx * scale[i]);
+                        if (in_idx >= in_shape_[i]) in_idx = in_shape_[i] - 1;
+                        in_off += in_idx * in_strides_[i];
+                    }
+                    out_data[out_off] = in_data[in_off];
+                }
+            }
+        } else { // Linear
+            if (ndims == 1) {
+                size_m out_s0 = out_strides_[0], in_s0 = in_strides_[0], in_sh0 = in_shape_[0];
+                float sc0 = scale[0];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    float coord = (float)i * sc0;
+                    float f = std::floor(coord);
+                    size_m fi = (size_m)f; if (fi >= in_sh0) fi = in_sh0 - 1;
+                    size_m ci = fi + 1;    if (ci >= in_sh0) ci = in_sh0 - 1;
+                    float frac = coord - f;
+                    float sum = (float)in_data[fi * in_s0] * (1.0f - frac) + (float)in_data[ci * in_s0] * frac;
+                    out_data[i * out_s0] = (T)sum;
+                }
+            } else if (ndims == 2) {
+                size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1];
+                size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1];
+                size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1];
+                float sc0 = scale[0], sc1 = scale[1];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    float coord0 = (float)i * sc0;
+                    float f0 = std::floor(coord0);
+                    size_m fi0 = (size_m)f0; if (fi0 >= in_sh0) fi0 = in_sh0 - 1;
+                    size_m ci0 = fi0 + 1;    if (ci0 >= in_sh0) ci0 = in_sh0 - 1;
+                    float frac0 = coord0 - f0;
+                    size_m in_row_fi0 = fi0 * in_s0, in_row_ci0 = ci0 * in_s0;
+                    size_m out_row = i * out_s0;
+                    for (size_m j = 0; j < out_shape_[1]; j++) {
+                        float coord1 = (float)j * sc1;
+                        float f1 = std::floor(coord1);
+                        size_m fi1 = (size_m)f1; if (fi1 >= in_sh1) fi1 = in_sh1 - 1;
+                        size_m ci1 = fi1 + 1;    if (ci1 >= in_sh1) ci1 = in_sh1 - 1;
+                        float frac1 = coord1 - f1;
+
+                        float v00 = (float)in_data[in_row_fi0 + fi1 * in_s1];
+                        float v01 = (float)in_data[in_row_fi0 + ci1 * in_s1];
+                        float v10 = (float)in_data[in_row_ci0 + fi1 * in_s1];
+                        float v11 = (float)in_data[in_row_ci0 + ci1 * in_s1];
+                        float top = v00 * (1.0f - frac1) + v01 * frac1;
+                        float bot = v10 * (1.0f - frac1) + v11 * frac1;
+                        float sum = top * (1.0f - frac0) + bot * frac0;
+                        out_data[out_row + j * out_s1] = (T)sum;
+                    }
+                }
+            } else if (ndims == 3) {
+                size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1], out_s2 = out_strides_[2];
+                size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1], in_s2 = in_strides_[2];
+                size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1], in_sh2 = in_shape_[2];
+                float sc0 = scale[0], sc1 = scale[1], sc2 = scale[2];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    float coord0 = (float)i * sc0;
+                    float f0 = std::floor(coord0);
+                    size_m fi0 = (size_m)f0; if (fi0 >= in_sh0) fi0 = in_sh0 - 1;
+                    size_m ci0 = fi0 + 1;    if (ci0 >= in_sh0) ci0 = in_sh0 - 1;
+                    float frac0 = coord0 - f0;
+                    size_m out_plane = i * out_s0;
+                    size_m in_plane_fi0 = fi0 * in_s0, in_plane_ci0 = ci0 * in_s0;
+                    for (size_m j = 0; j < out_shape_[1]; j++) {
+                        float coord1 = (float)j * sc1;
+                        float f1 = std::floor(coord1);
+                        size_m fi1 = (size_m)f1; if (fi1 >= in_sh1) fi1 = in_sh1 - 1;
+                        size_m ci1 = fi1 + 1;    if (ci1 >= in_sh1) ci1 = in_sh1 - 1;
+                        float frac1 = coord1 - f1;
+                        size_m out_row = out_plane + j * out_s1;
+                        size_m base_fi0_fi1 = in_plane_fi0 + fi1 * in_s1;
+                        size_m base_fi0_ci1 = in_plane_fi0 + ci1 * in_s1;
+                        size_m base_ci0_fi1 = in_plane_ci0 + fi1 * in_s1;
+                        size_m base_ci0_ci1 = in_plane_ci0 + ci1 * in_s1;
+                        for (size_m k = 0; k < out_shape_[2]; k++) {
+                            float coord2 = (float)k * sc2;
+                            float f2 = std::floor(coord2);
+                            size_m fi2 = (size_m)f2; if (fi2 >= in_sh2) fi2 = in_sh2 - 1;
+                            size_m ci2 = fi2 + 1;    if (ci2 >= in_sh2) ci2 = in_sh2 - 1;
+                            float frac2 = coord2 - f2;
+
+                            float v000 = (float)in_data[base_fi0_fi1 + fi2 * in_s2];
+                            float v001 = (float)in_data[base_fi0_fi1 + ci2 * in_s2];
+                            float v010 = (float)in_data[base_fi0_ci1 + fi2 * in_s2];
+                            float v011 = (float)in_data[base_fi0_ci1 + ci2 * in_s2];
+                            float v100 = (float)in_data[base_ci0_fi1 + fi2 * in_s2];
+                            float v101 = (float)in_data[base_ci0_fi1 + ci2 * in_s2];
+                            float v110 = (float)in_data[base_ci0_ci1 + fi2 * in_s2];
+                            float v111 = (float)in_data[base_ci0_ci1 + ci2 * in_s2];
+
+                            float c00 = v000 * (1.0f - frac2) + v001 * frac2;
+                            float c01 = v010 * (1.0f - frac2) + v011 * frac2;
+                            float c10 = v100 * (1.0f - frac2) + v101 * frac2;
+                            float c11 = v110 * (1.0f - frac2) + v111 * frac2;
+                            float c0 = c00 * (1.0f - frac1) + c01 * frac1;
+                            float c1 = c10 * (1.0f - frac1) + c11 * frac1;
+                            float sum = c0 * (1.0f - frac0) + c1 * frac0;
+                            out_data[out_row + k * out_s2] = (T)sum;
+                        }
+                    }
+                }
+            } else {
+                size_m num_corners = 1u << ndims;
+                for (size_t gid = 0; gid < output.total_size; gid++) {
+                    size_m rem = (size_m)gid;
+                    size_m out_off = 0;
+                    size_m floor_idx[MAX_TENSOR_DIMS];
+                    float frac[MAX_TENSOR_DIMS];
+                    for (int i = (int)ndims - 1; i >= 0; i--) {
+                        size_m out_idx = rem % out_shape_[i];
+                        rem /= out_shape_[i];
+                        out_off += out_idx * out_strides_[i];
+                        float coord = (float)out_idx * scale[i];
+                        float f = std::floor(coord);
+                        size_m fi = (size_m)f;
+                        if (fi >= in_shape_[i]) fi = in_shape_[i] - 1;
+                        floor_idx[i] = fi;
+                        frac[i] = coord - f;
+                    }
+                    float sum = 0.0f;
+                    for (size_m corner = 0; corner < num_corners; corner++) {
+                        float weight = 1.0f;
+                        size_m in_off = 0;
+                        for (int i = 0; i < (int)ndims; i++) {
+                            bool bit = (corner >> i) & 1u;
+                            size_m idx = floor_idx[i];
+                            if (bit) {
+                                size_m ceil_i = idx + 1;
+                                if (ceil_i >= in_shape_[i]) ceil_i = in_shape_[i] - 1;
+                                idx = ceil_i;
+                                weight *= frac[i];
+                            } else {
+                                weight *= (1.0f - frac[i]);
+                            }
+                            in_off += idx * in_strides_[i];
+                        }
+                        if (weight != 0.0f) {
+                            sum += weight * (float)in_data[in_off];
+                        }
+                    }
+                    out_data[out_off] = (T)sum;
+                }
+            }
+        }
+    });
+}
+
+// GPU backend for the identity-tail fast path (see resample_collapsed_tail_start()).
+void matrix::resample_tail_backend_gpu(matrix& output, uint32_t leading_rank, size_m tail_size, size_m in_tail_stride, size_m out_tail_stride) {
+    ResamplePrimitive* primit = static_cast<ResamplePrimitive*>(output.tape);
+    ResampleMode mode = primit->mode;
+    float* scale = primit->scale;
+
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    int typeCode = (int)type;
+    int kernel_code = leading_rank > 3 ? 3 : ((int)leading_rank - 1);
+    bool linear = (mode == ResampleMode::Linear);
+
+    if (linear) {
+        if (!GlobalGPUManager.ResampleLinearTailInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initResampleLinearTail_nd(typeCode, kernel_code);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.ResampleLinearTailComputeState_nd[typeCode][kernel_code]];
+    } else {
+        if (!GlobalGPUManager.ResampleNearestTailInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initResampleNearestTail_nd(typeCode, kernel_code);
+        }
+        [commandEncoder setComputePipelineState:GlobalGPUManager.ResampleNearestTailComputeState_nd[typeCode][kernel_code]];
+    }
+
+    setBufferOrBytes(commandEncoder, output, 0); // dst
+    setBufferOrBytes(commandEncoder, *this, 1); // src
+
+    auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+    auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+    if (leading_rank == 1) {
+        size_m out_stride0 = output.strides()[0];
+        size_m in_stride0 = strides()[0];
+        size_m in_shape0 = shape()[0];
+        [commandEncoder setBytes:&out_stride0 length:sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:&in_stride0 length:sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:&in_shape0 length:sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:scale length:sizeof(float) atIndex:5];
+        [commandEncoder setBytes:&tail_size length:sizeof(size_m) atIndex:6];
+        [commandEncoder setBytes:&in_tail_stride length:sizeof(size_m) atIndex:7];
+        [commandEncoder setBytes:&out_tail_stride length:sizeof(size_m) atIndex:8];
+        _dispatchExecutionSize = MTLSizeMake(output.shape()[0], 1, 1);
+    } else if (leading_rank == 2) {
+        [commandEncoder setBytes:output.strides() length:2 * sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:strides() length:2 * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:shape() length:2 * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:scale length:2 * sizeof(float) atIndex:5];
+        [commandEncoder setBytes:&tail_size length:sizeof(size_m) atIndex:6];
+        [commandEncoder setBytes:&in_tail_stride length:sizeof(size_m) atIndex:7];
+        [commandEncoder setBytes:&out_tail_stride length:sizeof(size_m) atIndex:8];
+        _dispatchExecutionSize = MTLSizeMake(output.shape()[1], output.shape()[0], 1);
+    } else if (leading_rank == 3) {
+        [commandEncoder setBytes:output.strides() length:3 * sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:strides() length:3 * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:shape() length:3 * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:scale length:3 * sizeof(float) atIndex:5];
+        [commandEncoder setBytes:&tail_size length:sizeof(size_m) atIndex:6];
+        [commandEncoder setBytes:&in_tail_stride length:sizeof(size_m) atIndex:7];
+        [commandEncoder setBytes:&out_tail_stride length:sizeof(size_m) atIndex:8];
+        _dispatchExecutionSize = MTLSizeMake(output.shape()[2], output.shape()[1], output.shape()[0]);
+    } else {
+        [commandEncoder setBytes:output.strides() length:leading_rank * sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:strides() length:leading_rank * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:shape() length:leading_rank * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:scale length:leading_rank * sizeof(float) atIndex:5];
+        [commandEncoder setBytes:output.shape() length:leading_rank * sizeof(size_m) atIndex:6];
+        int ndim_i = (int)leading_rank;
+        [commandEncoder setBytes:&ndim_i length:sizeof(int) atIndex:7];
+        [commandEncoder setBytes:&tail_size length:sizeof(size_m) atIndex:8];
+        [commandEncoder setBytes:&in_tail_stride length:sizeof(size_m) atIndex:9];
+        [commandEncoder setBytes:&out_tail_stride length:sizeof(size_m) atIndex:10];
+
+        size_t leading_total = output.total_size / tail_size;
+        size_m threads_x = output.shape()[leading_rank-1];
+        size_m threads_y = output.shape()[leading_rank-2];
+        size_m threads_z = (size_m)(leading_total / ((size_t)threads_x * (size_t)threads_y));
+        _dispatchExecutionSize = MTLSizeMake(threads_x, threads_y, threads_z);
+    }
+
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+}
+
+// CPU backend for the identity-tail fast path. If the caller opted in via
+// matrix::resample()'s useAccelerateCPU, tries Accelerate/vImage first for the common
+// image-shaped case (see resample_try_vimage_tail() for exactly when and why); off by
+// default since it's a real numeric behavior change, not just a speed one. Either way,
+// falls back to rank-specialized loops (leading_rank 1/2/3 unrolled, same hoisting
+// idea as resample_backend_cpu(); 4+ falls back to the generic modular-decomposition +
+// corner-array loop) that additionally loop the identity tail axis innermost, reusing
+// the leading-axis weights computed once per leading position.
+void matrix::resample_tail_backend_cpu(matrix& output, uint32_t leading_rank, size_m tail_size, size_m in_tail_stride, size_m out_tail_stride) {
+    ResamplePrimitive* primit = static_cast<ResamplePrimitive*>(output.tape);
+    ResampleMode mode = primit->mode;
+    float* scale = primit->scale;
+
+    if (primit->useAccelerateCPU && resample_try_vimage_tail(*this, output, mode, leading_rank, tail_size)) {
+        return;
+    }
+
+    dispatch_type(type, output.buffer, [&](auto *out_data) {
+        using T = std::decay_t<decltype(*out_data)>;
+        T* in_data = (T*)buffer;
+        const size_m* out_shape_ = output.shape();
+        const size_m* out_strides_ = output.strides();
+        const size_m* in_shape_ = shape();
+        const size_m* in_strides_ = strides();
+
+        if (mode == ResampleMode::Nearest) {
+            if (leading_rank == 1) {
+                size_m out_s0 = out_strides_[0], in_s0 = in_strides_[0], in_sh0 = in_shape_[0];
+                float sc0 = scale[0];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    size_m in_i = (size_m) std::lround((double)i * sc0);
+                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    size_m out_off = i * out_s0, in_off = in_i * in_s0;
+                    for (size_m c = 0; c < tail_size; c++) {
+                        out_data[out_off + c * out_tail_stride] = in_data[in_off + c * in_tail_stride];
+                    }
+                }
+            } else if (leading_rank == 2) {
+                size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1];
+                size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1];
+                size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1];
+                float sc0 = scale[0], sc1 = scale[1];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    size_m in_i = (size_m) std::lround((double)i * sc0);
+                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    size_m out_row = i * out_s0, in_row = in_i * in_s0;
+                    for (size_m j = 0; j < out_shape_[1]; j++) {
+                        size_m in_j = (size_m) std::lround((double)j * sc1);
+                        if (in_j >= in_sh1) in_j = in_sh1 - 1;
+                        size_m out_off = out_row + j * out_s1, in_off = in_row + in_j * in_s1;
+                        for (size_m c = 0; c < tail_size; c++) {
+                            out_data[out_off + c * out_tail_stride] = in_data[in_off + c * in_tail_stride];
+                        }
+                    }
+                }
+            } else if (leading_rank == 3) {
+                size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1], out_s2 = out_strides_[2];
+                size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1], in_s2 = in_strides_[2];
+                size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1], in_sh2 = in_shape_[2];
+                float sc0 = scale[0], sc1 = scale[1], sc2 = scale[2];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    size_m in_i = (size_m) std::lround((double)i * sc0);
+                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    size_m out_plane = i * out_s0, in_plane = in_i * in_s0;
+                    for (size_m j = 0; j < out_shape_[1]; j++) {
+                        size_m in_j = (size_m) std::lround((double)j * sc1);
+                        if (in_j >= in_sh1) in_j = in_sh1 - 1;
+                        size_m out_row = out_plane + j * out_s1, in_row = in_plane + in_j * in_s1;
+                        for (size_m k = 0; k < out_shape_[2]; k++) {
+                            size_m in_k = (size_m) std::lround((double)k * sc2);
+                            if (in_k >= in_sh2) in_k = in_sh2 - 1;
+                            size_m out_off = out_row + k * out_s2, in_off = in_row + in_k * in_s2;
+                            for (size_m c = 0; c < tail_size; c++) {
+                                out_data[out_off + c * out_tail_stride] = in_data[in_off + c * in_tail_stride];
+                            }
+                        }
+                    }
+                }
+            } else {
+                size_t leading_total = output.total_size / tail_size;
+                for (size_t gid = 0; gid < leading_total; gid++) {
+                    size_m rem = (size_m)gid;
+                    size_m out_off = 0;
+                    size_m in_off = 0;
+                    for (int i = (int)leading_rank - 1; i >= 0; i--) {
+                        size_m out_idx = rem % out_shape_[i];
+                        rem /= out_shape_[i];
+                        out_off += out_idx * out_strides_[i];
+                        size_m in_idx = (size_m) std::lround((double)out_idx * scale[i]);
+                        if (in_idx >= in_shape_[i]) in_idx = in_shape_[i] - 1;
+                        in_off += in_idx * in_strides_[i];
+                    }
+                    for (size_m c = 0; c < tail_size; c++) {
+                        out_data[out_off + c * out_tail_stride] = in_data[in_off + c * in_tail_stride];
+                    }
+                }
+            }
+        } else { // Linear
+            if (leading_rank == 1) {
+                size_m out_s0 = out_strides_[0], in_s0 = in_strides_[0], in_sh0 = in_shape_[0];
+                float sc0 = scale[0];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    float coord = (float)i * sc0;
+                    float f = std::floor(coord);
+                    size_m fi = (size_m)f; if (fi >= in_sh0) fi = in_sh0 - 1;
+                    size_m ci = fi + 1;    if (ci >= in_sh0) ci = in_sh0 - 1;
+                    float frac = coord - f;
+                    size_m out_off = i * out_s0;
+                    size_m fi_off = fi * in_s0, ci_off = ci * in_s0;
+                    float w0 = 1.0f - frac, w1 = frac;
+                    for (size_m c = 0; c < tail_size; c++) {
+                        size_m tail_off = c * in_tail_stride;
+                        float sum = (float)in_data[fi_off + tail_off] * w0 + (float)in_data[ci_off + tail_off] * w1;
+                        out_data[out_off + c * out_tail_stride] = (T)sum;
+                    }
+                }
+            } else if (leading_rank == 2) {
+                size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1];
+                size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1];
+                size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1];
+                float sc0 = scale[0], sc1 = scale[1];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    float coord0 = (float)i * sc0;
+                    float f0 = std::floor(coord0);
+                    size_m fi0 = (size_m)f0; if (fi0 >= in_sh0) fi0 = in_sh0 - 1;
+                    size_m ci0 = fi0 + 1;    if (ci0 >= in_sh0) ci0 = in_sh0 - 1;
+                    float frac0 = coord0 - f0;
+                    size_m out_row = i * out_s0;
+                    size_m in_row_fi0 = fi0 * in_s0, in_row_ci0 = ci0 * in_s0;
+                    for (size_m j = 0; j < out_shape_[1]; j++) {
+                        float coord1 = (float)j * sc1;
+                        float f1 = std::floor(coord1);
+                        size_m fi1 = (size_m)f1; if (fi1 >= in_sh1) fi1 = in_sh1 - 1;
+                        size_m ci1 = fi1 + 1;    if (ci1 >= in_sh1) ci1 = in_sh1 - 1;
+                        float frac1 = coord1 - f1;
+
+                        size_m off00 = in_row_fi0 + fi1 * in_s1;
+                        size_m off01 = in_row_fi0 + ci1 * in_s1;
+                        size_m off10 = in_row_ci0 + fi1 * in_s1;
+                        size_m off11 = in_row_ci0 + ci1 * in_s1;
+                        float w00 = (1.0f - frac0) * (1.0f - frac1);
+                        float w01 = (1.0f - frac0) * frac1;
+                        float w10 = frac0 * (1.0f - frac1);
+                        float w11 = frac0 * frac1;
+
+                        size_m out_off = out_row + j * out_s1;
+                        for (size_m c = 0; c < tail_size; c++) {
+                            size_m tail_off = c * in_tail_stride;
+                            float sum = w00 * (float)in_data[off00 + tail_off]
+                                      + w01 * (float)in_data[off01 + tail_off]
+                                      + w10 * (float)in_data[off10 + tail_off]
+                                      + w11 * (float)in_data[off11 + tail_off];
+                            out_data[out_off + c * out_tail_stride] = (T)sum;
+                        }
+                    }
+                }
+            } else if (leading_rank == 3) {
+                size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1], out_s2 = out_strides_[2];
+                size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1], in_s2 = in_strides_[2];
+                size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1], in_sh2 = in_shape_[2];
+                float sc0 = scale[0], sc1 = scale[1], sc2 = scale[2];
+                for (size_m i = 0; i < out_shape_[0]; i++) {
+                    float coord0 = (float)i * sc0;
+                    float f0 = std::floor(coord0);
+                    size_m fi0 = (size_m)f0; if (fi0 >= in_sh0) fi0 = in_sh0 - 1;
+                    size_m ci0 = fi0 + 1;    if (ci0 >= in_sh0) ci0 = in_sh0 - 1;
+                    float frac0 = coord0 - f0;
+                    size_m out_plane = i * out_s0;
+                    size_m in_plane_fi0 = fi0 * in_s0, in_plane_ci0 = ci0 * in_s0;
+                    for (size_m j = 0; j < out_shape_[1]; j++) {
+                        float coord1 = (float)j * sc1;
+                        float f1 = std::floor(coord1);
+                        size_m fi1 = (size_m)f1; if (fi1 >= in_sh1) fi1 = in_sh1 - 1;
+                        size_m ci1 = fi1 + 1;    if (ci1 >= in_sh1) ci1 = in_sh1 - 1;
+                        float frac1 = coord1 - f1;
+                        size_m out_row = out_plane + j * out_s1;
+                        size_m base_fi0_fi1 = in_plane_fi0 + fi1 * in_s1;
+                        size_m base_fi0_ci1 = in_plane_fi0 + ci1 * in_s1;
+                        size_m base_ci0_fi1 = in_plane_ci0 + fi1 * in_s1;
+                        size_m base_ci0_ci1 = in_plane_ci0 + ci1 * in_s1;
+                        for (size_m k = 0; k < out_shape_[2]; k++) {
+                            float coord2 = (float)k * sc2;
+                            float f2 = std::floor(coord2);
+                            size_m fi2 = (size_m)f2; if (fi2 >= in_sh2) fi2 = in_sh2 - 1;
+                            size_m ci2 = fi2 + 1;    if (ci2 >= in_sh2) ci2 = in_sh2 - 1;
+                            float frac2 = coord2 - f2;
+
+                            size_m off000 = base_fi0_fi1 + fi2 * in_s2, off001 = base_fi0_fi1 + ci2 * in_s2;
+                            size_m off010 = base_fi0_ci1 + fi2 * in_s2, off011 = base_fi0_ci1 + ci2 * in_s2;
+                            size_m off100 = base_ci0_fi1 + fi2 * in_s2, off101 = base_ci0_fi1 + ci2 * in_s2;
+                            size_m off110 = base_ci0_ci1 + fi2 * in_s2, off111 = base_ci0_ci1 + ci2 * in_s2;
+                            float w000 = (1.0f - frac0) * (1.0f - frac1) * (1.0f - frac2);
+                            float w001 = (1.0f - frac0) * (1.0f - frac1) * frac2;
+                            float w010 = (1.0f - frac0) * frac1 * (1.0f - frac2);
+                            float w011 = (1.0f - frac0) * frac1 * frac2;
+                            float w100 = frac0 * (1.0f - frac1) * (1.0f - frac2);
+                            float w101 = frac0 * (1.0f - frac1) * frac2;
+                            float w110 = frac0 * frac1 * (1.0f - frac2);
+                            float w111 = frac0 * frac1 * frac2;
+
+                            size_m out_off = out_row + k * out_s2;
+                            for (size_m c = 0; c < tail_size; c++) {
+                                size_m tail_off = c * in_tail_stride;
+                                float sum = w000 * (float)in_data[off000 + tail_off]
+                                          + w001 * (float)in_data[off001 + tail_off]
+                                          + w010 * (float)in_data[off010 + tail_off]
+                                          + w011 * (float)in_data[off011 + tail_off]
+                                          + w100 * (float)in_data[off100 + tail_off]
+                                          + w101 * (float)in_data[off101 + tail_off]
+                                          + w110 * (float)in_data[off110 + tail_off]
+                                          + w111 * (float)in_data[off111 + tail_off];
+                                out_data[out_off + c * out_tail_stride] = (T)sum;
+                            }
+                        }
+                    }
+                }
+            } else {
+                size_m num_corners = 1u << leading_rank;
+                size_t leading_total = output.total_size / tail_size;
+                for (size_t gid = 0; gid < leading_total; gid++) {
+                    size_m rem = (size_m)gid;
+                    size_m out_off = 0;
+                    size_m floor_idx[MAX_TENSOR_DIMS];
+                    float frac[MAX_TENSOR_DIMS];
+                    for (int i = (int)leading_rank - 1; i >= 0; i--) {
+                        size_m out_idx = rem % out_shape_[i];
+                        rem /= out_shape_[i];
+                        out_off += out_idx * out_strides_[i];
+                        float coord = (float)out_idx * scale[i];
+                        float f = std::floor(coord);
+                        size_m fi = (size_m)f;
+                        if (fi >= in_shape_[i]) fi = in_shape_[i] - 1;
+                        floor_idx[i] = fi;
+                        frac[i] = coord - f;
+                    }
+
+                    // Precompute each corner's leading-axis input offset & weight once,
+                    // then reuse them across every element of the identity tail axis.
+                    float corner_weight[1 << (MAX_TENSOR_DIMS - 1)];
+                    size_m corner_off[1 << (MAX_TENSOR_DIMS - 1)];
+                    for (size_m corner = 0; corner < num_corners; corner++) {
+                        float weight = 1.0f;
+                        size_m off = 0;
+                        for (int i = 0; i < (int)leading_rank; i++) {
+                            bool bit = (corner >> i) & 1u;
+                            size_m idx = floor_idx[i];
+                            if (bit) {
+                                size_m ceil_i = idx + 1;
+                                if (ceil_i >= in_shape_[i]) ceil_i = in_shape_[i] - 1;
+                                idx = ceil_i;
+                                weight *= frac[i];
+                            } else {
+                                weight *= (1.0f - frac[i]);
+                            }
+                            off += idx * in_strides_[i];
+                        }
+                        corner_weight[corner] = weight;
+                        corner_off[corner] = off;
+                    }
+
+                    for (size_m c = 0; c < tail_size; c++) {
+                        size_m tail_off = c * in_tail_stride;
+                        float sum = 0.0f;
+                        for (size_m corner = 0; corner < num_corners; corner++) {
+                            if (corner_weight[corner] != 0.0f) {
+                                sum += corner_weight[corner] * (float)in_data[corner_off[corner] + tail_off];
+                            }
+                        }
+                        out_data[out_off + c * out_tail_stride] = (T)sum;
+                    }
+                }
+            }
+        }
+    });
 }
 
 template matrix &matrix::operator=<float>(float);

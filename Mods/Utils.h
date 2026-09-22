@@ -72,6 +72,11 @@ enum class ConvModeFull : uint8_t {
     Mirror  = 2  // optional common mode
 };
 
+enum class ResampleMode : uint8_t {
+    Nearest = 0,
+    Linear = 1,
+};
+
 
 enum class EvalType {
     EVAL_AUTO = 0,
