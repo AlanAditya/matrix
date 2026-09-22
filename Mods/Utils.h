@@ -219,6 +219,13 @@ struct AxisRange {
 void PatternFill(void* destination, const void* pattern, size_t patternSize, uint32_t n);
 void append_uint32(uint32_t value, std::vector<uint8_t>& header);
 
+template <typename T>
+void append_buf(const T* begin, size_t count, std::vector<uint8_t>& buffer) {
+    size_t pos = buffer.size();
+    buffer.resize(pos + count * sizeof(T));
+    memcpy(buffer.data() + pos, begin, count * sizeof(T));
+}
+
 template<typename T>
 void append_raw(T value, std::vector<uint8_t>& buffer)
 {

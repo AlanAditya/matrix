@@ -190,9 +190,10 @@ See [[MemoryManagement]] for the full ownership model this section implements.
 
 | Method | Purpose |
 |---|---|
-| `CopyToTexture(texture, exec=EncodeAndExecute)` | Blits the matrix's buffer into an existing `MTLTexture`. |
+| `CopyToTexture(texture, exec=EncodeAndExecute)` | Blits the matrix's buffer into an existing `MTLTexture`. `eval()`s first, and builds a Metal wrapper if the matrix has none (e.g. it was evaluated on the CPU). |
 | `ToMTLTexture(exec=EncodeAndExecute)` | Creates and returns a new `MTLTexture` from the matrix. |
 | `save_as_image(path, img_type)` | Writes the matrix out as an image file. |
+| `matrix::save_as_npz(std::vector<matrix> input, std::string file_path)` | Writes the matrices to one uncompressed NumPy `.npz` (`arr_0.npy`, `arr_1.npy`, ... like `np.savez`), loadable with `np.load`. Evaluates lazy inputs and packs non-contiguous ones first. Supports all dtypes (Float `<f4`, Float16 `<f2`, Int32 `<i4`, UInt32 `<u4`, Int16 `<i2`, UInt16 `<u2`, UInt8 `\|u1`). No ZIP64: throws `std::runtime_error`, before writing anything, if there are more than 65535 arrays, any array is ≥ 4 GiB, or the file would be ≥ 4 GiB. Static; it's an I/O sink, not a graph op. |
 | `matrix::fromImage(path, meta_out=nullptr)` | See Core factories above — the inverse operation. |
 
 ## Friend / Free Helper Functions Declared Here

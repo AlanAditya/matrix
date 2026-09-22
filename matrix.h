@@ -927,6 +927,13 @@ public:
     
     void save_as_image(std::string path, ImgType img_type);
 
+    // Writes N matrices into one uncompressed .npz (a plain ZIP of .npy entries,
+    // named "arr_0.npy", "arr_1.npy", ... to match numpy's np.savez default naming).
+    // Static because there's no natural "this" - it's an I/O sink over a list of
+    // already-existing matrices, not a graph-building op, so it doesn't belong in
+    // the frontend/primitive/backend op pipeline described in AddingNewOps.md.
+    static void save_as_npz(std::vector<matrix> input, std::string file_path);
+
     // Eagerly loads the "vertex" element of a .ply file (ascii, binary_little_endian
     // or binary_big_endian). Each inner list of `groups` names PLY properties
     // (exact header names) and becomes one [N, group.size()] matrix, columns in

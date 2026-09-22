@@ -21,6 +21,7 @@
 #include <arm_fp16.h>
 #include <arm_neon.h>
 #include <atomic>
+#include <fstream>
 #include <iomanip>
 #include <numeric>
 #include <random>
@@ -3046,6 +3047,318 @@ void matrix::save_as_image(std::string path, ImgType img_type) {
     
     CGImageRelease(image);
     CFRelease(dest);
+}
+
+// ---------------------------------------------------------------------------
+// save_as_npz
+//
+// An .npz is just a ZIP archive whose entries are .npy files. We only need
+// the STORED (uncompressed) ZIP method, so no zlib/deflate dependency is
+// required - just three pieces:
+//   1. npy_header(matrix)       -> the ASCII ".npy" header for one array
+//   2. crc32(data, len)         -> checksum ZIP needs per entry
+//   3. the ZIP container itself -> local file headers + central directory + EOCD
+//
+// No ZIP64: each entry must be < 4 GiB, the whole file < 4 GiB, and there can be at
+// most 65535 entries. save_as_npz() checks all three up front and throws std::runtime_error.
+// ---------------------------------------------------------------------------
+
+// Maps our dtype enum to a numpy "descr" string, e.g. dtype::Float -> "<f4".
+// '<' = little-endian, 'f'/'i'/'u' = float/signed/unsigned, digit = byte width.
+// Single-byte types conventionally use '|' (byte order is meaningless for 1 byte).
+static std::string npy_descr_for_dtype(dtype type) {
+    std::string desc;
+    switch (type) {
+        case dtype::Float:
+            desc = "<f4";
+            break;
+        case dtype::Float16:
+            desc = "<f2";
+            break;
+        case dtype::Int32:
+            desc = "<i4";
+            break;
+        case dtype::UInt32:
+            desc = "<u4";
+            break;
+        case dtype::Int16:
+            desc = "<i2";
+            break;
+        case dtype::UInt16:
+            desc = "<u2";
+            break;
+        case dtype::UInt8:
+            desc = "|u1";
+            break;
+        default:
+            throw std::runtime_error("npy_descr_for_dtype: not implemented");
+            break;
+    }
+    return desc;
+}
+
+// Builds the Python-tuple shape string numpy expects, e.g. {5} -> "(5,)"  (note
+// the trailing comma required for 1-tuples), {3,4} -> "(3, 4)", {} -> "()".
+static std::string npy_shape_tuple_string(const size_m* shape, uint32_t dims) {
+    std::string output;
+    output += "(";
+    for (int i = 0; i < dims; i++) {
+        output += std::to_string(shape[i]);;
+        if (dims == 1 || i + 1 < dims) output += ",";
+    }
+    output += ")";
+    return output;
+}
+
+// Builds one full .npy file (header + raw data) for a single, already-contiguous
+// matrix. Layout:
+//   bytes 0-5   magic "\x93NUMPY"
+//   byte  6     major version (1)
+//   byte  7     minor version (0)
+//   bytes 8-9   uint16 LE: length of the header string that follows
+//   header      ASCII dict "{'descr': '<f4', 'fortran_order': False, 'shape': (3, 4), }"
+//               padded with spaces + a trailing '\n' so that
+//               (10 + header.size()) is a multiple of 64 (npy alignment rule)
+//   data        raw bytes, exactly matrix.total_size * dtype_size(matrix.type)
+static std::vector<uint8_t> build_npy_blob(const matrix& mat) {
+    std::string shape = npy_shape_tuple_string(mat.shape(), mat.dims);
+    std::string type_desc = npy_descr_for_dtype(mat.type);
+    std::string header = "{'descr': '" + type_desc + "', 'fortran_order': False, 'shape': " + shape + ", }";
+
+    // Pad with spaces + a trailing '\n' so (10 + header.size()) % 64 == 0.
+    size_t unpadded_total = 10 + header.size() + 1;
+    size_t pad = (64 - (unpadded_total % 64)) % 64;
+    header.append(pad, ' ');
+    header.push_back('\n');
+
+    std::vector<uint8_t> bytes;
+    static const uint8_t magic[6] = {0x93, 'N', 'U', 'M', 'P', 'Y'};
+    append_buf<uint8_t>(magic, 6, bytes);
+    append_raw<uint8_t>(1, bytes);  // major version
+    append_raw<uint8_t>(0, bytes);  // minor version
+    append_raw<uint16_t>((uint16_t)header.size(), bytes);
+    append_buf<char>(header.data(), header.size(), bytes);
+
+    // `mat.buffer` is only valid here once the matrix is evaluated AND
+    // contiguous - see the caller in save_as_npz for how that's guaranteed.
+    size_t data_bytes = (size_t)mat.total_size * dtype_size(mat.type);
+    append_buf<uint8_t>(reinterpret_cast<const uint8_t*>(mat.buffer), data_bytes, bytes);
+    return bytes;
+}
+
+// Standard ZIP CRC-32 (polynomial 0xEDB88320), needed per-entry in both the
+// local file header and the central directory record.
+static uint32_t crc32(const uint8_t* data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            uint32_t mask = (uint32_t)(-(int32_t)(crc & 1u));
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+void matrix::save_as_npz(std::vector<matrix> input, std::string file_path) {
+    // 1) Get every matrix into a materialized, contiguous buffer before we can
+    //    read raw bytes out of it:
+    //      - mat.eval() forces any pending lazy graph (tape) to run so
+    //        mat.buffer is actually populated.
+    //      - a matrix can still be a *view* after eval (e.g. from slicing or
+    //        transpose) with non-default strides - check mat.flags &
+    //        NON_CONTIGUOUS_FLAG (Mods/Utils.h) and if set, make a packed copy
+    //        with mat.astype(mat.type, /*make_contig=*/true), then eval() the
+    //        result too (astype() builds a lazy AsTypePrimitive node, it does
+    //        not run immediately - same as any other frontend op).
+    //
+    // 2) For each prepared matrix, build_npy_blob(mat) and remember it under
+    //    the name "arr_<i>.npy" (numpy's default naming from np.savez).
+    //
+    // 3) Write the ZIP container to file_path:
+    //      for each named blob, in order:
+    //        - remember the current file offset (needed by its central
+    //          directory record)
+    //        - write a Local File Header, then the raw blob bytes
+    //      after all entries:
+    //        - write one Central Directory record per entry
+    //        - write a single End Of Central Directory (EOCD) record
+    //
+    //    ZIP Local File Header (30 bytes + filename):
+    //      u32 signature       0x04034b50
+    //      u16 version needed  20
+    //      u16 flags           0
+    //      u16 method          0        (STORED = no compression)
+    //      u16 mod time        0
+    //      u16 mod date        0
+    //      u32 crc32           crc32(blob)
+    //      u32 compressed size blob.size()   (== uncompressed, STORED)
+    //      u32 uncompressed size blob.size()
+    //      u16 filename length
+    //      u16 extra length    0
+    //      [filename bytes]
+    //
+    //    ZIP Central Directory record (46 bytes + filename), one per entry:
+    //      u32 signature       0x02014b50
+    //      u16 version made by 20
+    //      u16 version needed  20
+    //      u16 flags           0
+    //      u16 method          0
+    //      u16 mod time        0
+    //      u16 mod date        0
+    //      u32 crc32
+    //      u32 compressed size
+    //      u32 uncompressed size
+    //      u16 filename length
+    //      u16 extra length    0
+    //      u16 comment length  0
+    //      u16 disk number     0
+    //      u16 internal attrs  0
+    //      u32 external attrs  0
+    //      u32 local header offset   (the offset you recorded in step 3)
+    //      [filename bytes]
+    //
+    //    End Of Central Directory record (22 bytes), written once at the end:
+    //      u32 signature           0x06054b50
+    //      u16 disk number         0
+    //      u16 disk w/ CD start    0
+    //      u16 entries on disk     input.size()
+    //      u16 total entries       input.size()
+    //      u32 central dir size    (bytes written in the central directory step)
+    //      u32 central dir offset  (file offset where the central directory started)
+    //      u16 comment length      0
+    //
+    // All multi-byte integers above are little-endian - write them byte-by-byte
+    // (or memcpy from a LE host, which arm64/x86_64 both are) rather than
+    // relying on struct layout/padding.
+    // No ZIP64 support, so every count, size and offset below must fit the plain ZIP
+    // fields: entry counts are u16, sizes and offsets are u32. All limits are checked
+    // before the file is opened, so an over-limit export throws instead of leaving a
+    // truncated or silently corrupt .npz behind.
+    constexpr uint64_t kMaxZipEntries = 0xFFFF;
+    constexpr uint64_t kMaxZip32      = 0xFFFFFFFFull;
+
+    if (input.size() > kMaxZipEntries) {
+        throw std::runtime_error("save_as_npz: " + std::to_string(input.size()) +
+                                 " arrays exceeds the ZIP limit of 65535 entries (no ZIP64 support)");
+    }
+
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> entries;
+    entries.reserve(input.size());
+
+    for (size_t i = 0; i < input.size(); i++) {
+        matrix& mat = input[i];
+
+        // Reject an oversized array before eval/packing/serializing it, so we never
+        // allocate a multi-GiB copy just to throw afterwards.
+        uint64_t data_bytes = (uint64_t)mat.total_size * dtype_size(mat.type);
+        if (data_bytes > kMaxZip32) {
+            throw std::runtime_error("save_as_npz: arr_" + std::to_string(i) + " is " +
+                                     std::to_string(data_bytes) +
+                                     " bytes, over the 4 GiB per-entry ZIP limit (no ZIP64 support)");
+        }
+
+        mat.eval();
+
+        std::string name = "arr_" + std::to_string(i) + ".npy";
+        if (mat.flags & NON_CONTIGUOUS_FLAG) {
+            matrix packed = mat.astype(mat.type, /*make_contig=*/true);
+            packed.eval();
+            entries.emplace_back(std::move(name), build_npy_blob(packed));
+        } else {
+            entries.emplace_back(std::move(name), build_npy_blob(mat));
+        }
+
+        // Exact check: the .npy header can push data just under the limit over it.
+        if (entries.back().second.size() > kMaxZip32) {
+            throw std::runtime_error("save_as_npz: arr_" + std::to_string(i) + " serializes to " +
+                                     std::to_string(entries.back().second.size()) +
+                                     " bytes, over the 4 GiB per-entry ZIP limit (no ZIP64 support)");
+        }
+    }
+
+    // Every local header offset, the central directory offset and its size are u32
+    // fields, so the whole file has to stay under 4 GiB.
+    uint64_t file_bytes = 22;                                   // EOCD record
+    for (const auto& e : entries) {
+        file_bytes += 30 + e.first.size() + e.second.size();    // local header + data
+        file_bytes += 46 + e.first.size();                      // central directory record
+    }
+    if (file_bytes > kMaxZip32) {
+        throw std::runtime_error("save_as_npz: output would be " + std::to_string(file_bytes) +
+                                 " bytes, over the 4 GiB ZIP limit (no ZIP64 support)");
+    }
+
+    std::ofstream f(file_path, std::ios::binary);
+    if (!f) {
+        throw std::runtime_error("save_as_npz: failed to open file for writing: " + file_path);
+    }
+
+    std::vector<uint32_t> local_offsets(entries.size());
+    std::vector<uint32_t> crcs(entries.size());
+
+    for (size_t i = 0; i < entries.size(); i++) {
+        const std::string& name = entries[i].first;
+        const std::vector<uint8_t>& blob = entries[i].second;
+
+        crcs[i] = crc32(blob.data(), blob.size());
+        local_offsets[i] = (uint32_t)f.tellp();
+
+        std::vector<uint8_t> lfh;
+        append_raw<uint32_t>(0x04034b50, lfh);
+        append_raw<uint16_t>(20, lfh);  // version needed
+        append_raw<uint16_t>(0, lfh);   // flags
+        append_raw<uint16_t>(0, lfh);   // method (STORED)
+        append_raw<uint16_t>(0, lfh);   // mod time
+        append_raw<uint16_t>(0, lfh);   // mod date
+        append_raw<uint32_t>(crcs[i], lfh);
+        append_raw<uint32_t>((uint32_t)blob.size(), lfh);  // compressed size
+        append_raw<uint32_t>((uint32_t)blob.size(), lfh);  // uncompressed size
+        append_raw<uint16_t>((uint16_t)name.size(), lfh);
+        append_raw<uint16_t>(0, lfh);  // extra length
+        append_buf<char>(name.data(), name.size(), lfh);
+
+        f.write(reinterpret_cast<const char*>(lfh.data()), (std::streamsize)lfh.size());
+        f.write(reinterpret_cast<const char*>(blob.data()), (std::streamsize)blob.size());
+    }
+
+    uint32_t central_dir_offset = (uint32_t)f.tellp();
+    std::vector<uint8_t> central_dir;
+    for (size_t i = 0; i < entries.size(); i++) {
+        const std::string& name = entries[i].first;
+        const std::vector<uint8_t>& blob = entries[i].second;
+
+        append_raw<uint32_t>(0x02014b50, central_dir);
+        append_raw<uint16_t>(20, central_dir);  // version made by
+        append_raw<uint16_t>(20, central_dir);  // version needed
+        append_raw<uint16_t>(0, central_dir);   // flags
+        append_raw<uint16_t>(0, central_dir);   // method
+        append_raw<uint16_t>(0, central_dir);   // mod time
+        append_raw<uint16_t>(0, central_dir);   // mod date
+        append_raw<uint32_t>(crcs[i], central_dir);
+        append_raw<uint32_t>((uint32_t)blob.size(), central_dir);  // compressed size
+        append_raw<uint32_t>((uint32_t)blob.size(), central_dir);  // uncompressed size
+        append_raw<uint16_t>((uint16_t)name.size(), central_dir);
+        append_raw<uint16_t>(0, central_dir);  // extra length
+        append_raw<uint16_t>(0, central_dir);  // comment length
+        append_raw<uint16_t>(0, central_dir);  // disk number
+        append_raw<uint16_t>(0, central_dir);  // internal attrs
+        append_raw<uint32_t>(0, central_dir);  // external attrs
+        append_raw<uint32_t>(local_offsets[i], central_dir);
+        append_buf<char>(name.data(), name.size(), central_dir);
+    }
+    f.write(reinterpret_cast<const char*>(central_dir.data()), (std::streamsize)central_dir.size());
+
+    std::vector<uint8_t> eocd;
+    append_raw<uint32_t>(0x06054b50, eocd);
+    append_raw<uint16_t>(0, eocd);                         // disk number
+    append_raw<uint16_t>(0, eocd);                         // disk w/ CD start
+    append_raw<uint16_t>((uint16_t)entries.size(), eocd);  // entries on this disk
+    append_raw<uint16_t>((uint16_t)entries.size(), eocd);  // total entries
+    append_raw<uint32_t>((uint32_t)central_dir.size(), eocd);
+    append_raw<uint32_t>(central_dir_offset, eocd);
+    append_raw<uint16_t>(0, eocd);  // comment length
+    f.write(reinterpret_cast<const char*>(eocd.data()), (std::streamsize)eocd.size());
 }
 
 // ---- PLY point-cloud loading (matrix::pointsFromPLY) ----------------------
