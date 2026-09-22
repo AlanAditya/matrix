@@ -1306,17 +1306,18 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
-        if (out.buffer != (uint8_t*)input.buffer) {
+        // Compare against where the slice actually starts: comparing with the parent's base made
+        // this fire on every pass for any non-zero offset.
+        if (out.buffer != (uint8_t*)input.buffer + offset * dtype_size(out.type)) {
             out.releaseBuffer();
             out.buffer = (uint8_t*)input.buffer + offset * dtype_size(out.type);
             out.metalBuffer = input.metalBuffer;
             out.refCount = input.refCount;
             out.refCount->fetch_add(1);
 
-            out.tape->out_buffer = (uint8_t*)out.buffer;
-            out.tape->out_metal_buffer = out.metalBuffer;
-            out.tape->out_refcount = out.refCount;
-            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            // update_cache() releases the reference the cache already held before taking the
+            // new one; assigning the cache fields directly leaked one reference per rebind.
+            out.tape->update_cache((uint8_t*)out.buffer, out.metalBuffer, out.refCount);
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -1346,7 +1347,18 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
-        if (out.buffer != (uint8_t*)input.buffer) {
+        // Slice is a view: it never builds a wrapper of its own, it inherits the parent's. When the
+        // graph was last run on the CPU, `out` already has memory (so the branch above is skipped)
+        // but no wrapper, while the parent has only just built one earlier in this DFS - pass it
+        // down. A zero-offset slice depends on this: the rebind block below never fires for it.
+        // COMPILE does the handoff; on EXECUTE the pointers already match, so this is a no-op.
+        if (out.metalBuffer != input.metalBuffer) {
+            out.metalBuffer = input.metalBuffer;
+            out.tape->out_metal_buffer = out.metalBuffer;
+        }
+        // Compare against where the slice actually starts: comparing with the parent's base made
+        // this fire on every pass for any non-zero offset.
+        if (out.buffer != (uint8_t*)input.buffer + offset * dtype_size(out.type)) {
             out.releaseBuffer();
             out.buffer = (uint8_t*)input.buffer + offset * dtype_size(out.type);
             // Deliberately the parent's wrapper, which starts at the parent's base - not at the
@@ -1356,10 +1368,9 @@ public:
             out.refCount = input.refCount;
             out.refCount->fetch_add(1);
 
-            out.tape->out_buffer = (uint8_t*)out.buffer;
-            out.tape->out_metal_buffer = out.metalBuffer;
-            out.tape->out_refcount = out.refCount;
-            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            // update_cache() releases the reference the cache already held before taking the
+            // new one; assigning the cache fields directly leaked one reference per rebind.
+            out.tape->update_cache((uint8_t*)out.buffer, out.metalBuffer, out.refCount);
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -2487,9 +2498,13 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
-        if (!out_metal_buffer) {
-            out.buildMetalBuffer();
-            out_metal_buffer = out.metalBuffer;
+        // View: never builds a wrapper of its own, inherits the parent's. On a graph last run on the
+        // CPU, `out` already has memory (allocation branch skipped) but no wrapper, while the parent
+        // has only just built one earlier in this DFS - pass it down (see SlicePrimitive). COMPILE
+        // does the handoff; on EXECUTE the pointers already match, so this is a no-op.
+        if (out.metalBuffer != input.metalBuffer) {
+            out.metalBuffer = input.metalBuffer;
+            out.tape->out_metal_buffer = out.metalBuffer;
         }
         if (out.buffer != (uint8_t*)input.buffer) {
             out.releaseBuffer();
@@ -2666,9 +2681,19 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
-        if (!out_metal_buffer) {
-            out.buildMetalBuffer();
-            out_metal_buffer = out.metalBuffer;
+        if (REQUIRES_NEW_BUFFER) {
+            // Non-contiguous input: this node owns a fresh buffer, so it builds its own wrapper.
+            if (!out_metal_buffer) {
+                out.buildMetalBuffer();
+                out_metal_buffer = out.metalBuffer;
+            }
+        } else if (out.metalBuffer != input.metalBuffer) {
+            // View: never builds a wrapper of its own, inherits the parent's. On a graph last run on
+            // the CPU, `out` already has memory (allocation branch skipped) but no wrapper, while the
+            // parent has only just built one earlier in this DFS - pass it down (see SlicePrimitive).
+            // COMPILE does the handoff; on EXECUTE the pointers already match, so this is a no-op.
+            out.metalBuffer = input.metalBuffer;
+            out.tape->out_metal_buffer = out.metalBuffer;
         }
         if (out.buffer != (uint8_t*)input.buffer && !REQUIRES_NEW_BUFFER) {
             out.releaseBuffer();
@@ -2922,10 +2947,9 @@ public:
             out.refCount = input.refCount;
             if (out.refCount) out.refCount->fetch_add(1);
 
-            out.tape->out_buffer = (uint8_t*)out.buffer;
-            out.tape->out_metal_buffer = out.metalBuffer;
-            out.tape->out_refcount = out.refCount;
-            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            // update_cache() releases the reference the cache already held before taking the
+            // new one; assigning the cache fields directly leaked one reference per rebind.
+            out.tape->update_cache((uint8_t*)out.buffer, out.metalBuffer, out.refCount);
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -2955,9 +2979,13 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
-        if (!out_metal_buffer) {
-            out.buildMetalBuffer();
-            out_metal_buffer = out.metalBuffer;
+        // View: never builds a wrapper of its own, inherits the parent's. On a graph last run on the
+        // CPU, `out` already has memory (allocation branch skipped) but no wrapper, while the parent
+        // has only just built one earlier in this DFS - pass it down (see SlicePrimitive). COMPILE
+        // does the handoff; on EXECUTE the pointers already match, so this is a no-op.
+        if (out.metalBuffer != input.metalBuffer) {
+            out.metalBuffer = input.metalBuffer;
+            out.tape->out_metal_buffer = out.metalBuffer;
         }
         if (out.buffer != (uint8_t*)input.buffer) {
             out.releaseBuffer();
@@ -2966,10 +2994,9 @@ public:
             out.refCount = input.refCount;
             if (out.refCount) out.refCount->fetch_add(1);
 
-            out.tape->out_buffer = (uint8_t*)out.buffer;
-            out.tape->out_metal_buffer = out.metalBuffer;
-            out.tape->out_refcount = out.refCount;
-            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            // update_cache() releases the reference the cache already held before taking the
+            // new one; assigning the cache fields directly leaked one reference per rebind.
+            out.tape->update_cache((uint8_t*)out.buffer, out.metalBuffer, out.refCount);
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -3284,8 +3311,6 @@ public:
         }
 
         for (size_t i = 0; i < outer_inputs.size(); i++) {
-            if (!outer_inputs[i].metalBuffer && outer_inputs[i].buffer) {
-            }
             outer_inputs[i].shareBuffer(sample_inputs[i]);
         }
 
