@@ -3453,15 +3453,23 @@ void matrix::stack(const std::vector<matrix>& mats, matrix& output, int axis, Ex
     output.total_size = mats[0].total_size;
     
     matrix View(output.dims, output.type);
-    memcpy(View.shape(), out_shape, (output.dims+1) * sizeof(size_m));
+    memcpy(View.shape(), out_shape, output.dims * sizeof(size_m));
     View.shape()[axis] = 1;
-    View.calcStrides();
     View.total_size = mats[0].total_size;
-    View.flags |= NON_OWNERSHIP_FLAG;
-    
+    View.flags |= NON_OWNERSHIP_FLAG | NON_CONTIGUOUS_FLAG;
+
     size_m offset = output.strides()[axis];
+    size_m* view_strides = View.strides();
     if (exec_device == ExecutionDevice::METAL) {
         for (int i = 0; i < mats.size(); i++) {
+            // Use this input's ACTUAL strides, not a freshly-computed contiguous
+            // guess: a stack input can be a non-contiguous view (e.g. a channel
+            // slice of an interleaved image), and calcStrides() would silently
+            // assume it was packed, reading the wrong bytes.
+            const size_m* src_strides = mats[i].strides();
+            for (uint32_t d = 0; d < (uint32_t)axis; d++) view_strides[d] = src_strides[d];
+            view_strides[axis] = 0;
+            for (uint32_t d = axis; d < mats[i].dims; d++) view_strides[d + 1] = src_strides[d];
             View.buffer = mats[i].buffer;
             View.metalBuffer = mats[i].metalBuffer;
             View.type = mats[i].type;
@@ -3469,6 +3477,10 @@ void matrix::stack(const std::vector<matrix>& mats, matrix& output, int axis, Ex
         }
     } else {
         for (int i = 0; i < mats.size(); i++) {
+            const size_m* src_strides = mats[i].strides();
+            for (uint32_t d = 0; d < (uint32_t)axis; d++) view_strides[d] = src_strides[d];
+            view_strides[axis] = 0;
+            for (uint32_t d = axis; d < mats[i].dims; d++) view_strides[d + 1] = src_strides[d];
             View.buffer = mats[i].buffer;
             View.metalBuffer = mats[i].metalBuffer;
             View.type = mats[i].type;
