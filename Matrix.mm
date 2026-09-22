@@ -29,6 +29,12 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <cerrno>
+#include <limits>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #if !TARGET_OS_IPHONE
     #import <CoreServices/CoreServices.h>
 #else
@@ -3019,6 +3025,543 @@ void matrix::save_as_image(std::string path, ImgType img_type) {
     
     CGImageRelease(image);
     CFRelease(dest);
+}
+
+// ---- PLY point-cloud loading (matrix::pointsFromPLY) ----------------------
+//
+// A PLY body is an array of structs per element, laid out in header order with
+// no padding; the struct itself is whatever the header declares. We parse the
+// header into a schema, skip every element before "vertex", then walk the
+// vertex records and copy only the requested properties straight into their
+// group's [N, C] matrix. Bytes are copied as-is (byte-swapped for big endian,
+// text-parsed for ascii) - never converted to another type.
+
+// Int64/UInt64 aren't in the PLY spec, but some writers emit them; they're known
+// only so their bytes can be skipped (no matching dtype, so requesting one throws).
+enum class PlyType : uint8_t { Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float32, Float64 };
+
+struct PlyProperty {
+    std::string name;
+    PlyType type = PlyType::UInt8;       // scalar type, or item type for a list
+    bool is_list = false;
+    PlyType count_type = PlyType::UInt8; // only meaningful for lists
+};
+
+struct PlyElement {
+    std::string name;
+    uint64_t count = 0;
+    std::vector<PlyProperty> props;
+};
+
+enum class PlyFormat : uint8_t { Ascii, BinaryLE, BinaryBE };
+
+static size_t ply_type_size(PlyType t) {
+    switch (t) {
+        case PlyType::Int8:    case PlyType::UInt8:   return 1;
+        case PlyType::Int16:   case PlyType::UInt16:  return 2;
+        case PlyType::Int32:   case PlyType::UInt32:
+        case PlyType::Float32:                        return 4;
+        case PlyType::Int64:   case PlyType::UInt64:
+        case PlyType::Float64:                        return 8;
+    }
+    return 0;
+}
+
+static const char* ply_type_name(PlyType t) {
+    switch (t) {
+        case PlyType::Int8:    return "char";
+        case PlyType::UInt8:   return "uchar";
+        case PlyType::Int16:   return "short";
+        case PlyType::UInt16:  return "ushort";
+        case PlyType::Int32:   return "int";
+        case PlyType::UInt32:  return "uint";
+        case PlyType::Int64:   return "int64";
+        case PlyType::UInt64:  return "uint64";
+        case PlyType::Float32: return "float";
+        case PlyType::Float64: return "double";
+    }
+    return "?";
+}
+
+static PlyType ply_parse_type(const std::string& s) {
+    if (s == "char"   || s == "int8")    return PlyType::Int8;
+    if (s == "uchar"  || s == "uint8")   return PlyType::UInt8;
+    if (s == "short"  || s == "int16")   return PlyType::Int16;
+    if (s == "ushort" || s == "uint16")  return PlyType::UInt16;
+    if (s == "int"    || s == "int32")   return PlyType::Int32;
+    if (s == "uint"   || s == "uint32")  return PlyType::UInt32;
+    if (s == "int64")                    return PlyType::Int64;
+    if (s == "uint64")                   return PlyType::UInt64;
+    if (s == "float"  || s == "float32") return PlyType::Float32;
+    if (s == "double" || s == "float64") return PlyType::Float64;
+    throw std::runtime_error("pointsFromPLY: unknown property type '" + s + "'");
+}
+
+// The dtype a PLY scalar lands in unchanged; false when the matrix has no
+// matching dtype (char, int64, uint64, double) - we refuse rather than narrow/widen.
+static bool ply_dtype_for(PlyType t, dtype& out) {
+    switch (t) {
+        case PlyType::UInt8:   out = dtype::UInt8;  return true;
+        case PlyType::Int16:   out = dtype::Int16;  return true;
+        case PlyType::UInt16:  out = dtype::UInt16; return true;
+        case PlyType::Int32:   out = dtype::Int32;  return true;
+        case PlyType::UInt32:  out = dtype::UInt32; return true;
+        case PlyType::Float32: out = dtype::Float;  return true;
+        case PlyType::Int8:
+        case PlyType::Int64:
+        case PlyType::UInt64:
+        case PlyType::Float64: return false;
+    }
+    return false;
+}
+
+// Read-only mmap of the whole file, so large clouds are never copied into a string.
+struct PlyMappedFile {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+
+    explicit PlyMappedFile(const std::string& path) {
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0)
+            throw std::runtime_error("pointsFromPLY: cannot open '" + path + "'");
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            close(fd);
+            throw std::runtime_error("pointsFromPLY: cannot stat '" + path + "'");
+        }
+        size = (size_t)st.st_size;
+        if (size > 0) {
+            void* p = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (p == MAP_FAILED) {
+                close(fd);
+                throw std::runtime_error("pointsFromPLY: cannot map '" + path + "'");
+            }
+            data = static_cast<const uint8_t*>(p);
+        }
+        close(fd);
+    }
+    ~PlyMappedFile() {
+        if (data) munmap(const_cast<uint8_t*>(data), size);
+    }
+    PlyMappedFile(const PlyMappedFile&) = delete;
+    PlyMappedFile& operator=(const PlyMappedFile&) = delete;
+};
+
+// Parses the header; returns the byte offset where the body starts.
+static size_t ply_parse_header(const uint8_t* data, size_t size, PlyFormat& format, std::vector<PlyElement>& elements) {
+    size_t pos = 0;
+    auto next_line = [&](std::string& line) -> bool {
+        if (pos >= size) return false;
+        size_t start = pos;
+        while (pos < size && data[pos] != '\n' && data[pos] != '\r') pos++;
+        line.assign(reinterpret_cast<const char*>(data) + start, pos - start);
+        // Accept "\n" and "\r\n" endings. Consuming only one '\n' after '\r'
+        // matters for binary bodies whose first byte may itself be 0x0A.
+        if (pos < size && data[pos] == '\r') pos++;
+        if (pos < size && data[pos] == '\n') pos++;
+        return true;
+    };
+
+    std::string line;
+    if (!next_line(line) || line.rfind("ply", 0) != 0 || line.find_first_not_of(" \t", 3) != std::string::npos)
+        throw std::runtime_error("pointsFromPLY: not a PLY file (missing 'ply' magic line)");
+
+    bool have_format = false;
+    while (next_line(line)) {
+        std::istringstream ss(line);
+        std::string keyword;
+        if (!(ss >> keyword)) continue; // blank line
+
+        if (keyword == "end_header") {
+            if (!have_format)
+                throw std::runtime_error("pointsFromPLY: header has no 'format' line");
+            return pos;
+        }
+        if (keyword == "comment" || keyword == "obj_info") continue;
+
+        if (keyword == "format") {
+            std::string kind;
+            ss >> kind;
+            if      (kind == "ascii")                format = PlyFormat::Ascii;
+            else if (kind == "binary_little_endian") format = PlyFormat::BinaryLE;
+            else if (kind == "binary_big_endian")    format = PlyFormat::BinaryBE;
+            else throw std::runtime_error("pointsFromPLY: unknown format '" + kind + "'");
+            have_format = true;
+        } else if (keyword == "element") {
+            PlyElement e;
+            if (!(ss >> e.name >> e.count))
+                throw std::runtime_error("pointsFromPLY: malformed element line '" + line + "'");
+            elements.push_back(std::move(e));
+        } else if (keyword == "property") {
+            if (elements.empty())
+                throw std::runtime_error("pointsFromPLY: property declared before any element");
+            PlyProperty p;
+            std::string first;
+            ss >> first;
+            if (first == "list") {
+                std::string count_t, item_t;
+                if (!(ss >> count_t >> item_t >> p.name))
+                    throw std::runtime_error("pointsFromPLY: malformed list property '" + line + "'");
+                p.is_list = true;
+                p.count_type = ply_parse_type(count_t);
+                p.type = ply_parse_type(item_t);
+                if (p.count_type == PlyType::Float32 || p.count_type == PlyType::Float64)
+                    throw std::runtime_error("pointsFromPLY: list '" + p.name + "' has a floating-point count type");
+            } else {
+                if (!(ss >> p.name))
+                    throw std::runtime_error("pointsFromPLY: malformed property '" + line + "'");
+                p.type = ply_parse_type(first);
+            }
+            elements.back().props.push_back(std::move(p));
+        } else {
+            throw std::runtime_error("pointsFromPLY: unknown header keyword '" + keyword + "'");
+        }
+    }
+    throw std::runtime_error("pointsFromPLY: header has no 'end_header'");
+}
+
+static inline void ply_copy_scalar(uint8_t* dst, const uint8_t* src, size_t n, bool swap) {
+    if (!swap) {
+        switch (n) {
+            case 1: dst[0] = src[0]; return;
+            case 2: memcpy(dst, src, 2); return;
+            case 4: memcpy(dst, src, 4); return;
+            default: memcpy(dst, src, n); return;
+        }
+    }
+    for (size_t b = 0; b < n; b++) dst[b] = src[n - 1 - b];
+}
+
+// Binary list count -> element count. Counts are small integers of any int type.
+static uint64_t ply_read_count(const uint8_t* src, PlyType t, bool swap) {
+    uint8_t raw[8] = {};
+    ply_copy_scalar(raw, src, ply_type_size(t), swap);
+    switch (t) {
+        case PlyType::UInt8:  return raw[0];
+        case PlyType::Int8:   { int8_t v;   memcpy(&v, raw, 1); if (v < 0) break; return (uint64_t)v; }
+        case PlyType::UInt16: { uint16_t v; memcpy(&v, raw, 2); return v; }
+        case PlyType::Int16:  { int16_t v;  memcpy(&v, raw, 2); if (v < 0) break; return (uint64_t)v; }
+        case PlyType::UInt32: { uint32_t v; memcpy(&v, raw, 4); return v; }
+        case PlyType::Int32:  { int32_t v;  memcpy(&v, raw, 4); if (v < 0) break; return (uint64_t)v; }
+        case PlyType::UInt64: { uint64_t v; memcpy(&v, raw, 8); return v; }
+        case PlyType::Int64:  { int64_t v;  memcpy(&v, raw, 8); if (v < 0) break; return (uint64_t)v; }
+        default: break;
+    }
+    throw std::runtime_error("pointsFromPLY: negative or invalid list count");
+}
+
+// Whitespace-separated token stream over an ascii body. Records are just
+// consecutive tokens - we don't rely on one record per line.
+struct PlyAsciiCursor {
+    const char* p;
+    const char* end;
+
+    void next(const char*& tok, size_t& len) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+        if (p == end)
+            throw std::runtime_error("pointsFromPLY: ascii body ended early (file truncated?)");
+        tok = p;
+        while (p < end && !(*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+        len = (size_t)(p - tok);
+    }
+    void skip() { const char* t; size_t n; next(t, n); }
+};
+
+// The mmap'd body isn't NUL-terminated, so strto* needs a bounded copy.
+static void ply_token_to_cstr(const char* tok, size_t len, char (&buf)[64]) {
+    if (len >= sizeof(buf))
+        throw std::runtime_error("pointsFromPLY: ascii token too long: '" + std::string(tok, 32) + "...'");
+    memcpy(buf, tok, len);
+    buf[len] = '\0';
+}
+
+static uint64_t ply_ascii_count(PlyAsciiCursor& cur) {
+    const char* tok; size_t len; char buf[64];
+    cur.next(tok, len);
+    ply_token_to_cstr(tok, len, buf);
+    char* e;
+    long long v = strtoll(buf, &e, 10);
+    if (e != buf + len || v < 0)
+        throw std::runtime_error(std::string("pointsFromPLY: invalid list count '") + buf + "'");
+    return (uint64_t)v;
+}
+
+// Parses one ascii token as exactly the declared PLY type and stores its bytes.
+static void ply_ascii_scalar(PlyAsciiCursor& cur, PlyType t, uint8_t* dst) {
+    const char* tok; size_t len; char buf[64];
+    cur.next(tok, len);
+    ply_token_to_cstr(tok, len, buf);
+    char* e = nullptr;
+    auto bad = [&]() {
+        return std::runtime_error(std::string("pointsFromPLY: '") + buf + "' is not a valid " + ply_type_name(t));
+    };
+    auto store_int = [&](auto tag) {
+        using T = decltype(tag);
+        errno = 0;
+        if constexpr (std::is_signed_v<T>) {
+            long long v = strtoll(buf, &e, 10);
+            if (e != buf + len || errno == ERANGE || v < std::numeric_limits<T>::min() || v > std::numeric_limits<T>::max()) throw bad();
+            T out = (T)v; memcpy(dst, &out, sizeof(T));
+        } else {
+            if (buf[0] == '-') throw bad();
+            unsigned long long v = strtoull(buf, &e, 10);
+            if (e != buf + len || errno == ERANGE || v > std::numeric_limits<T>::max()) throw bad();
+            T out = (T)v; memcpy(dst, &out, sizeof(T));
+        }
+    };
+    switch (t) {
+        case PlyType::UInt8:  store_int(uint8_t{});  return;
+        case PlyType::Int16:  store_int(int16_t{});  return;
+        case PlyType::UInt16: store_int(uint16_t{}); return;
+        case PlyType::Int32:  store_int(int32_t{});  return;
+        case PlyType::UInt32: store_int(uint32_t{}); return;
+        case PlyType::Float32: {
+            float v = strtof(buf, &e); // accepts nan/inf too
+            if (e != buf + len) throw bad();
+            memcpy(dst, &v, sizeof(float));
+            return;
+        }
+        default: throw bad(); // unreachable: requested types were validated up front
+    }
+}
+
+std::vector<matrix> matrix::pointsFromPLY(const std::string& path, const std::vector<std::vector<std::string>>& groups) {
+    PlyMappedFile file(path);
+    PlyFormat format = PlyFormat::Ascii;
+    std::vector<PlyElement> elements;
+    const size_t body = ply_parse_header(file.data, file.size, format, elements);
+
+    size_t vertex_idx = elements.size();
+    for (size_t i = 0; i < elements.size(); i++) {
+        if (elements[i].name == "vertex") { vertex_idx = i; break; }
+    }
+    if (vertex_idx == elements.size())
+        throw std::runtime_error("pointsFromPLY: '" + path + "' has no vertex element");
+    const PlyElement& vertex = elements[vertex_idx];
+    if (vertex.count > std::numeric_limits<size_m>::max())
+        throw std::runtime_error("pointsFromPLY: vertex count " + std::to_string(vertex.count) + " exceeds size_m");
+    const size_m N = (size_m)vertex.count;
+
+    // Resolve every requested name to a vertex property and validate the group:
+    // it must exist, be a scalar, have a matching dtype, and share one PLY type
+    // with the rest of its group. Nothing is cast, so a mixed group is an error.
+    struct Dest { uint8_t* base; size_t row_bytes; size_t col_offset; };
+    std::vector<std::vector<size_t>> group_props(groups.size());
+    std::vector<dtype> group_dtypes(groups.size());
+    for (size_t g = 0; g < groups.size(); g++) {
+        if (groups[g].empty())
+            throw std::runtime_error("pointsFromPLY: group " + std::to_string(g) + " is empty");
+        for (size_t c = 0; c < groups[g].size(); c++) {
+            const std::string& name = groups[g][c];
+            size_t k = 0;
+            while (k < vertex.props.size() && vertex.props[k].name != name) k++;
+            if (k == vertex.props.size()) {
+                std::string available;
+                for (const auto& p : vertex.props) available += (available.empty() ? "" : ", ") + p.name;
+                throw std::runtime_error("pointsFromPLY: property '" + name + "' not in vertex element (has: " + available + ")");
+            }
+            const PlyProperty& prop = vertex.props[k];
+            if (prop.is_list)
+                throw std::runtime_error("pointsFromPLY: property '" + name + "' is a list, not a scalar");
+            dtype dt;
+            if (!ply_dtype_for(prop.type, dt))
+                throw std::runtime_error("pointsFromPLY: property '" + name + "' is " + ply_type_name(prop.type) + ", which has no matrix dtype");
+            if (c > 0) {
+                const PlyProperty& first = vertex.props[group_props[g][0]];
+                if (first.type != prop.type)
+                    throw std::runtime_error("pointsFromPLY: group " + std::to_string(g) + " mixes types: '" + first.name + "' is " +
+                                             ply_type_name(first.type) + " but '" + name + "' is " + ply_type_name(prop.type));
+            }
+            group_dtypes[g] = dt;
+            group_props[g].push_back(k);
+        }
+    }
+
+    std::vector<matrix> outputs;
+    outputs.reserve(groups.size());
+    std::vector<std::vector<Dest>> prop_dests(vertex.props.size());
+    for (size_t g = 0; g < groups.size(); g++) {
+        const size_m cols = (size_m)groups[g].size();
+        outputs.push_back(matrix::withShape({N, cols}, group_dtypes[g]));
+        const size_t elem = dtype_size(group_dtypes[g]);
+        for (size_t c = 0; c < cols; c++)
+            prop_dests[group_props[g][c]].push_back({static_cast<uint8_t*>(outputs[g].buffer), cols * elem, c * elem});
+    }
+
+    if (format == PlyFormat::Ascii) {
+        PlyAsciiCursor cur{reinterpret_cast<const char*>(file.data) + body, reinterpret_cast<const char*>(file.data) + file.size};
+        for (size_t ei = 0; ei < vertex_idx; ei++) {
+            for (uint64_t r = 0; r < elements[ei].count; r++) {
+                for (const PlyProperty& p : elements[ei].props) {
+                    if (!p.is_list) { cur.skip(); continue; }
+                    for (uint64_t n = ply_ascii_count(cur); n > 0; n--) cur.skip();
+                }
+            }
+        }
+        uint8_t scratch[8];
+        for (size_m i = 0; i < N; i++) {
+            for (size_t k = 0; k < vertex.props.size(); k++) {
+                const PlyProperty& p = vertex.props[k];
+                if (p.is_list) {
+                    for (uint64_t n = ply_ascii_count(cur); n > 0; n--) cur.skip();
+                    continue;
+                }
+                const auto& dests = prop_dests[k];
+                if (dests.empty()) { cur.skip(); continue; }
+                ply_ascii_scalar(cur, p.type, scratch);
+                const size_t sz = ply_type_size(p.type);
+                for (const Dest& d : dests)
+                    memcpy(d.base + i * d.row_bytes + d.col_offset, scratch, sz);
+            }
+        }
+        return outputs;
+    }
+
+    // Binary.
+    const bool swap = (format == PlyFormat::BinaryBE); // Apple silicon is little endian
+    const uint8_t* const end = file.data + file.size;
+    const uint8_t* p = file.data + body;
+    auto truncated = [&]() {
+        return std::runtime_error("pointsFromPLY: '" + path + "' is truncated (body shorter than the header declares)");
+    };
+
+    // Skip preceding elements: one multiply when records are fixed-size,
+    // otherwise walk them because list properties make each record variable.
+    for (size_t ei = 0; ei < vertex_idx; ei++) {
+        const PlyElement& e = elements[ei];
+        bool has_list = false;
+        size_t stride = 0;
+        for (const PlyProperty& q : e.props) {
+            has_list |= q.is_list;
+            stride += ply_type_size(q.type);
+        }
+        if (!has_list) {
+            if (stride > 0 && e.count > (uint64_t)(end - p) / stride) throw truncated();
+            p += e.count * stride;
+            continue;
+        }
+        for (uint64_t r = 0; r < e.count; r++) {
+            for (const PlyProperty& q : e.props) {
+                if (!q.is_list) {
+                    const size_t sz = ply_type_size(q.type);
+                    if ((size_t)(end - p) < sz) throw truncated();
+                    p += sz;
+                    continue;
+                }
+                const size_t csz = ply_type_size(q.count_type);
+                if ((size_t)(end - p) < csz) throw truncated();
+                const uint64_t n = ply_read_count(p, q.count_type, swap);
+                p += csz;
+                const size_t isz = ply_type_size(q.type);
+                if (n > (uint64_t)(end - p) / isz) throw truncated();
+                p += n * isz;
+            }
+        }
+    }
+
+    bool vertex_has_list = false;
+    for (const PlyProperty& q : vertex.props) vertex_has_list |= q.is_list;
+
+    if (!vertex_has_list) {
+        // Fixed record, so each field sits at a constant offset.
+        std::vector<size_t> prop_offset(vertex.props.size());
+        size_t stride = 0;
+        for (size_t k = 0; k < vertex.props.size(); k++) {
+            prop_offset[k] = stride;
+            stride += ply_type_size(vertex.props[k].type);
+        }
+        if (stride > 0 && (uint64_t)N > (uint64_t)(end - p) / stride) throw truncated();
+
+        if (!swap) {
+            // Byte-view path: types don't matter at the byte level - a float is
+            // just 4 bytes - so each group is strided UInt8 copies via
+            // copyCPUinplace: source rows are `stride` bytes apart in the mmap'd
+            // vertex block, destination rows are the output re-viewed as UInt8.
+            // Both sides must be UInt8: copyCPUinplace casts values (not bytes)
+            // when dtypes differ. The views are built directly rather than with
+            // slice(): slice() puts its input on the compute graph, which must
+            // own (refcount) its buffer and wrap it in a Metal buffer - neither
+            // is possible for mmap'd memory.
+            if (N == 0) return outputs;
+            auto byte_view = [N](uint8_t* base, size_t cols, size_t row_stride) {
+                matrix v(2, dtype::UInt8);
+                v.buffer = base;
+                v.shape()[0] = N;
+                v.shape()[1] = (size_m)cols;
+                v.strides()[0] = (size_m)row_stride;
+                v.strides()[1] = 1;
+                v.total_size = (size_t)N * cols;
+                v.flags |= NON_OWNERSHIP_FLAG;
+                if (row_stride != cols) v.flags |= NON_CONTIGUOUS_FLAG;
+                return v;
+            };
+            uint8_t* const vertex_block = const_cast<uint8_t*>(p);
+
+            for (size_t g = 0; g < groups.size(); g++) {
+                const std::vector<size_t>& props = group_props[g];
+                const size_t sz = ply_type_size(vertex.props[props[0]].type);
+                const size_t row_bytes = props.size() * sz;
+                uint8_t* const out = static_cast<uint8_t*>(outputs[g].buffer);
+
+                // Group stored adjacently and in request order in the file
+                // (xyz, rgba, f_rest_0..44): one copy for the whole group.
+                bool adjacent = true;
+                for (size_t c = 1; c < props.size() && adjacent; c++)
+                    adjacent = prop_offset[props[c]] == prop_offset[props[0]] + c * sz;
+                if (adjacent) {
+                    matrix src = byte_view(vertex_block + prop_offset[props[0]], row_bytes, stride);
+                    matrix dst = byte_view(out, row_bytes, row_bytes);
+                    matrix::copyCPUinplace(dst, src, 0);
+                    continue;
+                }
+                // Reordered or scattered: one strided copy per column.
+                for (size_t c = 0; c < props.size(); c++) {
+                    matrix src = byte_view(vertex_block + prop_offset[props[c]], sz, stride);
+                    matrix dst = byte_view(out + c * sz, sz, row_bytes);
+                    matrix::copyCPUinplace(dst, src, 0);
+                }
+            }
+            return outputs;
+        }
+
+        // Big endian: every value needs its bytes reversed, so gather field by
+        // field, visiting only the requested ones.
+        struct Field { size_t src_offset; size_t size; Dest dest; };
+        std::vector<Field> fields;
+        for (size_t k = 0; k < vertex.props.size(); k++) {
+            const size_t sz = ply_type_size(vertex.props[k].type);
+            for (const Dest& d : prop_dests[k]) fields.push_back({prop_offset[k], sz, d});
+        }
+        for (size_m i = 0; i < N; i++) {
+            const uint8_t* rec = p + (size_t)i * stride;
+            for (const Field& f : fields)
+                ply_copy_scalar(f.dest.base + i * f.dest.row_bytes + f.dest.col_offset, rec + f.src_offset, f.size, swap);
+        }
+        return outputs;
+    }
+
+    // Vertex records contain lists: walk each record field by field.
+    for (size_m i = 0; i < N; i++) {
+        for (size_t k = 0; k < vertex.props.size(); k++) {
+            const PlyProperty& q = vertex.props[k];
+            if (q.is_list) {
+                const size_t csz = ply_type_size(q.count_type);
+                if ((size_t)(end - p) < csz) throw truncated();
+                const uint64_t n = ply_read_count(p, q.count_type, swap);
+                p += csz;
+                const size_t isz = ply_type_size(q.type);
+                if (n > (uint64_t)(end - p) / isz) throw truncated();
+                p += n * isz;
+                continue;
+            }
+            const size_t sz = ply_type_size(q.type);
+            if ((size_t)(end - p) < sz) throw truncated();
+            for (const Dest& d : prop_dests[k])
+                ply_copy_scalar(d.base + i * d.row_bytes + d.col_offset, p, sz, swap);
+            p += sz;
+        }
+    }
+    return outputs;
 }
 
 //    static void copyGPUinplace( matrix& outMat, const matrix& inMat, int

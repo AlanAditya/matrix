@@ -926,6 +926,17 @@ public:
     id<MTLTexture> ToMTLTexture(Execution exec = Execution::EncodeAndExecute);
     
     void save_as_image(std::string path, ImgType img_type);
+
+    // Eagerly loads the "vertex" element of a .ply file (ascii, binary_little_endian
+    // or binary_big_endian). Each inner list of `groups` names PLY properties
+    // (exact header names) and becomes one [N, group.size()] matrix, columns in
+    // the requested order: {{"x","y","z"}, {"red","green","blue","alpha"}} gives
+    // [N,3] Float and [N,4] UInt8. Only requested properties are decoded.
+    // No casting ever happens - the dtype is the source's. Throws
+    // std::runtime_error if a property is missing, is a list, has a type with
+    // no dtype (char/int8, int64/uint64, double/float64 - these are skipped fine
+    // when not requested), or if one group mixes types.
+    static std::vector<matrix> pointsFromPLY(const std::string& path, const std::vector<std::vector<std::string>>& groups);
     
 //    static auto jit_gpu(std::function<matrix(matrix&)> func, matrix& sample) {
 //        matrix output = func(sample);
