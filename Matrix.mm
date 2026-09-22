@@ -143,6 +143,20 @@ inline size_m *BroadcastDescriptor::strides(int dims) {
     return reinterpret_cast<size_m *>(this + 1) + dims;
 }
 
+// `out_shape` always belongs to a result matrix that already has rank out_dim, and for
+// out_dim > SBO_MAX_DIMS its constructor already created a heap SharedArrayDescriptor.
+// Reuse that descriptor when we're its only holder, the same exclusivity rule as
+// matrix::detach_shape(). If it's shared, swap in a fresh one and release our hold on the
+// shared one. Unconditionally calling create() here, as the old code did, overwrote the
+// constructor's descriptor without releasing it: one leaked descriptor per 4D+ broadcast
+// or matmul op. See .agents/MemoryManagement.md, section 3.3c.
+static void ensure_exclusive_out_desc(array_descriptor &out_shape, int out_dim) {
+    SharedArrayDescriptor *existing = out_shape.shared_arr_desc;
+    if (existing && existing->refCount.load(std::memory_order_acquire) == 1) return;
+    out_shape.shared_arr_desc = SharedArrayDescriptor::create(out_dim);
+    if (existing) existing->release();
+}
+
 void broadcast_shapes(const array_descriptor &arr_desc1,
                       const array_descriptor &arr_desc2,
                       array_descriptor &out_shape,
@@ -151,7 +165,7 @@ void broadcast_shapes(const array_descriptor &arr_desc1,
     int out_dim = std::max(dim1, dim2);
     
     if (out_dim > SBO_MAX_DIMS) {
-        out_shape.shared_arr_desc = SharedArrayDescriptor::create(out_dim);
+        ensure_exclusive_out_desc(out_shape, out_dim);
     }
     assert(new_desc1 && "broadcast_shapes: new_desc1 must not be null");
     assert(new_desc2 && "broadcast_shapes: new_desc2 must not be null");
@@ -224,7 +238,7 @@ void broadcast_shapes_matmul(const array_descriptor &arr_desc1,
     int out_dim = std::max(dim1, dim2);
     
     if (out_dim > SBO_MAX_DIMS) {
-        out_shape.shared_arr_desc = SharedArrayDescriptor::create(out_dim);
+        ensure_exclusive_out_desc(out_shape, out_dim);
     }
     assert(new_desc1 && "broadcast_shapes: new_desc1 must not be null");
     assert(new_desc2 && "broadcast_shapes: new_desc2 must not be null");

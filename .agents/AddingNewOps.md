@@ -90,7 +90,6 @@ Every real primitive's `eval_cpu(matrix& out, EvalType eval_type)` follows the s
            // allocate fresh, and publish into the tape's cache for siblings to adopt later
            out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
            out.begin_refcount();
-           out.buildMetalBuffer();
            out.tape->out_buffer = (uint8_t*)out.buffer;
            out.tape->out_metal_buffer = out.metalBuffer;
            out.tape->out_refcount = out.refCount;
@@ -100,9 +99,12 @@ Every real primitive's `eval_cpu(matrix& out, EvalType eval_type)` follows the s
    ```
    This block is why `matrix::eval_cpu()`'s own trailing `update_from_trace()` call is a no-op for most primitives when called at the top level (no `!evaluated` guard sits above the root call, so this block always runs) — it only matters at the root for primitive types that skip this block entirely (`LeafPrimitive`, `SwapLeafPrimitive`), or after a `SwapLeafPrimitive` hot-swap leaves a stale pointer behind.
 
-   **Current known issue (planned fix, not yet done):** the "allocate fresh" branch unconditionally calls `out.buildMetalBuffer()`, i.e. every primitive currently creates a Metal buffer even for a pure CPU-only `eval_cpu()` call that will never touch the GPU. This is wasteful and will be changed in a future commit so Metal buffer creation is lazy/only-when-needed rather than mandatory on every primitive.
+   `eval_cpu` never touches Metal: no `buildMetalBuffer()` anywhere on the CPU path (fixed in `844928d`, it used to build one on every allocation). **`eval_metal` differs in three places**, all explained in [[MemoryManagement]] §5–7:
+   - **Inputs:** `if (in.tape && !in.tape->evaluated) { in.tape->eval_metal(in, t); in.update_from_trace(); } else { in.update_from_trace(); ensure_metal_buffer(in); }`. An input that was already evaluated (for example on the CPU) gets a wrapper if it's larger than 4096 bytes; smaller ones are inlined by `setBufferOrBytes`.
+   - **Owning node:** the allocate branch also calls `out.buildMetalBuffer()`, **and** right after this block comes the rerun guard `if (!out_metal_buffer) { out.buildMetalBuffer(); out_metal_buffer = out.metalBuffer; }`. A graph last run on the CPU has memory but no wrapper, so the allocate branch is skipped and this guard is the only place left in the DFS to build one ([[MemoryManagement]] §6.4). Copy it, with its comment, into every new owning primitive.
+   - **View (transient) node:** it borrows the parent's buffer at an offset, **never** calls `buildMetalBuffer()`, and instead inherits the parent's wrapper (`if (out.metalBuffer != input.metalBuffer) { ... }`). Its rebind check compares against `input.buffer + offset`, and it updates the cache with `update_cache()`. Model it on `SlicePrimitive` ([[MemoryManagement]] §7).
 
-3. **Bail early for `COMPILE_TRACE`:** `if (eval_type == EvalType::COMPILE_TRACE) { return; }` — compile-only passes want the buffer allocated/wired up (steps 1-2) but must not execute the backend or mark the node `evaluated`.
+3. **Bail early for `COMPILE_TRACE`:** `if (eval_type == EvalType::COMPILE_TRACE) { return; }` — compile-only passes want the buffer allocated/wired up (steps 1-2) but must not execute the backend or mark the node `evaluated`. This must be the **only** `COMPILE_TRACE` return in the function, and everything that allocates, refcounts or builds a wrapper must come before it: EXECUTE never allocates. A second return inside the cache-hit branch once skipped the wrapper build during compile and pushed it into EXECUTE.
 
 4. **Guard the actual compute:** `if (evaluated) { return; } else { evaluated = true; }` — this is the second, narrower `evaluated` check (compute-only, not buffer-sync), separate from the caller-side guard in step 1.
 

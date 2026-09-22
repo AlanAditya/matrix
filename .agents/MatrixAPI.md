@@ -22,8 +22,8 @@ This is a complete map of every public constructor, static factory, and method e
 | `matrix(uint32_t rank, dtype type)` | Allocates shape/strides storage for `rank` dims; no data buffer yet. |
 | `matrix(uint32_t rank, size_t total_size, dtype type)` | Same, and records `total_size` up front. |
 | `matrix({1,2,3})` (initializer_list ctor, 1–4 levels of nesting) | Builds a matrix directly from nested `{}` literals, inferring shape/dtype from the literal (up to 4D via the 4 explicit templated constructors + `setup_from_list`). |
-| `matrix(const matrix&)` / `matrix(matrix&&)` | Copy/move constructors — copy is a *view* (shares buffer/refcount per the refcounting rules in [[MemoryManagement]]), move transfers ownership. |
-| `~matrix()` | Destructor; delegates to `destroyInstance()`. |
+| `matrix(const matrix&)` / `matrix(matrix&&)` | Copy/move constructors. Copy **shares** (a view: buffer/`refCount` +1, tape +1) when the source is refcounted, non-owning or has a tape; otherwise it **deep-copies** into fresh contiguous memory (and builds a Metal wrapper). Move takes over the source's holds without incrementing. See [[MemoryManagement]] §3.7. |
+| `~matrix()` | Destructor: releases the descriptor, drops its buffer hold, then `releaseTape()`. It does **not** call `destroyInstance()`. |
 
 ### Static Factories
 
@@ -168,11 +168,11 @@ See [[MemoryManagement]] for the full ownership model this section implements.
 | Method | Purpose |
 |---|---|
 | `beginReferenceCounting()` / `begin_refcount()` | Initializes `refCount = 1` for a freshly allocated buffer. |
-| `shareBuffer(matrix&) const` | Makes another matrix instance share this one's `buffer`/`metalBuffer`/`refCount` (view semantics). |
+| `shareBuffer(matrix&) const` | `a.shareBuffer(b)` puts **a's** `buffer`/`metalBuffer`/`refCount` into **b** (+1), and updates `b.tape`'s cache via `update_cache`. Direction matters. |
 | `buildMetalBuffer()` | Wraps the current CPU `buffer` in an `MTLBuffer` (`newBufferWithBytesNoCopy`). |
-| `releaseBuffer()` | Decrements/releases the data buffer's refcount. |
-| `releaseTape()` | Decrements/releases the `Primitive` tape's instance refcount. |
-| `destroyInstance()` | Full teardown called from `~matrix()` (releases buffer, then tape). |
+| `releaseBuffer()` | Drops this handle's **buffer** hold (`fetch_sub`, frees on the last one) and clears `buffer`/`refCount`/`metalBuffer`. Never touches `tape`: it's used to rebind a matrix while it stays the same graph node. |
+| `releaseTape()` | Drops this handle's **instance** hold on its `Primitive` (deletes it on the last one). Never touches the buffer. |
+| `destroyInstance()` | Releases both holds (buffer, then tape). Only caller: move assignment, before it takes over the source. |
 | `matrix::copyGPUinplace(outMat, inMat, offset, exec=EncodeAndExecute)` | Copies `inMat` into `outMat` on the GPU (blit fast path when both are contiguous, else a compute-shader gather/scatter); dispatches to the type-casted variant when dtypes differ. |
 | `matrix::copyGPUinplaceTypeCasted(outMat, inMat, offset, exec=EncodeAndExecute)` | GPU copy with an on-the-fly dtype cast. |
 | `matrix::copyCPUinplace(outMat, inMat, offset)` | CPU equivalent of `copyGPUinplace`, with small-size fast paths (1/4/8-byte direct stores) and a `memcpy`-per-row path for the contiguous case. |

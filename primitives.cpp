@@ -242,6 +242,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -427,6 +433,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -578,6 +590,12 @@ class SubtractionPrimitive : public Primitive {
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -725,6 +743,12 @@ class MultiplicationPrimitive : public Primitive {
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -881,6 +905,12 @@ class DivisionPrimitive : public Primitive {
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -1032,6 +1062,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -1176,6 +1212,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -1352,6 +1394,7 @@ public:
         // but no wrapper, while the parent has only just built one earlier in this DFS - pass it
         // down. A zero-offset slice depends on this: the rebind block below never fires for it.
         // COMPILE does the handoff; on EXECUTE the pointers already match, so this is a no-op.
+        // See .agents/MemoryManagement.md, "Transient (view) primitives".
         if (out.metalBuffer != input.metalBuffer) {
             out.metalBuffer = input.metalBuffer;
             out.tape->out_metal_buffer = out.metalBuffer;
@@ -1518,6 +1561,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -1665,6 +1714,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -1798,6 +1853,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -1944,6 +2005,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -2085,6 +2152,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -2214,6 +2287,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -2349,6 +2428,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -2436,6 +2521,12 @@ public:
     BrodcastPrimitive(matrix& input_mat, array_descriptor input_brodcast_desc, size_t input_broadcasted_dims): input(ensure_graph_ready(input_mat)), brodcast_desc(input_brodcast_desc), broadcasted_dims(input_broadcasted_dims) {
         brodcast_desc.retain(broadcasted_dims);
     }
+    // Balances the retain() in the constructor. array_descriptor is a union with no
+    // destructor, so nothing else gives back this primitive's hold on the heap
+    // SharedArrayDescriptor (dims > SBO_MAX_DIMS); without this it leaked one per node.
+    ~BrodcastPrimitive() {
+        brodcast_desc.release(broadcasted_dims);
+    }
     void eval_cpu(matrix &out, EvalType eval_type) override {
         if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); };
         input.update_from_trace();
@@ -2502,6 +2593,7 @@ public:
         // CPU, `out` already has memory (allocation branch skipped) but no wrapper, while the parent
         // has only just built one earlier in this DFS - pass it down (see SlicePrimitive). COMPILE
         // does the handoff; on EXECUTE the pointers already match, so this is a no-op.
+        // See .agents/MemoryManagement.md, "Transient (view) primitives".
         if (out.metalBuffer != input.metalBuffer) {
             out.metalBuffer = input.metalBuffer;
             out.tape->out_metal_buffer = out.metalBuffer;
@@ -2597,6 +2689,12 @@ public:
     ReshapePrimitive(matrix& input_mat, array_descriptor input_reshape_desc, size_t input_reshape_dims, bool REQUIRES_NEW_BUFFER = true): input(ensure_graph_ready(input_mat)), reshape_desc(input_reshape_desc) , reshape_dim(input_reshape_dims), REQUIRES_NEW_BUFFER(REQUIRES_NEW_BUFFER) {
         reshape_desc.retain(reshape_dim);
     }
+    // Balances the retain() in the constructor. array_descriptor is a union with no
+    // destructor, so nothing else gives back this primitive's hold on the heap
+    // SharedArrayDescriptor (dims > SBO_MAX_DIMS); without this it leaked one per node.
+    ~ReshapePrimitive() {
+        reshape_desc.release(reshape_dim);
+    }
     void eval_cpu(matrix &out, EvalType eval_type) override {
         if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); };
         input.update_from_trace();
@@ -2682,7 +2780,9 @@ public:
             }
         }
         if (REQUIRES_NEW_BUFFER) {
-            // Non-contiguous input: this node owns a fresh buffer, so it builds its own wrapper.
+            // Non-contiguous input: this node owns a fresh buffer, so it builds its own wrapper,
+            // for the same reason as every owning node: a graph last run on the CPU has memory
+            // but no wrapper. See .agents/MemoryManagement.md, "CPU -> Metal rerun".
             if (!out_metal_buffer) {
                 out.buildMetalBuffer();
                 out_metal_buffer = out.metalBuffer;
@@ -2692,6 +2792,7 @@ public:
             // the CPU, `out` already has memory (allocation branch skipped) but no wrapper, while the
             // parent has only just built one earlier in this DFS - pass it down (see SlicePrimitive).
             // COMPILE does the handoff; on EXECUTE the pointers already match, so this is a no-op.
+            // See .agents/MemoryManagement.md, "Transient (view) primitives".
             out.metalBuffer = input.metalBuffer;
             out.tape->out_metal_buffer = out.metalBuffer;
         }
@@ -2837,6 +2938,12 @@ public:
 
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -2918,6 +3025,12 @@ public:
     TransposePrimitive(matrix& input_mat, array_descriptor input_transpose_desc): input(ensure_graph_ready(input_mat)), transpose_desc(input_transpose_desc) {
         transpose_desc.retain(input.dims);
     }
+    // Balances the retain() in the constructor. array_descriptor is a union with no
+    // destructor, so nothing else gives back this primitive's hold on the heap
+    // SharedArrayDescriptor (dims > SBO_MAX_DIMS); without this it leaked one per node.
+    ~TransposePrimitive() {
+        transpose_desc.release(input.dims);
+    }
     void eval_cpu(matrix &out, EvalType eval_type) override {
         if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); };
         input.update_from_trace();
@@ -2983,6 +3096,7 @@ public:
         // CPU, `out` already has memory (allocation branch skipped) but no wrapper, while the parent
         // has only just built one earlier in this DFS - pass it down (see SlicePrimitive). COMPILE
         // does the handoff; on EXECUTE the pointers already match, so this is a no-op.
+        // See .agents/MemoryManagement.md, "Transient (view) primitives".
         if (out.metalBuffer != input.metalBuffer) {
             out.metalBuffer = input.metalBuffer;
             out.tape->out_metal_buffer = out.metalBuffer;
@@ -3147,6 +3261,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -3364,9 +3484,12 @@ public:
                     out_i.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
                 }
             }
+            // Owning node, per output: same reason as every owning node - a graph last run on the
+            // CPU has memory but no wrapper, so build it here during COMPILE.
             // Each outer_output's tape may be a different sibling MultiInputCompilePrimitive,
             // so the cache to fix up is that output's own tape->out_metal_buffer, not this
             // primitive's single out_metal_buffer member.
+            // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
             if (out_i.tape && !out_i.tape->out_metal_buffer) {
                 out_i.buildMetalBuffer();
                 out_i.tape->out_metal_buffer = out_i.metalBuffer;
@@ -3525,6 +3648,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -3655,6 +3784,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -3780,6 +3915,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -3906,6 +4047,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -4031,6 +4178,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -4155,6 +4308,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -4280,6 +4439,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -4404,6 +4569,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -4543,6 +4714,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -4702,6 +4879,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -4844,6 +5027,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -4991,6 +5180,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -5113,6 +5308,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -5305,6 +5506,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -5395,6 +5602,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
@@ -5491,6 +5704,12 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
         if (!out_metal_buffer) {
             out.buildMetalBuffer();
             out_metal_buffer = out.metalBuffer;
