@@ -134,7 +134,7 @@ public:
     
     bool ConvolveFullInit[3];
     id<MTLComputePipelineState> ConvolveFullComputeState[3];
-    
+
     // Resample preserves the input dtype exactly (nearest: pure gather; linear: promoted
     // to float internally, cast back on write), so unlike Sin/Cos it's templated over all
     // 7 dtype codes, same axis sizing as Take's source/value axis.
@@ -153,19 +153,19 @@ public:
     bool ResampleLinearTailInit_nd[7][4];
     id<MTLComputePipelineState> ResampleLinearTailComputeState_nd[7][4];
 
-    id<MTLComputePipelineState> BrodcastedAddComputeState[4][4];
-    id<MTLComputePipelineState> BrodcastedSubComputeState[4][4];
-    id<MTLComputePipelineState> BrodcastedMulComputeState[4][4];
-    id<MTLComputePipelineState> BrodcastedDivComputeState[4][4];
-    id<MTLComputePipelineState> BrodcastedMaxComputeState[4][4];
-    id<MTLComputePipelineState> BrodcastedMinComputeState[4][4];
+    id<MTLComputePipelineState> BrodcastedAddComputeState[7][4];
+    id<MTLComputePipelineState> BrodcastedSubComputeState[7][4];
+    id<MTLComputePipelineState> BrodcastedMulComputeState[7][4];
+    id<MTLComputePipelineState> BrodcastedDivComputeState[7][4];
+    id<MTLComputePipelineState> BrodcastedMaxComputeState[7][4];
+    id<MTLComputePipelineState> BrodcastedMinComputeState[7][4];
     id<MTLComputePipelineState> BrodcastedCrossComputeState[4][4];
-    bool BrodcastedAddInit[4][4] = {{false}};
-    bool BrodcastedSubInit[4][4] = {{false}};
-    bool BrodcastedMulInit[4][4] = {{false}};
-    bool BrodcastedDivInit[4][4] = {{false}};
-    bool BrodcastedMaxInit[4][4] = {{false}};
-    bool BrodcastedMinInit[4][4] = {{false}};
+    bool BrodcastedAddInit[7][4] = {{false}};
+    bool BrodcastedSubInit[7][4] = {{false}};
+    bool BrodcastedMulInit[7][4] = {{false}};
+    bool BrodcastedDivInit[7][4] = {{false}};
+    bool BrodcastedMaxInit[7][4] = {{false}};
+    bool BrodcastedMinInit[7][4] = {{false}};
     bool BrodcastedCrossInit[4][4] = {{false}};
     
     bool Concat_2M[4];
@@ -244,22 +244,22 @@ public:
         for (int i = 0; i < 3; i++) {
             ConvolveFullInit[i] = false;
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 7; i++) {
             for (int j = 0; j < 4; j++) {
                 BrodcastedAddInit[i][j] = false;
             }
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 7; i++) {
             for (int j = 0; j < 4; j++) {
                 BrodcastedSubInit[i][j] = false;
             }
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 7; i++) {
             for (int j = 0; j < 4; j++) {
                 BrodcastedMulInit[i][j] = false;
             }
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 7; i++) {
             for (int j = 0; j < 4; j++) {
                 BrodcastedDivInit[i][j] = false;
             }

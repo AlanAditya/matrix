@@ -195,7 +195,7 @@ void eval_metal(matrix& out, EvalType eval_type) override {
 - **Has a wrapper:** `setBuffer:m.metalBuffer offset:(m.buffer - [m.metalBuffer contents])`. The offset is worked out at bind time, which is how a view sharing its parent's wrapper binds at the right place.
 - **No wrapper:** `setBytes:m.buffer length:effectiveBufferSize()*dtype_size`, inlining the data into the command. Metal caps this at **4096 bytes**. Past that, Metal aborts (`AGX setBytes:length:atIndex:` → `abort`).
 - All compute bindings go through `setBufferOrBytes`. Raw `setBuffer:x.metalBuffer` is not allowed.
-- **Blit encoders have no `setBytes`**: the blit copy fast path in `matrix.h` builds any missing wrapper on both sides first.
+- **Blit encoders have no `setBytes`**: the blit copy fast path in `matrix.h` builds any missing wrapper on both sides first, and so does `CopyToTexture()` / `ToMTLTexture()` (a CPU-evaluated matrix has no wrapper, and blitting from nil segfaulted).
 - **Outputs always get a real wrapper** (step (3)), since a kernel can't write into `setBytes` data.
 
 ### 6.3 `ensure_metal_buffer(m)` (inputs)
@@ -316,6 +316,7 @@ Bugs 5 and 6 were verified standalone with a live-descriptor counter: before the
 - `ensure_graph_ready()` wraps tapeless leaves at graph construction (§8.1).
 - `matrix(rank, total_size, type)` builds a wrapper when `total_size > 10`, and so do the eager *instance* methods `ones()`/`zeros()` (`matrix::ones() const`, not the lazy static generators) and `matrix::leaf()`.
 - Deep copy construction and deep copy assignment build a wrapper (§3.7).
+- `CopyToTexture()` builds one for a matrix that has none (§6.2). This is I/O, not graph execution.
 
 **Open issues found by reading the code (not fixed yet):**
 - `MultiInputCompilePrimitive::eval_metal` does `sib->evaluated = true` without a null check. `eval_cpu` checks, and the destructor sets entries in the siblings' lists to null, so running a surviving sibling after one is destroyed dereferences null.

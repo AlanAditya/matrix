@@ -497,6 +497,7 @@ matrix matrix::unsqueeze(int axis) const {
 }
 
 matrix matrix::unsqueeze(int insertion_axis, int num) const {
+    if (num == 0) return *this;
     int axis = insertion_axis;
     if (axis < 0) axis += dims+1;
     matrix output(dims+num, type);
@@ -2885,6 +2886,12 @@ void matrix::CopyToTexture(id<MTLTexture> texture, Execution exec) {
                                  "Matrix must be at least 2D to blit to a texture.");
     }
 #endif
+    eval();
+    // The blit below reads from metalBuffer, and blit encoders have no setBytes fallback.
+    // A matrix evaluated on the CPU (eval_cpu(), at(), or eval() on <= 10 elements) has
+    // memory but no wrapper, since the CPU path never builds one, so build it here. Same
+    // rule as the blit copy path in matrix.h. See .agents/MemoryManagement.md, section 6.2.
+    if (!metalBuffer && buffer) buildMetalBuffer();
     NSUInteger width = (NSUInteger)shape()[1];
     NSUInteger height = (NSUInteger)shape()[0];
     MTLRegion region = MTLRegionMake2D(0, 0, width, height);
@@ -6196,15 +6203,15 @@ void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType
         primit->desc_b = BroadcastDescriptor::create(result.dims);
         broadcast_shapes(array_desc, other.array_desc, result.array_desc,
                          primit->desc_a, primit->desc_b, dims, other.dims);
-        primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_a->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+        primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
         primit->dims_collapsed = true;
         result.total_size = result.accumul(0, result.dims);
         result.tape = primit;
         return;
     }
-    
 
-    
+
+
 //    if (result.total_size != result.accumul(0, result.dims)) {
 //        // as during execution of compiled graph
 //        // we trust everything that memory has
@@ -6297,39 +6304,41 @@ void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType
         if (!GlobalGPUManager.BrodcastedAddInit[typeCode][1]) {
             GlobalGPUManager.initBrodcastedAddInit(typeCode, 1);
         }
-        [commandEncoder setBytes:result.strides() length:result.dims * sizeof(size_m) atIndex:3];
-        [commandEncoder setBytes:strideA length:result.dims * sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:strideB length:result.dims * sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
         [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedAddComputeState[typeCode][1]];
-        _dispatchExecutionSize = MTLSizeMake(result.shape()[1], result.shape()[0], 1);
+        _dispatchExecutionSize = MTLSizeMake(result_shape[1], result_shape[0], 1);
         max_threads = [GlobalGPUManager.BrodcastedAddComputeState[typeCode][1] maxTotalThreadsPerThreadgroup];
-        
+
     } else if (cdims == 3) {
         // 3D specialisation
         if (!GlobalGPUManager.BrodcastedAddInit[typeCode][2]) {
             GlobalGPUManager.initBrodcastedAddInit(typeCode, 2);
         }
-        [commandEncoder setBytes:result.strides() length:result.dims * sizeof(size_m) atIndex:3];
-        [commandEncoder setBytes:strideA length:result.dims * sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:strideB length:result.dims * sizeof(size_m) atIndex:5];
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
         [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedAddComputeState[typeCode][2]];
-        _dispatchExecutionSize = MTLSizeMake(result.shape()[2], result.shape()[1], result.shape()[0]);
+        _dispatchExecutionSize = MTLSizeMake(result_shape[2], result_shape[1], result_shape[0]);
         max_threads = [GlobalGPUManager.BrodcastedAddComputeState[typeCode][2] maxTotalThreadsPerThreadgroup];
-        
+
     } else {
         // ND specialisation
         if (!GlobalGPUManager.BrodcastedAddInit[typeCode][3]) {
             GlobalGPUManager.initBrodcastedAddInit(typeCode, 3);
         }
-        [commandEncoder setBytes:result.strides() length:cdims * sizeof(size_m) atIndex:3];
+        size_t bulk = 1;
+        for (int i = 0; i < cdims-2; i++) { bulk *= result_shape[i]; }
+        [commandEncoder setBytes:strideR length:cdims * sizeof(size_m) atIndex:3];
         [commandEncoder setBytes:strideA length:cdims * sizeof(size_m) atIndex:4];
         [commandEncoder setBytes:strideB length:cdims * sizeof(size_m) atIndex:5];
-        [commandEncoder setBytes:result.shape() length:result.dims * sizeof(size_m) atIndex:6];
+        [commandEncoder setBytes:result_shape length:cdims * sizeof(size_m) atIndex:6];
         [commandEncoder setBytes:&cdims length:sizeof(int) atIndex:7];
         [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedAddComputeState[typeCode][3]];
-        _dispatchExecutionSize = MTLSizeMake(result.shape()[result.dims - 1],
-                                             result.shape()[result.dims - 2],
-                                             result.accumul(0, result.dims - 2));
+        _dispatchExecutionSize = MTLSizeMake(result_shape[cdims - 1],
+                                             result_shape[cdims - 2],
+                                             bulk);
         max_threads = [GlobalGPUManager.BrodcastedAddComputeState[typeCode][3] maxTotalThreadsPerThreadgroup];
     }
     

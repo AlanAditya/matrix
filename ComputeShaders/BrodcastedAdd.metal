@@ -87,6 +87,9 @@ INSTANTIATE_FROM_TYPE(0, float);
 INSTANTIATE_FROM_TYPE(1, half);
 INSTANTIATE_FROM_TYPE(2, uint8_t);
 INSTANTIATE_FROM_TYPE(3, int);
+INSTANTIATE_FROM_TYPE(4, int16_t);
+INSTANTIATE_FROM_TYPE(5, uint32_t);
+INSTANTIATE_FROM_TYPE(6, uint16_t);
 
 // Not functional yet
 // General Brodcasted Add ND version where gid is based on result buffer directly as result buffer is contiguous in memory
