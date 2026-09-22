@@ -15,6 +15,7 @@
 #include <arm_fp16.h>
 #include <arm_neon.h>
 #include <atomic>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 #include <type_traits>
@@ -963,12 +964,23 @@ public:
         matrix result(1, no_of_points, type);
         result.shape()[0] = no_of_points;
         result.calcStrides();
-        Type step = (no_of_points > 1) ? (end - start) / static_cast<Type>(no_of_points - 1) : Type(0);
-        
+        // Always step in double, never in Type: for an integral Type (e.g. building
+        // a nearest-neighbor sample grid), (end-start)/(no_of_points-1) done in
+        // integer arithmetic truncates to 0 whenever no_of_points-1 > end-start
+        // (i.e. upsampling), collapsing every sample to `start`.
+        double step = (no_of_points > 1)
+            ? (static_cast<double>(end) - static_cast<double>(start)) / static_cast<double>(no_of_points - 1)
+            : 0.0;
+
         dispatch_type(type, result.buffer, [&](auto* typed_buffer) {
             using BufT = std::decay_t<decltype(*typed_buffer)>;
             for (size_t i = 0; i < no_of_points; i++) {
-                typed_buffer[i] = static_cast<BufT>(start + i * step);
+                double value = static_cast<double>(start) + static_cast<double>(i) * step;
+                if constexpr (std::is_integral_v<BufT>) {
+                    typed_buffer[i] = static_cast<BufT>(std::llround(value));
+                } else {
+                    typed_buffer[i] = static_cast<BufT>(value);
+                }
             }
         });
         
