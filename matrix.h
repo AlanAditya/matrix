@@ -564,7 +564,7 @@ public:
                 GlobalGPUManager.initRandint_Legacy(typeCode);
             }
             [commandEncoder setComputePipelineState:GlobalGPUManager.RandintComputeState_Legacy[typeCode]];
-            [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+            setBufferOrBytes(commandEncoder, output, 0);
             [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
             [commandEncoder setBytes:&seed length:sizeof(uint) atIndex:2];
 
@@ -611,7 +611,7 @@ public:
                 GlobalGPUManager.initRand_Legacy(typeCode);
             }
             [commandEncoder setComputePipelineState:GlobalGPUManager.RandComputeState_Legacy[typeCode]];
-            [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+            setBufferOrBytes(commandEncoder, output, 0);
             [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
             [commandEncoder setBytes:&seed length:sizeof(uint) atIndex:2];
 
@@ -654,7 +654,7 @@ public:
                 GlobalGPUManager.initRandn_Legacy(typeCode);
             }
             [commandEncoder setComputePipelineState:GlobalGPUManager.RandnComputeState_Legacy[typeCode]];
-            [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+            setBufferOrBytes(commandEncoder, output, 0);
             [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
             [commandEncoder setBytes:&seed length:sizeof(uint) atIndex:2];
 
@@ -937,7 +937,7 @@ public:
     // no dtype (char/int8, int64/uint64, double/float64 - these are skipped fine
     // when not requested), or if one group mixes types.
     static std::vector<matrix> pointsFromPLY(const std::string& path, const std::vector<std::vector<std::string>>& groups);
-    
+
 //    static auto jit_gpu(std::function<matrix(matrix&)> func, matrix& sample) {
 //        matrix output = func(sample);
 //        output.compile_metal();
@@ -1028,6 +1028,13 @@ public:
         //        drastically faster.
         if (!(inMat.flags & NON_CONTIGUOUS_FLAG) &&
             !(outMat.flags & NON_CONTIGUOUS_FLAG)) {
+            // Blit needs a real MTLBuffer on both sides - there's no setBytes-style
+            // inline path for a blit encoder (no argument table to splice into, unlike
+            // compute/render encoders). A small or CPU-only-materialized operand can
+            // reach here without one, so build it now rather than losing the DMA fast
+            // path to a setBytes fallback that doesn't exist for blit.
+            if (!inMat.metalBuffer && inMat.buffer) const_cast<matrix&>(inMat).buildMetalBuffer();
+            if (!outMat.metalBuffer && outMat.buffer) outMat.buildMetalBuffer();
             GlobalGPUManager.endCommandEncoding();
             id<MTLBlitCommandEncoder> blitEncoder =
             [commandBuffer blitCommandEncoder];

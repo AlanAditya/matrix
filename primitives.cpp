@@ -30,6 +30,23 @@ static const std::vector<matrix>& ensure_graph_ready(const std::vector<matrix>& 
     return v;
 }
 
+// A matrix can arrive at an eval_metal() with real data (buffer set) but no metalBuffer -
+// e.g. a leaf someone materialized via eval_cpu() directly, whose tape->evaluated is now
+// true so the recursive eval_metal() call above never runs for it. eval_cpu() deliberately
+// never builds a metalBuffer (it doesn't need one), so this is the one place that has to
+// notice and fix that before a kernel binds it. Called from the section of eval_metal that
+// runs during compile_metal()'s COMPILE_TRACE pass (before the early-return), so the build
+// happens once, not on every dispatch. Tensors small enough for setBytes (<=4096 bytes, the
+// Metal cap) are left buffer-less on purpose - setBufferOrBytes() will inline them instead.
+static void ensure_metal_buffer(matrix& m) {
+    if (m.buffer && !m.metalBuffer) {
+        size_t bytes = m.effectiveBufferSize() * dtype_size(m.type);
+        if (bytes > 4096) {
+            m.buildMetalBuffer();
+        }
+    }
+}
+
 
 #include <functional>
 #include <typeinfo>
@@ -184,7 +201,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -201,11 +217,14 @@ public:
     }
 
     void eval_metal(matrix& out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); }
-        if (kernel.tape && !kernel.tape->evaluated) { kernel.tape->eval_metal(kernel, eval_type); }
-        input.update_from_trace();
-        kernel.update_from_trace();
-
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
+        if (kernel.tape && !kernel.tape->evaluated) { kernel.tape->eval_metal(kernel, eval_type); kernel.update_from_trace(); } else {
+            kernel.update_from_trace();
+            ensure_metal_buffer(kernel);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -222,6 +241,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -363,7 +386,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -380,10 +402,14 @@ public:
 
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); }
-        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); }
-        a.update_from_trace();
-        b.update_from_trace();
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); a.update_from_trace(); } else {
+            a.update_from_trace();
+            ensure_metal_buffer(a);
+        }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); b.update_from_trace(); } else {
+            b.update_from_trace();
+            ensure_metal_buffer(b);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -400,6 +426,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -509,7 +539,6 @@ class SubtractionPrimitive : public Primitive {
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -524,10 +553,14 @@ class SubtractionPrimitive : public Primitive {
         a.subtract_cpu_brodcasted(b, out, eval_type);
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); }
-        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); }
-        a.update_from_trace();
-        b.update_from_trace();
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); a.update_from_trace(); } else {
+            a.update_from_trace();
+            ensure_metal_buffer(a);
+        }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); b.update_from_trace(); } else {
+            b.update_from_trace();
+            ensure_metal_buffer(b);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -544,6 +577,10 @@ class SubtractionPrimitive : public Primitive {
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -649,7 +686,6 @@ class MultiplicationPrimitive : public Primitive {
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -664,10 +700,14 @@ class MultiplicationPrimitive : public Primitive {
         a.multiply_cpu_brodcasted(b, out, eval_type);
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); }
-        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); }
-        a.update_from_trace();
-        b.update_from_trace();
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); a.update_from_trace(); } else {
+            a.update_from_trace();
+            ensure_metal_buffer(a);
+        }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); b.update_from_trace(); } else {
+            b.update_from_trace();
+            ensure_metal_buffer(b);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -684,6 +724,10 @@ class MultiplicationPrimitive : public Primitive {
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -798,7 +842,6 @@ class DivisionPrimitive : public Primitive {
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -813,10 +856,14 @@ class DivisionPrimitive : public Primitive {
         a.divide_cpu_brodcasted(b, out, eval_type);
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); }
-        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); }
-        a.update_from_trace();
-        b.update_from_trace();
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); a.update_from_trace(); } else {
+            a.update_from_trace();
+            ensure_metal_buffer(a);
+        }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); b.update_from_trace(); } else {
+            b.update_from_trace();
+            ensure_metal_buffer(b);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -833,6 +880,10 @@ class DivisionPrimitive : public Primitive {
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -944,7 +995,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -960,8 +1010,10 @@ public:
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
         for (size_t i = 0; i < inputs.size(); i++) {
-            if (inputs[i].tape && !inputs[i].tape->evaluated) { inputs[i].tape->eval_metal(inputs[i], eval_type); }
-            inputs[i].update_from_trace();
+            if (inputs[i].tape && !inputs[i].tape->evaluated) { inputs[i].tape->eval_metal(inputs[i], eval_type); inputs[i].update_from_trace(); } else {
+                inputs[i].update_from_trace();
+                ensure_metal_buffer(inputs[i]);
+            }
         }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
@@ -969,7 +1021,6 @@ public:
                 out.metalBuffer = out.tape->out_metal_buffer;
                 out.refCount = out.tape->out_refcount;
                 out.refCount->fetch_add(1);
-                if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
@@ -980,6 +1031,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -1084,7 +1139,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -1100,8 +1154,10 @@ public:
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
         for (size_t i = 0; i < inputs.size(); i++) {
-            if (inputs[i].tape && !inputs[i].tape->evaluated) { inputs[i].tape->eval_metal(inputs[i], eval_type); }
-            inputs[i].update_from_trace();
+            if (inputs[i].tape && !inputs[i].tape->evaluated) { inputs[i].tape->eval_metal(inputs[i], eval_type); inputs[i].update_from_trace(); } else {
+                inputs[i].update_from_trace();
+                ensure_metal_buffer(inputs[i]);
+            }
         }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
@@ -1109,7 +1165,6 @@ public:
                 out.metalBuffer = out.tape->out_metal_buffer;
                 out.refCount = out.tape->out_refcount;
                 out.refCount->fetch_add(1);
-                if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
@@ -1120,6 +1175,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -1238,7 +1297,6 @@ public:
             } else if (input.buffer) {
                 out.buffer = (uint8_t*)input.buffer + offset * dtype_size(out.type);
                 // out.metalBuffer = input.metalBuffer;
-                out.buildMetalBuffer();
                 out.refCount = input.refCount;
                 out.refCount->fetch_add(1);
 
@@ -1266,15 +1324,16 @@ public:
         if (evaluated) {return;} else {evaluated = true;}
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
                 out.metalBuffer = out.tape->out_metal_buffer;
                 out.refCount = out.tape->out_refcount;
                 out.refCount->fetch_add(1);
-                if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else if (input.buffer) {
                 out.buffer = (uint8_t*)input.buffer + offset * dtype_size(out.type);
                 out.metalBuffer = input.metalBuffer;
@@ -1290,7 +1349,10 @@ public:
         if (out.buffer != (uint8_t*)input.buffer) {
             out.releaseBuffer();
             out.buffer = (uint8_t*)input.buffer + offset * dtype_size(out.type);
-            out.metalBuffer = input.metalBuffer; // BUG HERE SLICE BUFFER SHOULD BE AT AN OFFSET
+            // Deliberately the parent's wrapper, which starts at the parent's base - not at the
+            // slice. Only `buffer` carries the offset; setBufferOrBytes() recovers the offset at
+            // bind time as (buffer - [metalBuffer contents]), so a view never needs its own wrapper.
+            out.metalBuffer = input.metalBuffer;
             out.refCount = input.refCount;
             out.refCount->fetch_add(1);
 
@@ -1398,7 +1460,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -1421,11 +1482,14 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); }
-        if (rhs.tape && !rhs.tape->evaluated) { rhs.tape->eval_metal(rhs, eval_type); }
-        input.update_from_trace();
-        rhs.update_from_trace();
-
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
+        if (rhs.tape && !rhs.tape->evaluated) { rhs.tape->eval_metal(rhs, eval_type); rhs.update_from_trace(); } else {
+            rhs.update_from_trace();
+            ensure_metal_buffer(rhs);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -1442,6 +1506,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) return;
         if (evaluated) return; else evaluated = true;
@@ -1550,7 +1618,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -1566,8 +1633,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -1584,6 +1653,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         // ONLY Allocate, don't execute or mark as evaluated!
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -1678,7 +1751,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -1694,8 +1766,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -1712,6 +1786,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         // ONLY Allocate, don't execute or mark as evaluated!
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -1816,7 +1894,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -1831,10 +1908,14 @@ public:
     }
     
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); }
-        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); }
-        a.update_from_trace();
-        b.update_from_trace();
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); a.update_from_trace(); } else {
+            a.update_from_trace();
+            ensure_metal_buffer(a);
+        }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); b.update_from_trace(); } else {
+            b.update_from_trace();
+            ensure_metal_buffer(b);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -1851,6 +1932,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) { return; }
         if (evaluated) {return;} else { evaluated = true; }
@@ -1950,7 +2035,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -1965,10 +2049,14 @@ public:
     }
     
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); }
-        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); }
-        a.update_from_trace();
-        b.update_from_trace();
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); a.update_from_trace(); } else {
+            a.update_from_trace();
+            ensure_metal_buffer(a);
+        }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); b.update_from_trace(); } else {
+            b.update_from_trace();
+            ensure_metal_buffer(b);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -1985,6 +2073,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) { return; }
         if (evaluated) {return;} else { evaluated = true; }
@@ -2074,7 +2166,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -2091,8 +2182,10 @@ public:
         
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -2109,6 +2202,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -2205,7 +2302,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
@@ -2221,15 +2317,16 @@ public:
 
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
                 out.metalBuffer = out.tape->out_metal_buffer;
                 out.refCount = out.tape->out_refcount;
                 out.refCount->fetch_add(1);
-                if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
@@ -2240,6 +2337,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -2364,15 +2465,16 @@ public:
         if (evaluated) {return;} else {evaluated = true;}
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
                 out.metalBuffer = out.tape->out_metal_buffer;
                 out.refCount = out.tape->out_refcount;
                 out.refCount->fetch_add(1);
-                if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = (uint8_t*)input.buffer;
                 out.metalBuffer = input.metalBuffer;
@@ -2384,6 +2486,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (out.buffer != (uint8_t*)input.buffer) {
             out.releaseBuffer();
@@ -2488,7 +2594,6 @@ public:
             } else if (REQUIRES_NEW_BUFFER) {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
@@ -2529,9 +2634,10 @@ public:
         }
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
-
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -2559,6 +2665,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (out.buffer != (uint8_t*)input.buffer && !REQUIRES_NEW_BUFFER) {
             out.releaseBuffer();
@@ -2666,7 +2776,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -2681,15 +2790,16 @@ public:
         input.astype(out, new_type, eval_type, ExecutionDevice::CPU);
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
                 out.metalBuffer = out.tape->out_metal_buffer;
                 out.refCount = out.tape->out_refcount;
                 out.refCount->fetch_add(1);
-                if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
@@ -2701,6 +2811,10 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
 
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
@@ -2813,33 +2927,22 @@ public:
             out.tape->out_refcount = out.refCount;
             out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
         }
-        if (out.buffer != (uint8_t*)input.buffer) {
-            out.releaseBuffer();
-            out.buffer = (uint8_t*)input.buffer;
-            out.metalBuffer = input.metalBuffer;
-            out.refCount = input.refCount;
-            out.refCount->fetch_add(1);
-
-            out.tape->out_buffer = (uint8_t*)out.buffer;
-            out.tape->out_metal_buffer = out.metalBuffer;
-            out.tape->out_refcount = out.refCount;
-            out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
-        }
         if (eval_type == EvalType::COMPILE_TRACE) {
             return;
         }
         if (evaluated) {return;} else {evaluated = true;}
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
                 out.metalBuffer = out.tape->out_metal_buffer;
                 out.refCount = out.tape->out_refcount;
                 out.refCount->fetch_add(1);
-                if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = (uint8_t*)input.buffer;
                 out.metalBuffer = input.metalBuffer;
@@ -2851,6 +2954,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (out.buffer != (uint8_t*)input.buffer) {
             out.releaseBuffer();
@@ -2957,7 +3064,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -2993,9 +3099,10 @@ public:
         
     }
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (outer_input.tape && !outer_input.tape->evaluated) { outer_input.tape->eval_metal(outer_input, eval_type); }
-        outer_input.update_from_trace();
-
+        if (outer_input.tape && !outer_input.tape->evaluated) { outer_input.tape->eval_metal(outer_input, eval_type); outer_input.update_from_trace(); } else {
+            outer_input.update_from_trace();
+            ensure_metal_buffer(outer_input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -3013,12 +3120,13 @@ public:
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
         }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
+        }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
         if (evaluated) {return;} else {evaluated = true;}
-        if (!outer_input.metalBuffer && outer_input.buffer) {
-            outer_input.buildMetalBuffer();
-        }
-        
+
         // outer input gives its buffer to leading node
         outer_input.shareBuffer(sample_parameter);
         // out gives its buffer to the last node of comiled graph
@@ -3158,7 +3266,6 @@ public:
                 } else if (out_i.tape) {
                     out_i.buffer = new uint8_t[out_i.effectiveBufferSize() * dtype_size(out_i.type)];
                     out_i.begin_refcount();
-                    out_i.buildMetalBuffer();
                     out_i.tape->out_buffer = (uint8_t*)out_i.buffer;
                     out_i.tape->out_metal_buffer = out_i.metalBuffer;
                     out_i.tape->out_refcount = out_i.refCount;
@@ -3178,7 +3285,6 @@ public:
 
         for (size_t i = 0; i < outer_inputs.size(); i++) {
             if (!outer_inputs[i].metalBuffer && outer_inputs[i].buffer) {
-                outer_inputs[i].buildMetalBuffer();
             }
             outer_inputs[i].shareBuffer(sample_inputs[i]);
         }
@@ -3210,10 +3316,12 @@ public:
 
     void eval_metal(matrix &out, EvalType eval_type) override {
         for (auto& o_in : outer_inputs) {
-            if (o_in.tape && !o_in.tape->evaluated) { o_in.tape->eval_metal(o_in, eval_type); }
-            o_in.update_from_trace();
+            if (o_in.tape && !o_in.tape->evaluated) { o_in.tape->eval_metal(o_in, eval_type); o_in.update_from_trace(); } else {
+                o_in.update_from_trace();
+                ensure_metal_buffer(o_in);
+            }
         }
-        
+
         for (auto& out_i : outer_outputs) {
             if (!out_i.buffer) {
                 if (out_i.tape && out_i.tape->out_buffer) {
@@ -3230,6 +3338,13 @@ public:
                     out_i.tape->out_refcount = out_i.refCount;
                     out_i.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
                 }
+            }
+            // Each outer_output's tape may be a different sibling MultiInputCompilePrimitive,
+            // so the cache to fix up is that output's own tape->out_metal_buffer, not this
+            // primitive's single out_metal_buffer member.
+            if (out_i.tape && !out_i.tape->out_metal_buffer) {
+                out_i.buildMetalBuffer();
+                out_i.tape->out_metal_buffer = out_i.metalBuffer;
             }
         }
         
@@ -3348,7 +3463,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -3365,8 +3479,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -3383,6 +3499,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         // ONLY Allocate, don't execute or mark as evaluated!
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -3473,7 +3593,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -3490,8 +3609,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -3508,6 +3629,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         // ONLY Allocate, don't execute or mark as evaluated!
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -3596,7 +3721,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -3610,8 +3734,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -3628,6 +3754,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
         if (evaluated) {return;} else {evaluated = true;}
@@ -3715,7 +3845,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -3731,8 +3860,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -3749,6 +3880,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         // ONLY Allocate, don't execute or mark as evaluated!
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -3836,7 +3971,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -3851,8 +3985,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -3869,6 +4005,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
 
@@ -3955,7 +4095,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -3970,8 +4109,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -3988,6 +4129,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
 
@@ -4074,7 +4219,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4090,8 +4234,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -4108,6 +4254,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         // ONLY Allocate, don't execute or mark as evaluated!
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -4193,7 +4343,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4209,8 +4358,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -4227,6 +4378,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         // ONLY Allocate, don't execute or mark as evaluated!
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -4324,7 +4479,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4339,11 +4493,14 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); }
-        if (b_transposed.tape && !b_transposed.tape->evaluated) { b_transposed.tape->eval_metal(b_transposed, eval_type); }
-        a.update_from_trace();
-        b_transposed.update_from_trace();
-
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); a.update_from_trace(); } else {
+            a.update_from_trace();
+            ensure_metal_buffer(a);
+        }
+        if (b_transposed.tape && !b_transposed.tape->evaluated) { b_transposed.tape->eval_metal(b_transposed, eval_type); b_transposed.update_from_trace(); } else {
+            b_transposed.update_from_trace();
+            ensure_metal_buffer(b_transposed);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -4360,6 +4517,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) return;
         if (evaluated) return; else evaluated = true;
@@ -4470,7 +4631,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4490,7 +4650,7 @@ public:
     }
 
     void eval_metal(matrix& out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { 
+        if (input.tape && !input.tape->evaluated) {
             if (boundary_exec_device == ExecutionDevice::METAL) {
                 input.tape->eval_metal(input, eval_type);
             } else {
@@ -4498,6 +4658,7 @@ public:
             }
         };
         input.update_from_trace();
+        ensure_metal_buffer(input);
 
         if (!out.buffer) {
             if (out.tape->out_buffer) {
@@ -4515,6 +4676,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
 
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
@@ -4615,7 +4780,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4630,11 +4794,14 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (source.tape && !source.tape->evaluated) { source.tape->eval_metal(source, eval_type); }
-        if (indices.tape && !indices.tape->evaluated) { indices.tape->eval_metal(indices, eval_type); }
-        source.update_from_trace();
-        indices.update_from_trace();
-
+        if (source.tape && !source.tape->evaluated) { source.tape->eval_metal(source, eval_type); source.update_from_trace(); } else {
+            source.update_from_trace();
+            ensure_metal_buffer(source);
+        }
+        if (indices.tape && !indices.tape->evaluated) { indices.tape->eval_metal(indices, eval_type); indices.update_from_trace(); } else {
+            indices.update_from_trace();
+            ensure_metal_buffer(indices);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -4651,6 +4818,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) return;
         if (evaluated) return; else evaluated = true;
@@ -4882,7 +5053,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
@@ -4894,10 +5064,14 @@ public:
         a.cross_cpu_brodcasted(b, out);
     }
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); }
-        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); }
-        a.update_from_trace();
-        b.update_from_trace();
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); a.update_from_trace(); } else {
+            a.update_from_trace();
+            ensure_metal_buffer(a);
+        }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); b.update_from_trace(); } else {
+            b.update_from_trace();
+            ensure_metal_buffer(b);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -4913,6 +5087,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) return;
         if (evaluated) return; else evaluated = true;
@@ -5072,7 +5250,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
                 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -5102,6 +5279,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) { return; }
         if (evaluated) { return; } else { evaluated = true; }
@@ -5155,7 +5336,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -5169,8 +5349,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -5187,6 +5369,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
         if (evaluated) {return;} else {evaluated = true;}
@@ -5246,7 +5432,6 @@ public:
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
                 out.begin_refcount();
-                out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -5260,8 +5445,10 @@ public:
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
-        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); };
-        input.update_from_trace();
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -5278,6 +5465,10 @@ public:
                 out.tape->out_refcount = out.refCount;
                 out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
         if (evaluated) {return;} else {evaluated = true;}

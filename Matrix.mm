@@ -1669,7 +1669,7 @@ matrix matrix::ones(std::initializer_list<size_m> shapeI, dtype type) {
             GlobalGPUManager.initFillOnes(typeCode);
         }
         [commandEncoder setComputePipelineState:GlobalGPUManager.FillOnesComputeState[typeCode]];
-        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, out, 0);
         uint size = (uint)out.total_size;
         [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
 
@@ -1768,7 +1768,7 @@ matrix matrix::gaussian(std::initializer_list<size_m> shapeI, float std_dev, boo
         memset(sumBuffer.contents, 0, sizeof(float));
 
         [commandEncoder setComputePipelineState:GlobalGPUManager.GaussianFillComputeState[typeCode]];
-        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, out, 0);
         [commandEncoder setBuffer:sumBuffer offset:0 atIndex:1];
         uint size = (uint)out.total_size;
         [commandEncoder setBytes:&size length:sizeof(uint) atIndex:2];
@@ -1788,7 +1788,7 @@ matrix matrix::gaussian(std::initializer_list<size_m> shapeI, float std_dev, boo
                 GlobalGPUManager.initGaussianNormalize(typeCode);
             }
             [commandEncoder setComputePipelineState:GlobalGPUManager.GaussianNormalizeComputeState[typeCode]];
-            [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+            setBufferOrBytes(commandEncoder, out, 0);
             [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
             [commandEncoder setBuffer:sumBuffer offset:0 atIndex:2];
             [commandEncoder dispatchThreads:dispatchSize threadsPerThreadgroup:threadsPerGroup];
@@ -1923,7 +1923,7 @@ matrix matrix::perlin(std::initializer_list<size_m> shapeI, float scale, int oct
             out.dims >= 3 ? (uint32_t)out.strides()[2] : 0);
 
         [commandEncoder setComputePipelineState:GlobalGPUManager.PerlinComputeState];
-        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, out, 0);
         uint size = (uint)out.total_size;
         [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
         [commandEncoder setBytes:&shape3 length:sizeof(simd_uint3) atIndex:2];
@@ -1975,7 +1975,7 @@ matrix matrix::randint(int low, int high, std::initializer_list<size_m> shapeI, 
             GlobalGPUManager.initRandint(typeCode);
         }
         [commandEncoder setComputePipelineState:GlobalGPUManager.RandintComputeState[typeCode]];
-        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, out, 0);
         uint size = (uint)out.total_size;
         [commandEncoder setBytes:&key length:sizeof(simd_uint2) atIndex:1];
         [commandEncoder setBytes:&size length:sizeof(uint) atIndex:2];
@@ -2021,7 +2021,7 @@ matrix matrix::rand(std::initializer_list<size_m> shapeI, dtype type) {
             GlobalGPUManager.initRand(typeCode);
         }
         [commandEncoder setComputePipelineState:GlobalGPUManager.RandComputeState[typeCode]];
-        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, out, 0);
         uint size = (uint)out.total_size;
         [commandEncoder setBytes:&key length:sizeof(simd_uint2) atIndex:1];
         [commandEncoder setBytes:&size length:sizeof(uint) atIndex:2];
@@ -2069,7 +2069,7 @@ matrix matrix::randn(std::initializer_list<size_m> shapeI, dtype type) {
             GlobalGPUManager.initRandn(typeCode);
         }
         [commandEncoder setComputePipelineState:GlobalGPUManager.RandnComputeState[typeCode]];
-        [commandEncoder setBuffer:out.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, out, 0);
         uint size = (uint)out.total_size;
         [commandEncoder setBytes:&key length:sizeof(simd_uint2) atIndex:1];
         [commandEncoder setBytes:&size length:sizeof(uint) atIndex:2];
@@ -4163,7 +4163,7 @@ void matrix::SumNoRed(matrix& output, int axis, EvalType eval_type) {
     auto _dispatchExecutionSize =  MTLSizeMake(output.total_size, 1, 1);
 
     size_t outputDims = dims -1;
-    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, output, 0);
     setBufferOrBytes(commandEncoder, *this, 1);
     
     [commandEncoder setBytes:&axisStride length: sizeof(size_m) atIndex:2];
@@ -4264,7 +4264,7 @@ void matrix::sum_legacy(matrix& output, int axis, bool keepdims, EvalType eval_t
     auto _dispatchExecutionSize =  MTLSizeMake(output.total_size, 1, 1);
 
     size_t outputDims = dims - 1;
-    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, output, 0);
     setBufferOrBytes(commandEncoder, *this, 1);
     
     [commandEncoder setBytes:&axisStride length: sizeof(size_m) atIndex:2];
@@ -4390,7 +4390,7 @@ void matrix::conv1d_gpu(const matrix& kernel, matrix& output) {
     }
     [commandEncoder setComputePipelineState:GlobalGPUManager.Conv1dComputeState[typeCode]];
     
-    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, output, 0);
     setBufferOrBytes(commandEncoder, *this, 1);
     setBufferOrBytes(commandEncoder, kernel, 2);
     
@@ -4428,7 +4428,7 @@ void matrix::conv2d_gpu(const matrix& kernel, matrix& output) {
     }
     [commandEncoder setComputePipelineState:GlobalGPUManager.Conv2dComputeState[typeCode]];
     
-    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, output, 0);
     setBufferOrBytes(commandEncoder, *this, 1);
     setBufferOrBytes(commandEncoder, kernel, 2);
     
@@ -4466,7 +4466,7 @@ void matrix::conv3d_gpu(const matrix& kernel, matrix& output) {
     }
     [commandEncoder setComputePipelineState:GlobalGPUManager.Conv3dComputeState[typeCode]];
     
-    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, output, 0);
     setBufferOrBytes(commandEncoder, *this, 1);
     setBufferOrBytes(commandEncoder, kernel, 2);
     
@@ -4527,7 +4527,7 @@ void matrix::clamp(matrix& output, double min_val, double max_val, ExecutionDevi
             GlobalGPUManager.initClamp_nd(typeCode, kernel_code);
         }
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
         auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
@@ -4693,7 +4693,7 @@ void matrix::log(matrix& output, ExecutionDevice exec_device) {
             GlobalGPUManager.initLog(typeCode, kernel_code);
         }
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
         auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
@@ -4806,7 +4806,7 @@ void matrix::abs(matrix& output, ExecutionDevice exec_device) {
             GlobalGPUManager.initAbs(typeCode, kernel_code);
         }
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
         auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
@@ -4933,7 +4933,7 @@ void matrix::sin(matrix& output, ExecutionDevice exec_device) {
             GlobalGPUManager.initSin_nd(typeCode, kernel_code);
         }
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
         auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
@@ -5061,7 +5061,7 @@ void matrix::cos(matrix& output, ExecutionDevice exec_device) {
             GlobalGPUManager.initCos_nd(typeCode, kernel_code);
         }
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
         auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
@@ -5189,7 +5189,7 @@ void matrix::tan(matrix& output, ExecutionDevice exec_device) {
             GlobalGPUManager.initTan_nd(typeCode, kernel_code);
         }
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
         auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
@@ -5317,7 +5317,7 @@ void matrix::sqrt(matrix& output, ExecutionDevice exec_device) {
             GlobalGPUManager.initSqrt_nd(typeCode, kernel_code);
         }
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
         auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
@@ -5445,7 +5445,7 @@ void matrix::exp(matrix& output, ExecutionDevice exec_device) {
             GlobalGPUManager.initExp_nd(typeCode, kernel_code);
         }
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // Output destination
+        setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
         auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
@@ -5724,10 +5724,10 @@ void matrix::batched_dot_gpu(matrix& b_transposed, matrix& result) {
     id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
     id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
     [commandEncoder setComputePipelineState:GlobalGPUManager.BatchedMatMulComputeState[typeCode][spec_idx]];
-    
-    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
-    [commandEncoder setBuffer:this->metalBuffer offset:0 atIndex:1];
-    [commandEncoder setBuffer:b_transposed.metalBuffer offset:0 atIndex:2];
+
+    setBufferOrBytes(commandEncoder, result, 0);
+    setBufferOrBytes(commandEncoder, *this, 1);
+    setBufferOrBytes(commandEncoder, b_transposed, 2);
     
     size_t array_len = sizeof(size_m) * collapsed_desc.out_dims;
     [commandEncoder setBytes:collapsed_desc.stridesA length:array_len atIndex:3];
@@ -6249,7 +6249,7 @@ void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType
 
     auto _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
     
-    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, result, 0);
     setBufferOrBytes(commandEncoder, *this, 1);
     setBufferOrBytes(commandEncoder, other, 2);
     
@@ -6379,7 +6379,7 @@ void matrix::multiply_gpu_brodcasted( matrix &other, matrix &result, EvalType ev
     
     auto _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
     
-    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, result, 0);
     setBufferOrBytes(commandEncoder, *this, 1);
     setBufferOrBytes(commandEncoder, other, 2);
     
@@ -6500,7 +6500,7 @@ void matrix::subtract_gpu_brodcasted( matrix &other, matrix &result, EvalType ev
     auto _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
     
     
-    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, result, 0);
     setBufferOrBytes(commandEncoder, *this, 1);
     setBufferOrBytes(commandEncoder, other, 2);
     
@@ -6616,7 +6616,7 @@ void matrix::divide_gpu_brodcasted( matrix &other, matrix &result, EvalType eval
     
     auto _dispatchExecutionSize = MTLSizeMake(result.total_size, 1, 1);
     
-    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, result, 0);
     setBufferOrBytes(commandEncoder, *this, 1);
     setBufferOrBytes(commandEncoder, other, 2);
     
@@ -10762,10 +10762,10 @@ void matrix::conv_gpu(const matrix& kernel, matrix& output) {
     }
     MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
     
-    [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
-    [commandEncoder setBuffer:metalBuffer offset:0 atIndex:1];
-    [commandEncoder setBuffer:kernel.metalBuffer offset:0 atIndex:2];
-    
+    setBufferOrBytes(commandEncoder, output, 0);
+    setBufferOrBytes(commandEncoder, *this, 1);
+    setBufferOrBytes(commandEncoder, kernel, 2);
+
     [commandEncoder setBytes:shape() length:dims * sizeof(size_m) atIndex:3];
     [commandEncoder setBytes:kernel.shape() length:kernel.dims * sizeof(size_m) atIndex:4];
     [commandEncoder setBytes:output.shape() length:output.dims * sizeof(size_m) atIndex:5];
@@ -11662,7 +11662,7 @@ void matrix::max(const matrix& other, matrix& result, ExecutionDevice exec_devic
         id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
         [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedMaxComputeState[typeCode][kernelCode]];
         
-        [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, result, 0);
         setBufferOrBytes(commandEncoder, *this, 1);
         setBufferOrBytes(commandEncoder, other, 2);
         
@@ -11776,7 +11776,7 @@ void matrix::min(const matrix& other, matrix& result, ExecutionDevice exec_devic
         id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
         [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedMinComputeState[typeCode][kernelCode]];
         
-        [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, result, 0);
         setBufferOrBytes(commandEncoder, *this, 1);
         setBufferOrBytes(commandEncoder, other, 2);
         
@@ -11914,7 +11914,7 @@ void matrix::max(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
         id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
         id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, output, 0);
         setBufferOrBytes(commandEncoder, *this, 1);
         
         [commandEncoder setBytes:&reduce_axis_stride length: sizeof(size_m) atIndex:2];
@@ -12058,7 +12058,7 @@ void matrix::min(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
         id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
         id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, output, 0);
         setBufferOrBytes(commandEncoder, *this, 1);
         
         [commandEncoder setBytes:&reduce_axis_stride length: sizeof(size_m) atIndex:2];
@@ -12207,7 +12207,7 @@ void matrix::sum(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
         id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
         id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0];
+        setBufferOrBytes(commandEncoder, output, 0);
         setBufferOrBytes(commandEncoder, *this, 1);
         
         [commandEncoder setBytes:&reduce_axis_stride length: sizeof(size_m) atIndex:2];
@@ -12381,7 +12381,7 @@ void matrix::take_backend(const matrix& index, matrix& output, int axis, Executi
         }
         [commandEncoder setComputePipelineState:GlobalGPUManager.TakeComputeState_nd[typeCode][kernel_code][idxTypeCode]];
 
-        [commandEncoder setBuffer:output.metalBuffer offset:0 atIndex:0]; // dst
+        setBufferOrBytes(commandEncoder, output, 0); // dst
         setBufferOrBytes(commandEncoder, *this, 1); // src
         setBufferOrBytes(commandEncoder, index, 2); // indices
         
@@ -12589,7 +12589,7 @@ void matrix::cross_gpu_brodcasted(matrix &other, matrix &result) {
     id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
     id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
     
-    [commandEncoder setBuffer:result.metalBuffer offset:0 atIndex:0];
+    setBufferOrBytes(commandEncoder, result, 0);
     setBufferOrBytes(commandEncoder, *this, 1);
     setBufferOrBytes(commandEncoder, other, 2);
     
