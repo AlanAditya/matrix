@@ -12149,6 +12149,96 @@ void matrix::max(const matrix& other, matrix& result, ExecutionDevice exec_devic
     }
 }
 
+matrix matrix::equal(const matrix& a, const matrix& b) {
+    dtype res_type = promote_types(a.type, b.type);
+    matrix lhs = (a.type != res_type) ? a.astype(res_type) : a;
+    matrix rhs = (b.type != res_type) ? b.astype(res_type) : b;
+
+    matrix result(std::max(lhs.dims, rhs.dims), res_type);
+    auto primit = new EqualPrimitive(lhs, rhs);
+    primit->desc_a = BroadcastDescriptor::create(result.dims);
+    primit->desc_b = BroadcastDescriptor::create(result.dims);
+    broadcast_shapes(lhs.array_desc, rhs.array_desc, result.array_desc,
+                     primit->desc_a, primit->desc_b, lhs.dims, rhs.dims);
+    primit->collapsed_dims_3 = collapse_dims(primit->desc_a->shape(), primit->desc_a->strides(result.dims), primit->desc_b->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+    primit->out_shape.assign(result.shape(), result.shape() + result.dims);
+    result.total_size = result.accumul(0, result.dims);
+    result.tape = primit;
+    return result;
+}
+
+void matrix::equal_backend(matrix& output, ExecutionDevice exec_device) {
+    EqualPrimitive* primit = static_cast<EqualPrimitive*>(output.tape);
+    const matrix& a = primit->a;
+    const matrix& b = primit->b;
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = output.total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+
+    // Both-scalar inputs collapse to rank 0: run it as one element in 1D.
+    CollapsedDims_3 res = primit->collapsed_dims_3;
+    if (res.out_dims == 0) {
+        res.out_dims = 1;
+        res.shape[0] = 1;
+        res.stridesA[0] = res.stridesB[0] = res.stridesC[0] = 0;
+    }
+    uint32_t cdims = res.out_dims;
+    if (output.total_size == 0) return;
+
+    if (exec_device == ExecutionDevice::METAL) {
+        int typeCode = (int)output.type;
+        int kernelCode = cdims > 3 ? 3 : cdims - 1;
+        if (!GlobalGPUManager.EqualInit[typeCode][kernelCode]) {
+            GlobalGPUManager.initEqual(typeCode, kernelCode);
+        }
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        [commandEncoder setComputePipelineState:GlobalGPUManager.EqualComputeState[typeCode][kernelCode]];
+
+        setBufferOrBytes(commandEncoder, output, 0);
+        setBufferOrBytes(commandEncoder, a, 1);
+        setBufferOrBytes(commandEncoder, b, 2);
+        [commandEncoder setBytes:res.stridesC length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:5];
+
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        MTLSize _dispatchExecutionSize;
+        if (cdims == 1) {
+            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+        } else if (cdims == 2) {
+            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        } else if (cdims == 3) {
+            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        } else {
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:6];
+            int ndims = cdims;
+            [commandEncoder setBytes:&ndims length:sizeof(int) atIndex:7];
+            size_m acc = 1;
+            for (uint32_t i = 0; i < cdims - 2; i++) { acc *= res.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+        }
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        dispatch_type(output.type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            const T* a_data = (const T*)a.buffer;
+            const T* b_data = (const T*)b.buffer;
+            for (size_t gid = 0; gid < output.total_size; gid++) {
+                size_m rem = gid;
+                size_t ia = 0, ib = 0, ir = 0;
+                for (int d = cdims - 1; d >= 0; --d) {
+                    size_m idx = rem % res.shape[d];
+                    ia += idx * res.stridesA[d];
+                    ib += idx * res.stridesB[d];
+                    ir += idx * res.stridesC[d];
+                    rem /= res.shape[d];
+                }
+                out_data[ir] = a_data[ia] == b_data[ib] ? T(1) : T(0);
+            }
+        });
+    }
+}
+
 matrix matrix::min(const matrix& a, const matrix& b) {
     dtype res_type = promote_types(a.type, b.type);
     matrix result(std::max(a.dims, b.dims), res_type);

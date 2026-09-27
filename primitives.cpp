@@ -1678,6 +1678,13 @@ public:
     matrix& input_at(uint32_t i) override { return i == 0 ? input : rhs; }
 };
 
+// Where an axis max/min came from: 1/k at each of the k elements equal to the extremum
+// (extremum has keepdims shape, so it broadcasts back along axis), 0 elsewhere.
+static matrix extremum_weights(const matrix& input, const matrix& extremum, int axis) {
+    matrix mask = matrix::equal(input, extremum);
+    return mask / mask.sum(axis, true);
+}
+
 class MaxReductionPrimitive : public Primitive {
 public:
     matrix input;
@@ -1754,16 +1761,16 @@ public:
         if (evaluated) {return;} else {evaluated = true;}
         input.max(out, axis, keepdims, ExecutionDevice::METAL);
     }
+    // The gradient flows only to the element(s) that were the max, split evenly between
+    // ties (as in MLX). The max is recomputed with keepdims so it broadcasts back along axis.
     std::vector<matrix> vjp(matrix& grad_out) override {
-        // a, b, c are vectors (a)=>c soo J = (dc/da) and for sum its 1 so J = (1, 1)
-        return {};
+        matrix g = keepdims ? grad_out : grad_out.unsqueeze(axis);
+        return { extremum_weights(input, input.max(axis, true), axis) * g };
     }
-    matrix jvp(std::vector<matrix>& tangents) override {
-        // a, b, c are vectors (a,b)=>c soo J = (dc/da, dc/db) and for stack we just need to stack the derivative
-        // tangents are coming from the inputs so tangents are {da/.., db/...}
-        // we need to find the total derivative of c so (da/.. , db/...)
 
-        return matrix(0, dtype::UInt8);
+    // The tangent at the max's position (averaged over ties).
+    matrix jvp(std::vector<matrix>& tangents) override {
+        return (extremum_weights(input, input.max(axis, true), axis) * tangents[0]).sum(axis, keepdims);
     }
 // Converts dirty=true into evaluated=false along every path leading to a dirty node,
     // then resets dirty. This is needed because nodes only know their parents, not their
@@ -1895,16 +1902,16 @@ public:
         if (evaluated) {return;} else {evaluated = true;}
         input.min(out, axis, keepdims, ExecutionDevice::METAL);
     }
+    // The gradient flows only to the element(s) that were the min, split evenly between
+    // ties (as in MLX). The min is recomputed with keepdims so it broadcasts back along axis.
     std::vector<matrix> vjp(matrix& grad_out) override {
-        // a, b, c are vectors (a)=>c soo J = (dc/da) and for sum its 1 so J = (1, 1)
-        return {};
+        matrix g = keepdims ? grad_out : grad_out.unsqueeze(axis);
+        return { extremum_weights(input, input.min(axis, true), axis) * g };
     }
-    matrix jvp(std::vector<matrix>& tangents) override {
-        // a, b, c are vectors (a,b)=>c soo J = (dc/da, dc/db) and for stack we just need to stack the derivative
-        // tangents are coming from the inputs so tangents are {da/.., db/...}
-        // we need to find the total derivative of c so (da/.. , db/...)
 
-        return matrix(0, dtype::UInt8);
+    // The tangent at the min's position (averaged over ties).
+    matrix jvp(std::vector<matrix>& tangents) override {
+        return (extremum_weights(input, input.min(axis, true), axis) * tangents[0]).sum(axis, keepdims);
     }
 // Converts dirty=true into evaluated=false along every path leading to a dirty node,
     // then resets dirty. This is needed because nodes only know their parents, not their
@@ -1959,6 +1966,139 @@ public:
     uint32_t num_inputs() const override { return 1; }
     matrix& input_at(uint32_t i) override { return input; }
 
+};
+
+// Broadcasted elementwise a == b -> 1/0 in the promoted dtype. Owning node. The inputs are
+// already cast to the output dtype by matrix::equal (Phase 1); the backend is
+// matrix::equal_backend (Phase 3). A comparison has no gradient.
+class EqualPrimitive : public Primitive {
+public:
+    matrix a;
+    matrix b;
+    BroadcastDescriptor* desc_a = nullptr;
+    BroadcastDescriptor* desc_b = nullptr;
+    CollapsedDims_3 collapsed_dims_3;       // stridesA = a, stridesB = b, stridesC = result
+    std::vector<size_m> out_shape;          // for the (zero) tangent in jvp
+
+    EqualPrimitive(const matrix& a, const matrix& b) : a(ensure_graph_ready(a)), b(ensure_graph_ready(b)) {}
+    ~EqualPrimitive() {
+        if (desc_a) BroadcastDescriptor::destroy(desc_a);
+        if (desc_b) BroadcastDescriptor::destroy(desc_b);
+    }
+
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_cpu(a, eval_type); }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_cpu(b, eval_type); }
+        a.update_from_trace();
+        b.update_from_trace();
+
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) {return;} else {evaluated = true;}
+
+        matrix::equal_backend(out, ExecutionDevice::CPU);
+    }
+
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_metal(a, eval_type); a.update_from_trace(); } else {
+            a.update_from_trace();
+            ensure_metal_buffer(a);
+        }
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_metal(b, eval_type); b.update_from_trace(); } else {
+            b.update_from_trace();
+            ensure_metal_buffer(b);
+        }
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) {return;} else { evaluated = true; }
+
+        matrix::equal_backend(out, ExecutionDevice::METAL);
+    }
+
+    // Piecewise constant: zero gradient to both inputs.
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        std::vector<size_m> a_shape(a.shape(), a.shape() + a.dims);
+        std::vector<size_m> b_shape(b.shape(), b.shape() + b.dims);
+        return {matrix::zeros(a_shape, a.type), matrix::zeros(b_shape, b.type)};
+    }
+    matrix jvp(std::vector<matrix>& tangents) override {
+        return matrix::zeros(out_shape, a.type);
+    }
+
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (a.tape->version > this->version) inv = true;
+            new_version = std::max(a.tape->version, new_version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (b.tape->version > this->version) inv = true;
+            new_version = std::max(b.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (a.tape) { a.tape->clear_trace_checks(); }
+        if (b.tape) { b.tape->clear_trace_checks(); }
+    }
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {a, b}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? a : b; }
 };
 
 class MaxPrimitive : public Primitive {

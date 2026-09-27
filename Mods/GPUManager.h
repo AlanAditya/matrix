@@ -171,6 +171,9 @@ public:
     bool BrodcastedMaxInit[7][4] = {{false}};
     bool BrodcastedMinInit[7][4] = {{false}};
     bool BrodcastedCrossInit[4][4] = {{false}};
+    // Broadcasted elementwise equality (ComputeShaders/Equal.metal), [dtype][dim specialization].
+    id<MTLComputePipelineState> EqualComputeState[7][4];
+    bool EqualInit[7][4] = {{false}};
     
     bool Concat_2M[4];
     id<MTLComputePipelineState> Concat_2M_ComputeState[4];
@@ -838,6 +841,14 @@ public:
         id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedMaxGPU_%i_%i", typeCode, dimSpecialiation]];
         BrodcastedMaxComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         BrodcastedMaxInit[typeCode][dimSpecialiation] = true;
+    }
+    
+    void initEqual(int typeCode, int dimSpecialiation) {
+        NSError* error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"EqualGPU_%i_%i", typeCode, dimSpecialiation]];
+        EqualComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        EqualInit[typeCode][dimSpecialiation] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
     }
     
     void initBrodcastedMinInit(int typeCode, int dimSpecialiation) {

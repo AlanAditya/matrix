@@ -1540,6 +1540,10 @@ public:
     
     static matrix max(const matrix& a, const matrix& b);
     void max(const matrix& other, matrix& output, ExecutionDevice exec_device) const;
+    // Broadcasted elementwise a == b as 1/0 in the promoted dtype (a mask that multiplies
+    // straight into other tensors). No gradient. See .agents/MatrixAPI.md.
+    static matrix equal(const matrix& a, const matrix& b);
+    static void equal_backend(matrix& output, ExecutionDevice exec_device);
     static matrix min(const matrix& a, const matrix& b);
     void min(const matrix& other, matrix& output, ExecutionDevice exec_device) const;
 
