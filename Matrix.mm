@@ -1820,6 +1820,43 @@ matrix matrix::gaussian(std::initializer_list<size_m> shapeI, float std_dev, boo
 // output is a real fixed-z (or fixed-y,z) slice of one coherent 3D field, not a 1D
 // noise line reshaped into more dimensions.
 matrix matrix::perlin(std::initializer_list<size_m> shapeI, float scale, int octaves, float persistence, float lacunarity) {
+    return matrix::perlin(shapeI, ScalarArg(scale), ScalarArg(octaves), ScalarArg(persistence), ScalarArg(lacunarity));
+}
+
+// One perlin() parameter, resolved: either a constant baked into the closures, or an index
+// into the generator's `inputs` (a tracked 1-element matrix, read when the kernel runs).
+struct PerlinParam {
+    int input = -1;
+    float constant = 0.0f;
+};
+
+static PerlinParam perlin_param(const ScalarArg& arg, dtype expected, const char* name, std::vector<matrix>& inputs) {
+    PerlinParam p;
+    if (!arg.is_tracked) {
+        p.constant = arg.constant;
+        return p;
+    }
+    if (arg.tracked.total_size != 1) {
+        throw std::invalid_argument(std::string("matrix::perlin: tracked `") + name + "` must have exactly 1 element");
+    }
+    // The GPU kernel reads the bound bytes as the parameter's own type, so a tracked matrix
+    // must already be that type (a Float matrix bound as `int octaves` would be garbage).
+    if (arg.tracked.type != expected) {
+        throw std::invalid_argument(std::string("matrix::perlin: tracked `") + name + "` must be " +
+                                    (expected == dtype::Int32 ? "Int32" : "Float"));
+    }
+    p.input = (int)inputs.size();
+    inputs.push_back(arg.tracked);
+    return p;
+}
+
+matrix matrix::perlin(std::initializer_list<size_m> shapeI, const ScalarArg& scale_arg, const ScalarArg& octaves_arg, const ScalarArg& persistence_arg, const ScalarArg& lacunarity_arg) {
+    std::vector<matrix> inputs;
+    PerlinParam scale_p       = perlin_param(scale_arg,       dtype::Float, "scale",       inputs);
+    PerlinParam octaves_p     = perlin_param(octaves_arg,     dtype::Int32, "octaves",     inputs);
+    PerlinParam persistence_p = perlin_param(persistence_arg, dtype::Float, "persistence", inputs);
+    PerlinParam lacunarity_p  = perlin_param(lacunarity_arg,  dtype::Float, "lacunarity",  inputs);
+
     matrix output((uint32_t)shapeI.size(), dtype::Float);
     memcpy(output.shape(), shapeI.begin(), output.dims * sizeof(size_m));
     output.calcStrides();
@@ -1832,7 +1869,12 @@ matrix matrix::perlin(std::initializer_list<size_m> shapeI, float scale, int oct
     std::uniform_real_distribution<float> seed_dist(0.0f, 1000.0f);
     simd_float3 seed_offset = simd_make_float3(seed_dist(seed_rng), seed_dist(seed_rng), seed_dist(seed_rng));
 
-    auto fill_perlin_cpu = [scale, octaves, persistence, lacunarity, seed_offset](matrix& out) {
+    auto fill_perlin_cpu = [scale_p, octaves_p, persistence_p, lacunarity_p, seed_offset](matrix& out, std::vector<matrix>& ins) {
+        // Tracked inputs are already evaluated on the CPU by GeneratorPrimitive's DFS.
+        const float scale       = scale_p.input       < 0 ? scale_p.constant       : *(float*)ins[scale_p.input].buffer;
+        const int   octaves     = octaves_p.input     < 0 ? (int)octaves_p.constant : *(int32_t*)ins[octaves_p.input].buffer;
+        const float persistence = persistence_p.input < 0 ? persistence_p.constant : *(float*)ins[persistence_p.input].buffer;
+        const float lacunarity  = lacunarity_p.input  < 0 ? lacunarity_p.constant  : *(float*)ins[lacunarity_p.input].buffer;
         static constexpr int p[512] = {
             151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,
             8,99,37,240,21,10,23,190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,
@@ -1922,7 +1964,7 @@ matrix matrix::perlin(std::initializer_list<size_m> shapeI, float scale, int oct
         }
     };
 
-    auto fill_perlin_gpu = [scale, octaves, persistence, lacunarity, seed_offset](matrix& out) {
+    auto fill_perlin_gpu = [scale_p, octaves_p, persistence_p, lacunarity_p, seed_offset](matrix& out, std::vector<matrix>& ins) {
         id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
         if (!GlobalGPUManager.PerlinInit) {
             GlobalGPUManager.initPerlin();
@@ -1944,19 +1986,26 @@ matrix matrix::perlin(std::initializer_list<size_m> shapeI, float scale, int oct
         [commandEncoder setBytes:&size length:sizeof(uint) atIndex:1];
         [commandEncoder setBytes:&shape3 length:sizeof(simd_uint3) atIndex:2];
         [commandEncoder setBytes:&strides3 length:sizeof(simd_uint3) atIndex:3];
-        [commandEncoder setBytes:&scale length:sizeof(float) atIndex:4];
+        // Constants go in with setBytes. Tracked inputs are bound with setBufferOrBytes rather
+        // than read on the host here: one computed earlier in this same command buffer only
+        // has its value once its kernel has run, which the GPU orders but the host can't see.
+        auto bind_float = [&](const PerlinParam& p, NSUInteger index) {
+            if (p.input < 0) { float v = p.constant; [commandEncoder setBytes:&v length:sizeof(float) atIndex:index]; }
+            else { setBufferOrBytes(commandEncoder, ins[p.input], index); }
+        };
+        bind_float(scale_p, 4);
         [commandEncoder setBytes:&seed_offset length:sizeof(simd_float3) atIndex:5];
-        int oct = octaves;
-        [commandEncoder setBytes:&oct length:sizeof(int) atIndex:6];
-        [commandEncoder setBytes:&persistence length:sizeof(float) atIndex:7];
-        [commandEncoder setBytes:&lacunarity length:sizeof(float) atIndex:8];
+        if (octaves_p.input < 0) { int oct = (int)octaves_p.constant; [commandEncoder setBytes:&oct length:sizeof(int) atIndex:6]; }
+        else { setBufferOrBytes(commandEncoder, ins[octaves_p.input], 6); }
+        bind_float(persistence_p, 7);
+        bind_float(lacunarity_p, 8);
 
         auto dispatchSize = MTLSizeMake(size, 1, 1);
         auto threadsPerGroup = MTLSizeMake((size < 256 ? size : 256), 1, 1);
         [commandEncoder dispatchThreads:dispatchSize threadsPerThreadgroup:threadsPerGroup];
     };
 
-    output.tape = new GeneratorPrimitive(fill_perlin_cpu, fill_perlin_gpu);
+    output.tape = new GeneratorPrimitive(fill_perlin_cpu, fill_perlin_gpu, inputs);
     return output;
 }
 
@@ -2140,6 +2189,42 @@ matrix matrix::leaf(const std::vector<size_m>& shape, dtype type) {
     output.releaseTape();
     output.tape = new LeafPrimitive(output);
     return output;
+}
+
+matrix matrix::host_op(const std::vector<size_m>& shape, dtype type,
+                       std::function<void(matrix& out, std::vector<matrix>& ins)> fn,
+                       const std::vector<matrix>& inputs) {
+    matrix output((uint32_t)shape.size(), type);
+    memcpy(output.shape(), shape.data(), output.dims * sizeof(size_m));
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    // The inputs were evaluated by the DFS just before this runs, but on Metal that only means
+    // their kernels are encoded into this thread's command buffer. Host code reads their memory
+    // directly, so finish that work first (later nodes in the pass start a new command buffer).
+    auto gpu_fn = [fn](matrix& out, std::vector<matrix>& ins) {
+        if (GlobalGPUManager._thread_gCommandBuffer) {
+            GlobalGPUManager.endCommandEncoding();
+            GlobalGPUManager.commitCommandBuffer();
+        }
+        fn(out, ins);
+    };
+    output.tape = new GeneratorPrimitive(fn, gpu_fn, inputs);
+    return output;
+}
+
+matrix matrix::leaf_scalar(float value, dtype type) {
+    matrix output = matrix::scalar(value, type);  // host memory, refcounted, no tape
+    output.make_leaf();
+    return output;
+}
+
+void matrix::mark_changed() {
+    if (!tape) {
+        throw std::runtime_error("matrix::mark_changed: no tape - make it a leaf (make_leaf()/leaf_scalar()) so the graph can track it");
+    }
+    tape->evaluated = false;
+    tape->version = ++global_epoch;
 }
 
 void matrix::make_leaf() {

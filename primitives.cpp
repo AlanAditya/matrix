@@ -100,6 +100,10 @@ public:
     virtual matrix jvp(std::vector<matrix>& tangents) = 0;
     virtual matrix vmap(std::function<matrix(const matrix&)> func, std::vector<int> in_axis) = 0;
     virtual std::vector<matrix> get_inputs() = 0;
+    // Non-allocating input access: a reference to the primitive's own member - no vector,
+    // no handle copies, no refcount traffic. Same order as get_inputs().
+    virtual uint32_t num_inputs() const = 0;
+    virtual matrix& input_at(uint32_t i) = 0;
     virtual bool invalidate_pass(uint64_t current_pass_id) = 0;
 };
 
@@ -170,6 +174,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {};
     }
+    uint32_t num_inputs() const override { return 0; }
+    matrix& input_at(uint32_t i) override { throw std::out_of_range("primitive has no inputs"); }
     
 };
 
@@ -357,6 +363,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input, kernel};
     }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? input : kernel; }
 };
 
 class AdditionPrimitive : public Primitive {
@@ -519,6 +527,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {a, b};
     }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? a : b; }
 };
 
 class SubtractionPrimitive : public Primitive {
@@ -674,6 +684,8 @@ class SubtractionPrimitive : public Primitive {
     std::vector<matrix> get_inputs() override {
         return {a, b};
     }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? a : b; }
 };
 
 class MultiplicationPrimitive : public Primitive {
@@ -834,6 +846,8 @@ class MultiplicationPrimitive : public Primitive {
     std::vector<matrix> get_inputs() override {
         return {a, b};
     }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? a : b; }
 };
 
 class DivisionPrimitive : public Primitive {
@@ -992,6 +1006,8 @@ class DivisionPrimitive : public Primitive {
     std::vector<matrix> get_inputs() override {
         return {a, b};
     }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? a : b; }
 };
 
 //using size_m = uint32;
@@ -1149,6 +1165,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return inputs;
     }
+    uint32_t num_inputs() const override { return (uint32_t)inputs.size(); }
+    matrix& input_at(uint32_t i) override { return inputs[i]; }
 };
 
 class ConcatPrimitive : public Primitive {
@@ -1299,6 +1317,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return inputs;
     }
+    uint32_t num_inputs() const override { return (uint32_t)inputs.size(); }
+    matrix& input_at(uint32_t i) override { return inputs[i]; }
 };
 
 
@@ -1482,6 +1502,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 class SliceAssignPrimitive : public Primitive {
@@ -1652,6 +1674,8 @@ public:
     
     matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
     std::vector<matrix> get_inputs() override { return {input, rhs}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? input : rhs; }
 };
 
 class MaxReductionPrimitive : public Primitive {
@@ -1791,6 +1815,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return { input };
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 class MinReductionPrimitive : public Primitive {
@@ -1930,6 +1956,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return { input };
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 
 };
 
@@ -2078,6 +2106,8 @@ public:
     }
     matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
     std::vector<matrix> get_inputs() override { return {a, b}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? a : b; }
 };
 
 class MinPrimitive : public Primitive {
@@ -2225,6 +2255,8 @@ public:
     }
     matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
     std::vector<matrix> get_inputs() override { return {a, b}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? a : b; }
 };
 
 class SumPrimitive : public Primitive {
@@ -2368,6 +2400,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return { input };
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 class PaddingPrimitive : public Primitive {
@@ -2510,6 +2544,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input, value};
     }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? input : value; }
 };
 
 class BrodcastPrimitive : public Primitive {
@@ -2677,6 +2713,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 class ReshapePrimitive : public Primitive {
@@ -2880,6 +2918,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return { input };
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 class AsTypePrimitive : public Primitive {
@@ -3015,6 +3055,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return { input };
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 class TransposePrimitive : public Primitive {
@@ -3178,6 +3220,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 
@@ -3357,6 +3401,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {};
     }
+    uint32_t num_inputs() const override { return 0; }
+    matrix& input_at(uint32_t i) override { throw std::out_of_range("primitive has no inputs"); }
 };
 
 
@@ -3584,6 +3630,8 @@ public:
     }
     matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
     std::vector<matrix> get_inputs() override { return outer_inputs; }
+    uint32_t num_inputs() const override { return (uint32_t)outer_inputs.size(); }
+    matrix& input_at(uint32_t i) override { return outer_inputs[i]; }
 };
 
 
@@ -3724,6 +3772,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 // ==================== ABS PRIMITIVE ====================
@@ -3858,6 +3908,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 // ==================== LOG PRIMITIVE ====================
@@ -3934,6 +3986,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
     
 // Converts dirty=true into evaluated=false along every path leading to a dirty node,
     // then resets dirty. This is needed because nodes only know their parents, not their
@@ -4121,6 +4175,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 // ==================== COS PRIMITIVE ====================
@@ -4251,6 +4307,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 // ==================== TAN PRIMITIVE ====================
@@ -4382,6 +4440,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 class SqrtPrimitive : public Primitive {
@@ -4512,6 +4572,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 class ExpPrimitive : public Primitive {
@@ -4642,6 +4704,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 class DotPrimitive : public Primitive {
@@ -4803,6 +4867,8 @@ public:
     }
     matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
     std::vector<matrix> get_inputs() override { return {a, b_transposed}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? a : b_transposed; }
 };
 
 class ExecutionBoundaryPrimitive : public Primitive {
@@ -4913,6 +4979,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
     
 // Converts dirty=true into evaluated=false along every path leading to a dirty node,
     // then resets dirty. This is needed because nodes only know their parents, not their
@@ -5110,6 +5178,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {source, indices};
     }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? source : indices; }
 };
 
 class ResamplePrimitive : public Primitive {
@@ -5241,6 +5311,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 class CrossPrimitive : public Primitive {
@@ -5386,6 +5458,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {a, b};
     }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? a : b; }
 };
 
 class LeafPrimitive : public Primitive {
@@ -5451,22 +5525,40 @@ public:
     std::vector<matrix> get_inputs() override {
         return {};
     }
+    uint32_t num_inputs() const override { return 0; }
+    matrix& input_at(uint32_t i) override { throw std::out_of_range("primitive has no inputs"); }
 };
 
 // Backs every data-free factory (zeros, ones, gaussian, rand, randn, randint, ...).
 // One shared Primitive parameterised by a CPU closure and a GPU closure, rather than a
 // subclass per generator, since the shape of the work (allocate output, fill it, done) never
-// changes across generators. A generator is a leaf: it has no input matrices, so vjp/jvp/
-// get_inputs are all empty/zero and invalidate_pass can never be dirtied from below.
+// changes across generators.
+//
+// Most generators are leaves (no inputs). A generator can optionally take scalar `inputs`
+// (e.g. perlin()'s scale fed by a UI slider leaf): they are ordinary graph edges, evaluated
+// first in the DFS and version-checked in invalidate_pass, so bumping an input's version
+// re-runs the generator into its same cached buffer. The closures receive the evaluated
+// inputs; the GPU closure should bind them with setBufferOrBytes (not read them on the host),
+// so an input computed earlier in the same command buffer is read after its kernel ran.
 class GeneratorPrimitive : public Primitive {
 public:
-    std::function<void(matrix&)> cpu_gen;
-    std::function<void(matrix&)> gpu_gen;
+    using GenFn = std::function<void(matrix&, std::vector<matrix>&)>;
+    GenFn cpu_gen;
+    GenFn gpu_gen;
+    std::vector<matrix> inputs;
 
     GeneratorPrimitive(std::function<void(matrix&)> cpu_gen, std::function<void(matrix&)> gpu_gen)
-        : cpu_gen(std::move(cpu_gen)), gpu_gen(std::move(gpu_gen)) {}
+        : cpu_gen([f = std::move(cpu_gen)](matrix& out, std::vector<matrix>&) { f(out); }),
+          gpu_gen([f = std::move(gpu_gen)](matrix& out, std::vector<matrix>&) { f(out); }) {}
+
+    GeneratorPrimitive(GenFn cpu_gen, GenFn gpu_gen, const std::vector<matrix>& gen_inputs)
+        : cpu_gen(std::move(cpu_gen)), gpu_gen(std::move(gpu_gen)), inputs(ensure_graph_ready(gen_inputs)) {}
 
     void eval_cpu(matrix &out, EvalType eval_type) override {
+        for (auto& in : inputs) {
+            if (in.tape && !in.tape->evaluated) { in.tape->eval_cpu(in, eval_type); }
+            in.update_from_trace();
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -5485,10 +5577,16 @@ public:
         }
         if (eval_type == EvalType::COMPILE_TRACE) { return; }
         if (evaluated) { return; } else { evaluated = true; }
-        cpu_gen(out);
+        cpu_gen(out, inputs);
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
+        for (auto& in : inputs) {
+            if (in.tape && !in.tape->evaluated) { in.tape->eval_metal(in, eval_type); in.update_from_trace(); } else {
+                in.update_from_trace();
+                ensure_metal_buffer(in);
+            }
+        }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -5518,30 +5616,58 @@ public:
         }
         if (eval_type == EvalType::COMPILE_TRACE) { return; }
         if (evaluated) { return; } else { evaluated = true; }
-        gpu_gen(out);
+        gpu_gen(out, inputs);
     }
 
-    // A generator has no inputs, so there is nothing for a gradient to flow into.
-    std::vector<matrix> vjp(matrix& grad_out) override { return {}; }
+    // Generator inputs are parameters (a noise scale, a seed), not values the output is a
+    // differentiable function of here, so no gradient flows into them: one zero per input,
+    // since build_grad_graph pairs vjp()[i] with get_inputs()[i].
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        std::vector<matrix> grads;
+        for (auto& in : inputs) grads.push_back(matrix::scalar(0.0f, in.type));
+        return grads;
+    }
     // Constant w.r.t. every variable: contributes zero to any total derivative it's summed into.
     matrix jvp(std::vector<matrix>& tangents) override { return matrix::scalar(0.0f); }
 
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
         this->last_visited_pass_id = current_pass_id;
-        // Leaf: nothing upstream can ever mark this dirty.
+
+        // No inputs: a leaf, nothing upstream can mark it dirty (mark_changed() on the
+        // generator itself resets `evaluated` directly).
+        bool inv = false;
+        uint64_t new_version = this->version;
+        for (auto& in : inputs) {
+            if (in.tape) {
+                if (in.tape->invalidate_pass(current_pass_id)) { inv = true; }
+                if (in.tape->version > this->version) inv = true;
+                new_version = std::max(in.tape->version, new_version);
+            }
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
         return false;
     }
 
     void clear_trace_checks() override {
         evaluated = false;
+        for (auto& in : inputs) {
+            if (in.tape) { in.tape->clear_trace_checks(); }
+        }
     }
 
     matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
 
     std::vector<matrix> get_inputs() override {
-        return {};
+        return inputs;
     }
+    uint32_t num_inputs() const override { return (uint32_t)inputs.size(); }
+    matrix& input_at(uint32_t i) override { return inputs[i]; }
 };
 
 class ArgMaxPrimitive : public Primitive {
@@ -5644,6 +5770,8 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 
 class ArgMinPrimitive : public Primitive {
@@ -5746,5 +5874,7 @@ public:
     std::vector<matrix> get_inputs() override {
         return {input};
     }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
 };
 

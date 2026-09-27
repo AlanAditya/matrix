@@ -38,6 +38,7 @@ This is a complete map of every public constructor, static factory, and method e
 | `matrix::randint(low, high, {shape...}, dtype=Int32)` | Uniform random integers; runs on GPU compute shader when `total_size > 10`, else CPU loop. |
 | `matrix::rand({shape...}, dtype=Float)` | Uniform random floats in `[0, 1)`; GPU/CPU split same as `randint`. |
 | `matrix::randn({shape...}, dtype=Float)` | Standard-normal random floats (Box–Muller); GPU/CPU split same as `randint`. |
+| `matrix::perlin({shape...}, scale=5, octaves=1, persistence=0.5, lacunarity=2)` | Perlin/fBm noise (`Float`). An overload takes `ScalarArg`s, so any parameter can be a tracked 1-element matrix (a slider's `leaf_scalar`) instead of a constant: `perlin(shape, scale_leaf, 4, 0.5f, 2.0f)`. Tracked float params must be `Float`, `octaves` `Int32`. See [[Generators]] §6. |
 | `matrix::eye(m, n, k, dtype=Float)` / `matrix::eye(m, dtype=Float)` | Identity / diagonal-offset identity matrix. |
 | `matrix::leaf({shape...}, dtype=Float)` (both `initializer_list` and `std::vector` overloads) | Creates an unevaluated "leaf" graph node (no data yet, but a valid tape placeholder) — see `make_leaf()`. |
 | `matrix::linespace(a, b, n)` (matrix endpoints) / `matrix::linespace<T>(start, end, n, dtype=...)` (scalar endpoints) | Evenly spaced values between two endpoints. |
@@ -154,6 +155,9 @@ Matrices carry an optional `Primitive* tape` describing how they were computed (
 | `execute_cpu()` / `execute_metal()` | Runs a previously compiled plan. |
 | `clear_trace_checks()` | Resets internal flags used to detect stale/re-traced graphs (used by the `jit_gpu` family after each call). |
 | `make_leaf()` | Marks a matrix as a graph leaf (input placeholder) — pairs with `matrix::leaf(...)`. |
+| `matrix::leaf_scalar(value, dtype=Float)` | A 1-element leaf holding `value`, meant to be written in place (UI sliders, tweakable constants). Pair with `mark_changed()`. |
+| `mark_changed()` | After writing a node's buffer in place: bumps its `version` to `++global_epoch` and clears `evaluated`, so the next `invalidate_pass` re-runs everything downstream (and a generator re-runs its fill). Call it on the thread that owns the graph. Throws if the matrix has no tape. |
+| `matrix::host_op(shape, dtype, fn, inputs)` | A lazy node computed by host code (algorithms that aren't graph ops, e.g. RANSAC). `fn(out, ins)` fills the pre-allocated `out` from the evaluated `inputs` and re-runs when an input's version changes; on Metal the inputs' queued GPU work is finished first so `fn` can read them on the host. Pass slider parameters with `HostArg::track(ScalarArg, inputs)` and read them in `fn` with `.value(ins)`. No gradient. Example: `fovea::segment_planar_surfaces_labels`. |
 | `insert_break(lambda, exec_device=METAL) const` | Inserts a debug/inspection breakpoint node into the graph, invoking `lambda` when that point evaluates. |
 | `matrix::jit_gpu(func, sample)` | Compiles `func` against a `sample` input into a fast-path callable `matrix(matrix&)`. |
 | `matrix::grad_gpu(func, sample)` | Same, but returns the gradient function. |

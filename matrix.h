@@ -246,6 +246,7 @@ inline std::atomic<uint64_t> global_epoch{1};
 
 class Primitive;
 class StackPrimitive;
+struct ScalarArg;
 struct data {
     void *buffer = nullptr;
     id<MTLBuffer> metalBuffer = nil;
@@ -541,6 +542,11 @@ public:
     // Always Float output (like gaussian()) - there's only an f32 GPU kernel, so a type
     // parameter here would let eval_metal() write raw float bits into a differently-typed buffer.
     static matrix perlin(std::initializer_list<size_m> shapeI, float scale = 5.0f, int octaves = 1, float persistence = 0.5f, float lacunarity = 2.0f);
+    // Same noise, but any parameter can be a tracked 1-element matrix instead of a constant
+    // (see ScalarArg below): e.g. perlin({512,512}, scale_slider, 4, 0.5f, 2.0f). Tracked
+    // parameters become inputs of the generator node, so bumping their version re-runs the
+    // noise on the next pass. Float parameters need a Float matrix, `octaves` an Int32 one.
+    static matrix perlin(std::initializer_list<size_m> shapeI, const ScalarArg& scale, const ScalarArg& octaves, const ScalarArg& persistence, const ScalarArg& lacunarity);
 
     static matrix randint(int low, int high, std::initializer_list<size_m> shapeI, dtype type = dtype::Int32);
 
@@ -689,6 +695,22 @@ public:
     static matrix leaf(std::initializer_list<size_m> shape, dtype type = dtype::Float);
     static matrix leaf(const std::vector<size_m>& shape, dtype type = dtype::Float);
     void make_leaf();
+    // A 1-element leaf holding `value`: the tracked scalar a UI slider (or anything else)
+    // writes into in place. After writing, call mark_changed() so the graph re-runs.
+    static matrix leaf_scalar(float value, dtype type = dtype::Float);
+    // A lazy graph node whose value is computed by host code: for algorithms that aren't graph
+    // ops (e.g. RANSAC, which loops on the CPU and dispatches its own Metal work). `fn(out, ins)`
+    // fills `out` (already allocated with `shape`/`type`) from the evaluated `inputs`, and re-runs
+    // whenever an input's version changes - so its parameters can be leaf_scalar() sliders passed
+    // in as inputs. On the Metal path the GPU work queued for the inputs in this pass is finished
+    // first, so `fn` can read their memory on the host. The output has no gradient.
+    static matrix host_op(const std::vector<size_m>& shape, dtype type,
+                          std::function<void(matrix& out, std::vector<matrix>& ins)> fn,
+                          const std::vector<matrix>& inputs);
+    // Tell the graph this node's data changed in place: bumps its version to ++global_epoch
+    // (so every consumer's invalidate_pass sees it) and clears `evaluated` (so a generator
+    // re-runs its fill). Call it on the thread that owns the graph. Throws if there's no tape.
+    void mark_changed();
     
     matrix ones() const;
     matrix zeros() const;
@@ -1634,5 +1656,46 @@ template <typename T>
 matrix operator/(T scalar, const matrix& m) { return matrix::scalar(scalar, m.type) / m; }
 
 bool compare_shapes(const matrix &a, const matrix &b);
+
+// A generator parameter that's either a plain constant or a tracked 1-element matrix
+// (typically a leaf_scalar() driven by a slider). Constants are baked into the generator's
+// closure exactly like before; tracked ones become graph inputs of the generator node.
+// Implicit from float/double/int/matrix, so call sites just mix them:
+//     matrix::perlin({512, 512}, scale_leaf, 4, persistence_leaf, 2.0f);
+struct ScalarArg {
+    matrix tracked;
+    float constant = 0.0f;
+    bool is_tracked = false;
+    ScalarArg(float v) : constant(v) {}
+    ScalarArg(double v) : constant((float)v) {}
+    ScalarArg(int v) : constant((float)v) {}
+    ScalarArg(const matrix& m) : tracked(m), is_tracked(true) {}
+};
+
+// A ScalarArg parameter of a matrix::host_op. At build time, track() adds a tracked arg to the
+// op's input list (so a change re-runs the op); inside the op, value() reads it on the host, in
+// any dtype. Constants stay constants.
+//     std::vector<matrix> inputs = {points};
+//     HostArg dist = HostArg::track(distance_threshold, inputs);
+//     matrix::host_op(shape, type, [dist](matrix& out, std::vector<matrix>& ins) { float d = dist.value(ins); ... }, inputs);
+struct HostArg {
+    int input = -1;
+    float constant = 0.0f;
+
+    static HostArg track(const ScalarArg& arg, std::vector<matrix>& inputs) {
+        HostArg a;
+        if (!arg.is_tracked) { a.constant = arg.constant; return a; }
+        if (arg.tracked.total_size != 1) throw std::invalid_argument("HostArg: a tracked parameter must have exactly 1 element");
+        a.input = (int)inputs.size();
+        inputs.push_back(arg.tracked);
+        return a;
+    }
+    float value(const std::vector<matrix>& ins) const {
+        if (input < 0) return constant;
+        float v = 0.0f;
+        dispatch_type(ins[input].type, ins[input].buffer, [&](auto* data) { v = static_cast<float>(*data); });
+        return v;
+    }
+};
 
 #endif // WORLDOF3D_MATRIX_H

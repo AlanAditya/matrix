@@ -67,3 +67,12 @@ During implementation, we encountered several significant hurdles:
 3. **Silent Buffer Modifications (Dynamic Scaling)**
    In `GraphViewer::draw()`, the X and Y axes were being dynamically scaled based on camera zoom (`p_scale(...)`). This directly overwrote their local transform CPU buffers. Under the old system, this forced changes locally. Under versioning, because we weren't explicitly bumping the `tape->version` when scaling the axes, the `DotPrimitive` didn't know the scale had changed and skipped GPU execution (reusing the stale metal buffer).
    **Fix**: Explicitly bump `tape->version = ++global_epoch;` whenever directly mutating matrices that act as roots/leaves in the graph, even for localized viewport scaling.
+
+## Later additions
+
+- **`matrix::mark_changed()`** is the one call to use after writing a node's buffer in place: `version = ++global_epoch` and `evaluated = false`. Clearing `evaluated` matters for **generators**: `GeneratorPrimitive` with no inputs is a leaf whose `invalidate_pass` always returns false and never resets its own `evaluated`, so a version bump alone would re-run its consumers on its stale output. For a `LeafPrimitive` (whose eval does nothing) the bump alone would do, and clearing `evaluated` is harmless.
+- **Generator inputs.** `GeneratorPrimitive(cpu, gpu, inputs)` takes optional inputs and version-checks them in `invalidate_pass` like any other multi-input primitive, so a slider leaf feeding `perlin`'s scale invalidates the generator through the normal walk (see [[Generators]] §6). `matrix::host_op` is built on it.
+- **Pass IDs.** Take them from `++global_epoch` too (`SliderGroup::run_graph_pass` does). `last_visited_pass_id` is only compared for equality, versions only with `>`, so sharing the counter is safe, and every pass gets a number no other pass (on any thread) can reuse. Per-object counters starting at 0 can collide on a shared node and skip a re-check. The `Viewer` still uses its own `current_pass_id`. See [[Concurrency]] §4.
+- **A tapeless matrix has no version.** `matrix::scalar(v)` is plain data: `invalidate_pass` only checks inputs that have a tape, so writing into one is invisible to dirty tracking. Anything that changes in place must be a leaf: `matrix::leaf_scalar(v)`, `matrix::leaf(shape)` or `make_leaf()`.
+- **A bump is a recompute signal, not a publish.** The renderer draws a buffer every frame whatever its version; see [[Concurrency]] §2 for what makes a cross-thread hand-off safe.
+

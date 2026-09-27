@@ -160,3 +160,16 @@ Benchmark (2M points, page cache warm): xyz + rgba from a 28-byte record takes 1
 - **Don't `slice()` a matrix that wraps foreign memory.** `slice()` puts its input on the compute graph via `ensure_graph_ready` (`primitives.cpp`). That starts refcounting the buffer (which would later `delete[]` it) and wraps it in a Metal buffer (which needs a page-aligned pointer). For a non-owning matrix it throws `cannot begin refcount on non-owning matrix`. Build strided views directly instead: set `shape`/`strides`/`buffer` and `NON_OWNERSHIP_FLAG` (plus `NON_CONTIGUOUS_FLAG` if the row stride != row width), with no tape.
 - **`copyCPUinplace` casts values, not bytes, when dtypes differ.** To move raw bytes into a `Float` output, view both sides as `UInt8`.
 - A matrix with `NON_OWNERSHIP_FLAG` and no `refCount` is never freed by the destructor or by copies, so wrapping mmap'd memory this way is safe.
+
+## 6. Generators With Tracked Inputs
+
+A lazy generator can take **inputs**: 1-element matrices whose values it reads when it runs, instead of constants captured at build time. That's how a UI slider drives `perlin()`'s `scale` without rebuilding the graph (see `UI/MatrixSliders.h`).
+
+- `GeneratorPrimitive(cpu_gen, gpu_gen, inputs)`: the closures take `(matrix& out, std::vector<matrix>& ins)`. The inputs are ordinary graph edges: evaluated first in the DFS, checked in `invalidate_pass` (so `leaf.mark_changed()` re-runs the generator into its **same** cached buffer), included in `clear_trace_checks`/`get_inputs`, and given a zero gradient each in `vjp` (generator parameters aren't differentiated). The old two-closure constructor still works and means "no inputs".
+- **Public signature:** take `const ScalarArg&` (in `matrix.h`) for each tweakable parameter. It's implicit from `float`/`double`/`int` (a constant, baked into the closures as before) or from a `matrix` (tracked, pushed into `inputs`). Keep the plain-float overload and make it delegate, as `perlin()` does. A `ScalarArg` overload can't have default arguments (`ScalarArg` is incomplete inside the class), so all its parameters are required.
+- **Validate** each tracked input: exactly 1 element, and the dtype the kernel reads. A `Float` matrix bound as `constant int&` is garbage, so `perlin()` throws unless `octaves` is `Int32`.
+- **CPU closure:** read the value from `ins[i].buffer` (already evaluated on the CPU).
+- **GPU closure:** bind the input with `setBufferOrBytes(encoder, ins[i], index)`. **Don't read it on the host.** An input computed earlier in the same command buffer (e.g. `slider * 2`) only has its value once its kernel has run: the GPU orders that, the host can't see it. A `constant float&` kernel parameter works with both `setBytes` and `setBuffer`, so the kernel doesn't change.
+
+Verified standalone (`perlin`): constant `ScalarArg`s match the float overload bit for bit; changing a tracked `Float`/`Int32` leaf propagates through a downstream graph on CPU and Metal; a CPU pass followed by a Metal pass after a change; a computed input (`slider * 2`) on Metal; reruns reuse the same buffers with a flat buffer count.
+
