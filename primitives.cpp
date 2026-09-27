@@ -2188,11 +2188,17 @@ public:
         a.max(b, out, ExecutionDevice::METAL);
     }
 
+    // Each element's gradient goes to whichever input was the max. On ties it goes to b, as in
+    // MLX (a's mask is a > b). b's mask is b == max(a, b), a's is the complement.
     std::vector<matrix> vjp(matrix& grad_out) override {
-        return {matrix(0, dtype::UInt8), matrix(0, dtype::UInt8)};
+        matrix mask_b = matrix::equal(b, matrix::max(a, b));
+        matrix mask_a = 1.0f - mask_b;
+        return {(grad_out * mask_a).unbroadcast_shape(a.shape(), a.dims),
+                (grad_out * mask_b).unbroadcast_shape(b.shape(), b.dims)};
     }
     matrix jvp(std::vector<matrix>& tangents) override {
-        return matrix(0, dtype::UInt8);
+        matrix mask_b = matrix::equal(b, matrix::max(a, b));
+        return tangents[0] * (1.0f - mask_b) + tangents[1] * mask_b;
     }
 // Converts dirty=true into evaluated=false along every path leading to a dirty node,
     // then resets dirty. This is needed because nodes only know their parents, not their
@@ -2337,11 +2343,17 @@ public:
         a.min(b, out, ExecutionDevice::METAL);
     }
 
+    // Each element's gradient goes to whichever input was the min. On ties it goes to b, as in
+    // MLX (a's mask is a < b). b's mask is b == min(a, b), a's is the complement.
     std::vector<matrix> vjp(matrix& grad_out) override {
-        return {matrix(0, dtype::UInt8), matrix(0, dtype::UInt8)};
+        matrix mask_b = matrix::equal(b, matrix::min(a, b));
+        matrix mask_a = 1.0f - mask_b;
+        return {(grad_out * mask_a).unbroadcast_shape(a.shape(), a.dims),
+                (grad_out * mask_b).unbroadcast_shape(b.shape(), b.dims)};
     }
     matrix jvp(std::vector<matrix>& tangents) override {
-        return matrix(0, dtype::UInt8);
+        matrix mask_b = matrix::equal(b, matrix::min(a, b));
+        return tangents[0] * (1.0f - mask_b) + tangents[1] * mask_b;
     }
 // Converts dirty=true into evaluated=false along every path leading to a dirty node,
     // then resets dirty. This is needed because nodes only know their parents, not their
