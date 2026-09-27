@@ -76,6 +76,10 @@ Controllers ([SOPs/Controllers.cpp](../SOPs/Controllers.cpp), e.g. `CubeControll
 
 Some controllers also expose an `update(...)` method that regenerates the node's `mesh.vert_position`/`indices`/`material` from new data at runtime (e.g. `LineController::update(matrix points)`, `PointCloudController::update(...)`). These typically dispatch the mutation onto the main queue via `dispatch_async(dispatch_get_main_queue(), ...)` to avoid racing the render thread, which reads the same `GeoNode` fields during `Viewer::draw`.
 
+- **`TriangleMeshController`** draws an arbitrary indexed triangle mesh with one colour per vertex (`update(vertices [V,3], colours [V,4], indices [3T])`), e.g. the foveated 2.5D grid's tiles. It supplies all-zero UVs itself: `DAGNodeVertexShader` declares a UV buffer at slot 5 and Metal's validation layer requires every declared buffer bound, even though the shader copes without one. Any hand-built mesh on the default pipeline needs `uv_coords`.
+- **Hiding** a node: the `Viewer` skips nodes whose `mesh.vert_position` is empty. `PointCloudController::clear()` / `TriangleMeshController::clear()` swap in a truly empty mesh on the main thread. Don't send a 0-point cloud through `update()` instead: it builds a zero-length Metal buffer.
+- Give `update()` plain tapeless matrices, not handles into a graph another thread is running (see [Concurrency.md](Concurrency.md)).
+
 `GridController` is the most involved example: it drives two multi-instance line nodes (`major_lines`, `minor_lines`) whose *per-instance* `local_transform` entries are recomputed every frame in `update_grid()` based on camera zoom and graph pan/scale, implementing a Desmos-style infinite adaptive grid without ever touching vertex data.
 
 ## 5. Viewers
