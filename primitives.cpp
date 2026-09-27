@@ -5111,12 +5111,18 @@ public:
         source.take_backend(indices, out, axis, ExecutionDevice::METAL);
     }
 
+    // Take is a gather, so its gradient is a scatter-add of grad_out back into source's
+    // shape (a source element picked k times gets k contributions). Indices get zeros.
     std::vector<matrix> vjp(matrix& grad_out) override {
-        return {grad_out};
+        std::vector<size_m> src_shape(source.shape(), source.shape() + source.dims);
+        std::vector<size_m> idx_shape(indices.shape(), indices.shape() + indices.dims);
+        matrix d_source = matrix::scatter(matrix::zeros(src_shape, grad_out.type), indices, grad_out, axis, ScatterMode::ADD);
+        return {d_source, matrix::zeros(idx_shape, indices.type)};
     }
-    
+
+    // Linear in source: gather the tangent with the same indices. tangents follow get_inputs(): {source, indices}.
     matrix jvp(std::vector<matrix>& tangents) override {
-        return tangents[0];
+        return tangents[0].take(indices, axis);
     }
     
 // Converts dirty=true into evaluated=false along every path leading to a dirty node,
@@ -5445,8 +5451,8 @@ public:
     // Resample is a pure gather (nearest: one source cell per output cell; linear: a
     // fixed weighted blend of 2^ndims source cells). Its gradient is a scatter-add back
     // into the input's shape. matrix::scatter(..., ScatterMode::ADD) now exists to build
-    // it on, but it isn't wired up yet (neither is TakePrimitive::vjp above, still a
-    // stub), so this throws rather than faking a gradient.
+    // it on (TakePrimitive::vjp above uses it), but this one isn't wired up yet, so it
+    // throws rather than faking a gradient.
     matrix jvp(std::vector<matrix>& tangents) override {
         throw std::runtime_error("JVP not implemented for ResamplePrimitive");
     }
