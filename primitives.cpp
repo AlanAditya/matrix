@@ -5110,7 +5110,7 @@ public:
 
         source.take_backend(indices, out, axis, ExecutionDevice::METAL);
     }
-    
+
     std::vector<matrix> vjp(matrix& grad_out) override {
         return {grad_out};
     }
@@ -5180,6 +5180,182 @@ public:
     }
     uint32_t num_inputs() const override { return 2; }
     matrix& input_at(uint32_t i) override { return i == 0 ? source : indices; }
+};
+
+// Scatter: out = copy of dst, then every update is combined (mode) into the slot along
+// `axis` that its index names. The inverse of TakePrimitive: updates lives in
+// take(dst, indices, axis)'s shape. Owning node: out is a fresh buffer, dst is never
+// written. See matrix::scatter (Phase 1) and matrix::scatter_backend (Phase 3).
+class ScatterPrimitive : public Primitive {
+public:
+    matrix dst;
+    matrix indices;
+    matrix updates; // already cast to dst's dtype; broadcast only through upd strides below
+    int axis;
+    ScatterMode mode;
+    // Update space (take's output shape) collapsed once at graph-build time:
+    // shape = update space, stridesA = out (0 on index dims), stridesB = updates
+    // (0 on broadcast dims), stridesC = indices (0 on non-index dims).
+    CollapsedDims_3 collapsed_dims;
+    size_m out_axis_stride = 0;
+    size_m axis_size = 0;
+    size_m update_count = 0;
+
+    ScatterPrimitive(const matrix& dst_in, const matrix& indices_in, const matrix& updates_in, int axis_in, ScatterMode mode_in)
+        : dst(ensure_graph_ready(dst_in)), indices(ensure_graph_ready(indices_in)),
+          updates(ensure_graph_ready(updates_in)), axis(axis_in), mode(mode_in) {}
+
+    matrix* get_borrowed_input() override { return nullptr; } // Allocates new memory
+
+    // Rounded up to a whole 32-bit word: the Metal kernel does 8/16-bit atomics as a
+    // compare-and-swap on the containing word, so the last word must be ours.
+    static size_t alloc_bytes(const matrix& out) {
+        return (out.effectiveBufferSize() * dtype_size(out.type) + 3) & ~size_t(3);
+    }
+
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (dst.tape && !dst.tape->evaluated) { dst.tape->eval_cpu(dst, eval_type); }
+        if (indices.tape && !indices.tape->evaluated) { indices.tape->eval_cpu(indices, eval_type); }
+        if (updates.tape && !updates.tape->evaluated) { updates.tape->eval_cpu(updates, eval_type); }
+        dst.update_from_trace();
+        indices.update_from_trace();
+        updates.update_from_trace();
+
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[alloc_bytes(out)];
+                out.begin_refcount();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return; else evaluated = true;
+
+        matrix::scatter_backend(out, ExecutionDevice::CPU);
+    }
+
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (dst.tape && !dst.tape->evaluated) { dst.tape->eval_metal(dst, eval_type); dst.update_from_trace(); } else {
+            dst.update_from_trace();
+            ensure_metal_buffer(dst);
+        }
+        if (indices.tape && !indices.tape->evaluated) { indices.tape->eval_metal(indices, eval_type); indices.update_from_trace(); } else {
+            indices.update_from_trace();
+            ensure_metal_buffer(indices);
+        }
+        if (updates.tape && !updates.tape->evaluated) { updates.tape->eval_metal(updates, eval_type); updates.update_from_trace(); } else {
+            updates.update_from_trace();
+            ensure_metal_buffer(updates);
+        }
+        // dst is copied into out with copyGPUinplace, whose blit fast path has no setBytes
+        // fallback and would build a missing wrapper during EXECUTE. Build it here, during
+        // COMPILE, on this primitive's own handle (it never touches dst's tape cache).
+        if (dst.buffer && !dst.metalBuffer) dst.buildMetalBuffer();
+
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[alloc_bytes(out)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return; else evaluated = true;
+
+        matrix::scatter_backend(out, ExecutionDevice::METAL);
+    }
+
+    // SET: overwritten slots get no gradient from dst; ADD: dst passes straight through.
+    // Either way each update receives the gradient of the slot it landed in (with duplicate
+    // indices, every duplicate gets it, as in MLX). PROD/MAX/MIN need the forward values to
+    // route gradients and aren't implemented yet.
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        if (mode != ScatterMode::SET && mode != ScatterMode::ADD) {
+            throw std::runtime_error("VJP not implemented for ScatterPrimitive PROD/MAX/MIN");
+        }
+        matrix d_dst = mode == ScatterMode::SET
+            ? matrix::scatter(grad_out, indices, matrix::scalar(0, grad_out.type), axis, ScatterMode::SET)
+            : grad_out;
+        matrix d_upd = grad_out.take(indices, axis).unbroadcast_shape(updates.shape(), updates.dims);
+        std::vector<size_m> idx_shape(indices.shape(), indices.shape() + indices.dims);
+        return {d_dst, matrix::zeros(idx_shape, indices.type), d_upd};
+    }
+
+    // Linear in (dst, updates) for SET and ADD. tangents follow get_inputs(): {dst, indices, updates}.
+    matrix jvp(std::vector<matrix>& tangents) override {
+        if (mode != ScatterMode::SET && mode != ScatterMode::ADD) {
+            throw std::runtime_error("JVP not implemented for ScatterPrimitive PROD/MAX/MIN");
+        }
+        return matrix::scatter(tangents[0], indices, tangents[2], axis, mode);
+    }
+
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        for (matrix* in : {&dst, &indices, &updates}) {
+            if (in->tape) {
+                if (in->tape->invalidate_pass(current_pass_id)) { inv = true; }
+                if (in->tape->version > this->version) inv = true;
+                new_version = std::max(in->tape->version, new_version);
+            }
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
+    }
+
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (dst.tape) dst.tape->clear_trace_checks();
+        if (indices.tape) indices.tape->clear_trace_checks();
+        if (updates.tape) updates.tape->clear_trace_checks();
+    }
+
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override {
+        return matrix(0, dtype::UInt8);
+    }
+
+    std::vector<matrix> get_inputs() override {
+        return {dst, indices, updates};
+    }
+    uint32_t num_inputs() const override { return 3; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? dst : (i == 1 ? indices : updates); }
 };
 
 class ResamplePrimitive : public Primitive {
@@ -5268,10 +5444,9 @@ public:
 
     // Resample is a pure gather (nearest: one source cell per output cell; linear: a
     // fixed weighted blend of 2^ndims source cells). Its gradient is a scatter-add back
-    // into the input's shape, which has no existing primitive to build on -- there is no
-    // ScatterAdd op in the graph yet (see TakePrimitive::vjp above, which is itself just
-    // a stub, and ConvolvePrimitive::vjp/jvp, which throw for the same reason). Matching
-    // that precedent rather than faking a gradient.
+    // into the input's shape. matrix::scatter(..., ScatterMode::ADD) now exists to build
+    // it on, but it isn't wired up yet (neither is TakePrimitive::vjp above, still a
+    // stub), so this throws rather than faking a gradient.
     matrix jvp(std::vector<matrix>& tangents) override {
         throw std::runtime_error("JVP not implemented for ResamplePrimitive");
     }

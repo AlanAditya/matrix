@@ -77,6 +77,17 @@ enum class ResampleMode : uint8_t {
     Linear = 1,
 };
 
+// How matrix::scatter combines an update with the value already at its target. Matches
+// MLX's scatter reduce types. SET with duplicate indices leaves an undefined winner.
+// The values are passed to the Metal kernel as-is (ComputeShaders/Scatter.metal).
+enum class ScatterMode : int32_t {
+    SET = 0,
+    ADD = 1,
+    PROD = 2,
+    MAX = 3,
+    MIN = 4,
+};
+
 
 enum class EvalType {
     EVAL_AUTO = 0,

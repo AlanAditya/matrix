@@ -119,6 +119,10 @@ public:
     // the 5 integer ones -- UInt8/Int32/Int16/UInt32/UInt16 -- are actually instantiated).
     bool TakeInit_nd[7][4][7];
     id<MTLComputePipelineState> TakeComputeState_nd[7][4][7];
+    // Scatter uses the same [value dtype][dim specialization][index dtype] grid as Take.
+    // The mode (ScatterMode) is a runtime argument, not part of the kernel name.
+    bool ScatterInit_nd[7][4][7];
+    id<MTLComputePipelineState> ScatterComputeState_nd[7][4][7];
     
     bool ConvolveInit[3];
     id<MTLComputePipelineState> ConvolveComputeState[3];
@@ -291,6 +295,7 @@ public:
             for (int j = 0; j < 4; j++) {
                 for (int k = 0; k < 7; k++) {
                     TakeInit_nd[i][j][k] = false;
+                    ScatterInit_nd[i][j][k] = false;
                 }
             }
         }
@@ -923,6 +928,14 @@ public:
         id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TakeGPU_nd_%i_%i_%i", type_code, cdims, idx_type_code]];
         TakeComputeState_nd[type_code][cdims][idx_type_code] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         TakeInit_nd[type_code][cdims][idx_type_code] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+    
+    void initScatter_nd(int type_code, int cdims, int idx_type_code) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ScatterGPU_nd_%i_%i_%i", type_code, cdims, idx_type_code]];
+        ScatterComputeState_nd[type_code][cdims][idx_type_code] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        ScatterInit_nd[type_code][cdims][idx_type_code] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
     }
     
