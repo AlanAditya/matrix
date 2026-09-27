@@ -12792,14 +12792,16 @@ matrix matrix::sum() const {
 
 matrix matrix::mean(int axis, bool keepdims) const {
     matrix s = this->sum(axis, keepdims);
+    if (axis < 0) axis += dims; // shape()[-1] would read before the shape array
     return s / (float)shape()[axis];
 }
 
 matrix matrix::mean(int start, int end, bool keepdims) const {
     matrix s = this->sum(start, end, keepdims);
+    int real_start = (start < 0) ? start + dims : start;
     int real_end = (end < 0) ? end + dims : end;
     size_m collapse_size = 1;
-    for (int i = start; i <= real_end; i++) {
+    for (int i = real_start; i <= real_end; i++) {
         collapse_size *= shape()[i];
     }
     return s / (float)collapse_size;

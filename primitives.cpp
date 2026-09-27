@@ -2480,8 +2480,11 @@ public:
 
 
     std::vector<matrix> vjp(matrix& grad_out) override {
-        // a, b, c are vectors (a)=>c soo J = (dc/da) and for sum its 1 so J = (1, 1)
-        return {grad_out.broadcast_toV2((input.dims < SBO_MAX_DIMS ? input.array_desc.inline_buffer : input.array_desc.shared_arr_desc->shape()), input.dims)};
+        // a, are vectors (a)=>c soo J = (dc/da) and for sum its 1 so J = (1, 1)
+        // we need to unsqueeze the back prop of gradients if we squeezed the forward flow of data;
+        matrix g = NoRed ? grad_out : grad_out.unsqueeze(axis);
+        g = g.broadcast_toV2(input.shape(), input.dims);
+        return {g};
     }
     matrix jvp(std::vector<matrix>& tangents) override {
         // a, b, c are vectors (a,b)=>c soo J = (dc/da, dc/db) and for stack we just need to stack the derivative
@@ -4657,11 +4660,11 @@ public:
     }
 
     std::vector<matrix> vjp(matrix& grad_out) override {
-        return { (1/2) * (1/matrix::sqrt(input)) * grad_out };
+        return { grad_out * 0.5f / matrix::sqrt(input) };
     }
 
     matrix jvp(std::vector<matrix>& tangents) override {
-        return tangents[0] * (1/2) * (1/matrix::sqrt(input));
+        return tangents[0] * 0.5f / matrix::sqrt(input);
     }
 
 // Converts dirty=true into evaluated=false along every path leading to a dirty node,
