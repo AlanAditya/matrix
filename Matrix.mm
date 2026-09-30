@@ -4434,7 +4434,10 @@ std::vector<matrix> matrix::pointsFromPLY(const std::string& path, const std::ve
 //    }
 
 void matrix::begin_refcount() {
-    if (flags & NON_OWNERSHIP_FLAG)
+    // With a tape the flag says nothing about ownership (the tape and refCount decide; e.g. a
+    // reshape that copies a view owns its new buffer but keeps the view's flags). A tapeless view
+    // really doesn't own its buffer: a refcount would make its last release delete[] it.
+    if ((flags & NON_OWNERSHIP_FLAG) && !tape)
         throw std::runtime_error(
                                  "matrix: cannot begin refcount on non-owning matrix");
     if (refCount != nullptr)
