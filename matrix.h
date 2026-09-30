@@ -1000,13 +1000,23 @@ public:
     // Like mx.value_and_grad: returns a function that, given the parameters, gives the loss and
     // its gradient w.r.t. each parameter (a graph rebuilt on each call, nothing compiled).
     //     auto [loss, grads] = matrix::value_and_grad(loss_fn)(params);
-    static std::function<std::pair<matrix, std::vector<matrix>>(std::vector<matrix>)> value_and_grad(std::function<matrix(std::vector<matrix>)> fn);
-    static std::function<std::pair<matrix, matrix>(matrix)> value_and_grad(std::function<matrix(matrix)> fn);
+    static std::function<std::pair<matrix, std::vector<matrix>>(const std::vector<matrix>&)> value_and_grad(std::function<matrix(std::vector<matrix>)> fn);
+    static std::function<std::pair<matrix, matrix>(const matrix&)> value_and_grad(std::function<matrix(matrix)> fn);
     // Both throw, like MLX, if fn returns more than one element.
     // Like mx.grad: value_and_grad without the value.
     //     std::vector<matrix> grads = matrix::grad(loss_fn)(params);
-    static std::function<std::vector<matrix>(std::vector<matrix>)> grad(std::function<matrix(std::vector<matrix>)> fn);
-    static std::function<matrix(matrix)> grad(std::function<matrix(matrix)> fn);
+    static std::function<std::vector<matrix>(const std::vector<matrix>&)> grad(std::function<matrix(std::vector<matrix>)> fn);
+    static std::function<matrix(const matrix&)> grad(std::function<matrix(matrix)> fn);
+    // Sum of the pure second derivatives of fn over the parameters in argnums (all when empty;
+    // negative counts from the end, -1 = last):
+    //     matrix lap = matrix::laplacian(f, {0, 1, 2})({x, y, z, t});   // d2f/dx2 + d2f/dy2 + d2f/dz2
+    // fn returns one element (for a batch of independent points, return their sum: the result is
+    // then per point). Each variable is its own parameter: within one parameter the elements must
+    // be independent (a batch), since their second derivatives are summed over its elements; x, y, z
+    // packed into one [3] parameter would give Hessian row sums, not the Laplacian.
+    // value_and_grad / grad / laplacian refcount the matrices they are handed, so their copies
+    // share buffers and build_grad_graph can find them (a braced list {x, y} holds copies of x, y).
+    static std::function<matrix(const std::vector<matrix>&)> laplacian(std::function<matrix(std::vector<matrix>)> fn, std::vector<int> argnums = {});
     static std::vector<matrix> build_grad_graph(std::vector<matrix>& output_nodes, std::vector<matrix>& sample_input_nodes);
     // Add this inside the matrix class
     matrix dot(const matrix& b, bool transposeB = false);

@@ -1209,41 +1209,67 @@ static void require_scalar_output(const matrix& value) {
 // build_grad_graph finds a tapeless parameter by its buffer, and copying a matrix that isn't
 // refcounted deep-copies it: fn's copies (by-value arguments, braced lists) would get new
 // buffers and the parameter's gradient would silently be zeros. Refcounted, every copy shares
-// the buffer. Same as grad_graph_gpu does for its sample. (A non-owning matrix's copies already
-// share its memory.)
-static void share_param_buffer(matrix& param) {
-    if (!param.tape && param.buffer && !(param.flags & NON_OWNERSHIP_FLAG)) param.begin_refcount();
+// the buffer. Same as grad_graph_gpu does for its sample. The transforms take their parameters
+// by const reference and refcount the caller's own matrices, so the caller can pass them on to
+// build_grad_graph too. (A view's copies already share its memory.)
+static void share_param_buffer(const matrix& param) {
+    matrix& p = const_cast<matrix&>(param);
+    if (!p.tape && p.buffer && !(p.flags & NON_OWNERSHIP_FLAG)) p.begin_refcount();
 }
 
-std::function<std::pair<matrix, std::vector<matrix>>(std::vector<matrix>)> matrix::value_and_grad(std::function<matrix(std::vector<matrix>)> fn) {
-    return [fn](std::vector<matrix> params) {
+std::function<std::pair<matrix, std::vector<matrix>>(const std::vector<matrix>&)> matrix::value_and_grad(std::function<matrix(std::vector<matrix>)> fn) {
+    return [fn](const std::vector<matrix>& params) {
         for (auto& p : params) share_param_buffer(p);
         matrix value = fn(params);
         require_scalar_output(value);
         std::vector<matrix> outputs = {value};
-        std::vector<matrix> grads = build_grad_graph(outputs, params);
+        std::vector<matrix> inputs = params;   // copies share the (now refcounted) buffers
+        std::vector<matrix> grads = build_grad_graph(outputs, inputs);
         return std::make_pair(value, grads);
     };
 }
 
-std::function<std::pair<matrix, matrix>(matrix)> matrix::value_and_grad(std::function<matrix(matrix)> fn) {
-    return [fn](matrix params) {
+std::function<std::pair<matrix, matrix>(const matrix&)> matrix::value_and_grad(std::function<matrix(matrix)> fn) {
+    return [fn](const matrix& params) {
         share_param_buffer(params);
         matrix value = fn(params);
         require_scalar_output(value);
-        matrix grads = build_grad_graph(value, params);
+        matrix input = params;
+        matrix grads = build_grad_graph(value, input);
         return std::make_pair(value, grads);
     };
 }
 
-std::function<std::vector<matrix>(std::vector<matrix>)> matrix::grad(std::function<matrix(std::vector<matrix>)> fn) {
+std::function<std::vector<matrix>(const std::vector<matrix>&)> matrix::grad(std::function<matrix(std::vector<matrix>)> fn) {
     auto vg = value_and_grad(fn);
-    return [vg](std::vector<matrix> params) { return vg(params).second; };
+    return [vg](const std::vector<matrix>& params) { return vg(params).second; };
 }
 
-std::function<matrix(matrix)> matrix::grad(std::function<matrix(matrix)> fn) {
+std::function<matrix(const matrix&)> matrix::grad(std::function<matrix(matrix)> fn) {
     auto vg = value_and_grad(fn);
-    return [vg](matrix params) { return vg(params).second; };
+    return [vg](const matrix& params) { return vg(params).second; };
+}
+
+// One reverse pass for all first derivatives, then one more per parameter in argnums (all when
+// empty): d_i = df/dp_i, and d(d_i)/dp_i = d2f/dp_i^2. Each d_i is differentiated alone, so no
+// mixed terms (d2f/dp_i dp_j) leak in. For a batch of independent points (fn returning their
+// sum), every second derivative is per point.
+std::function<matrix(const std::vector<matrix>&)> matrix::laplacian(std::function<matrix(std::vector<matrix>)> fn, std::vector<int> argnums) {
+    auto df = grad(fn);
+    return [df, argnums](const std::vector<matrix>& params) {
+        std::vector<matrix> d = df(params);   // refcounts params, so d is built on their buffers
+        std::vector<int> axes = argnums;
+        if (axes.empty()) for (int i = 0; i < (int)params.size(); i++) axes.push_back(i);
+        matrix lap(0, dtype::Float);
+        for (size_t k = 0; k < axes.size(); k++) {
+            int i = axes[k] < 0 ? axes[k] + (int)params.size() : axes[k];   // -1 = last parameter
+            if (i < 0 || i >= (int)params.size()) throw std::out_of_range("matrix: laplacian => argnum out of range");
+            matrix p = params[i];
+            matrix d2 = build_grad_graph(d[i], p);
+            lap = k == 0 ? d2 : lap + d2;
+        }
+        return lap;
+    };
 }
 
 std::vector<matrix> matrix::build_grad_graph(std::vector<matrix>& output_nodes, std::vector<matrix>& sample_input_nodes) {
