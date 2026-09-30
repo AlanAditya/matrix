@@ -1206,8 +1206,18 @@ static void require_scalar_output(const matrix& value) {
     throw std::invalid_argument("[value_and_grad] The return value of the function whose gradient we want to compute should be a scalar array; but " + shape + " was returned.");
 }
 
+// build_grad_graph finds a tapeless parameter by its buffer, and copying a matrix that isn't
+// refcounted deep-copies it: fn's copies (by-value arguments, braced lists) would get new
+// buffers and the parameter's gradient would silently be zeros. Refcounted, every copy shares
+// the buffer. Same as grad_graph_gpu does for its sample. (A non-owning matrix's copies already
+// share its memory.)
+static void share_param_buffer(matrix& param) {
+    if (!param.tape && param.buffer && !(param.flags & NON_OWNERSHIP_FLAG)) param.begin_refcount();
+}
+
 std::function<std::pair<matrix, std::vector<matrix>>(std::vector<matrix>)> matrix::value_and_grad(std::function<matrix(std::vector<matrix>)> fn) {
     return [fn](std::vector<matrix> params) {
+        for (auto& p : params) share_param_buffer(p);
         matrix value = fn(params);
         require_scalar_output(value);
         std::vector<matrix> outputs = {value};
@@ -1218,6 +1228,7 @@ std::function<std::pair<matrix, std::vector<matrix>>(std::vector<matrix>)> matri
 
 std::function<std::pair<matrix, matrix>(matrix)> matrix::value_and_grad(std::function<matrix(matrix)> fn) {
     return [fn](matrix params) {
+        share_param_buffer(params);
         matrix value = fn(params);
         require_scalar_output(value);
         matrix grads = build_grad_graph(value, params);
