@@ -2423,7 +2423,7 @@ matrix matrix::slice(R slice_range, int slice_axis) const{
         }
     }
     
-    slicedMat.total_size = slicedMat.accumul(0, dims);
+    slicedMat.total_size = slicedMat.accumul(0, out_dims);
     slicedMat.flags |= NON_OWNERSHIP_FLAG;
     slicedMat.flags |= NON_CONTIGUOUS_FLAG;
     std::vector<size_m> unsqueze_mask = slice_range.is_index ? std::vector<size_m>{ (size_m)slice_axis } : std::vector<size_m>{};
