@@ -2758,9 +2758,69 @@ void matrix::pad_backend(std::vector<size_m>& padding_range, matrix& padded_mat,
     size_m *dst_strides = padded_mat.strides();
     
     PaddingPrimitive* prim = (PaddingPrimitive*)padded_mat.tape;
-    
 
-    
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = padded_mat.total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    if (exec_device == ExecutionDevice::CPU) {
+        // Same as the Padding.metal kernels (1D / 2D / 3D / ND): an output coordinate outside
+        // [limits[2d], limits[2d+1]) on any axis d gets `value`, otherwise the source element at
+        // sum(coord[d] * src_strides[d]) - offset.
+        const size_m* limits = prim->padding_range.data();
+        const size_m offset = (size_m)prim->offset;
+        uint32_t cdims = padded_mat.dims;
+        dispatch_type(padded_mat.type, padded_mat.buffer, [&](auto* dst) {
+            using T = std::decay_t<decltype(*dst)>;
+            const T* src = (const T*)this->buffer;
+            T fill{};
+            dispatch_type(value.type, value.buffer, [&](auto* v) { fill = static_cast<T>(*v); });
+
+            if (cdims == 1) {
+                for (size_m x = 0; x < dst_shape[0]; ++x) {
+                    bool pad = limits[0] > x || limits[1] <= x;
+                    dst[x * dst_strides[0]] = pad ? fill : src[x * src_strides[0] - offset];
+                }
+            } else if (cdims == 2) {
+                for (size_m y = 0; y < dst_shape[0]; ++y) {
+                    for (size_m x = 0; x < dst_shape[1]; ++x) {
+                        bool pad = limits[0] > y || limits[1] <= y || limits[2] > x || limits[3] <= x;
+                        dst[y * dst_strides[0] + x * dst_strides[1]] =
+                            pad ? fill : src[y * src_strides[0] + x * src_strides[1] - offset];
+                    }
+                }
+            } else if (cdims == 3) {
+                for (size_m z = 0; z < dst_shape[0]; ++z) {
+                    for (size_m y = 0; y < dst_shape[1]; ++y) {
+                        for (size_m x = 0; x < dst_shape[2]; ++x) {
+                            bool pad = limits[0] > z || limits[1] <= z ||
+                                       limits[2] > y || limits[3] <= y ||
+                                       limits[4] > x || limits[5] <= x;
+                            dst[z * dst_strides[0] + y * dst_strides[1] + x * dst_strides[2]] =
+                                pad ? fill : src[z * src_strides[0] + y * src_strides[1] + x * src_strides[2] - offset];
+                        }
+                    }
+                }
+            } else {
+                std::vector<size_m> coords(cdims, 0);
+                for (size_m i = 0; i < padded_mat.total_size; ++i) {
+                    size_m src_idx = 0, dst_idx = 0;
+                    bool pad = false;
+                    for (uint32_t d = 0; d < cdims; ++d) {
+                        if (limits[2 * d] > coords[d] || limits[2 * d + 1] <= coords[d]) pad = true;
+                        src_idx += coords[d] * src_strides[d];
+                        dst_idx += coords[d] * dst_strides[d];
+                    }
+                    dst[dst_idx] = pad ? fill : src[src_idx - offset];
+                    for (int d = cdims - 1; d >= 0; --d) {
+                        if (++coords[d] < dst_shape[d]) break;
+                        coords[d] = 0;
+                    }
+                }
+            }
+        });
+        return;
+    }
+
     size_t elem_size = dtype_size(padded_mat.type);
     id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
 
