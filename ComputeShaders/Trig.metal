@@ -168,3 +168,53 @@ template <typename T>
 INSTANTIATE_TAN_ND(0, float)
 INSTANTIATE_TAN_ND(1, half)
 
+// The default fast-math tanh overflows to NaN for large positive inputs (e.g. tanh(50)), so
+// use the precise one, in float so half gets the same behaviour.
+template <typename T>
+inline T tanh_precise(T x) { return T(precise::tanh(float(x))); }
+
+// 1D Optimized Tanh
+template <typename T>
+[[kernel]] void tanh_gg_nd1(device T* dst [[buffer(0)]], device const T* src [[buffer(1)]], constant const size_m& dst_stride [[buffer(2)]], constant const size_m& src_stride [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    dst[index * dst_stride] = tanh_precise(src[index * src_stride]);
+}
+
+// 2D Optimized Tanh
+template <typename T>
+[[kernel]] void tanh_gg_nd2(device T* dst [[buffer(0)]], device const T* src [[buffer(1)]], constant const size_m* dst_strides [[buffer(2)]], constant const size_m* src_strides [[buffer(3)]], uint2 index [[thread_position_in_grid]]) {
+    auto src_idx = index.x * src_strides[1] + index.y * src_strides[0];
+    auto dst_idx = index.x * dst_strides[1] + index.y * dst_strides[0];
+    dst[dst_idx] = tanh_precise(src[src_idx]);
+}
+
+// 3D Optimized Tanh
+template <typename T>
+[[kernel]] void tanh_gg_nd3(device T* dst [[buffer(0)]], const device T* src [[buffer(1)]], constant const size_m* dst_strides [[buffer(2)]], constant const size_m* src_strides [[buffer(3)]], uint3 index [[thread_position_in_grid]]) {
+    size_m src_idx = index.x * src_strides[2] + index.y * src_strides[1] + index.z * src_strides[0];
+    size_m dst_idx = index.x * dst_strides[2] + index.y * dst_strides[1] + index.z * dst_strides[0];
+    dst[dst_idx] = tanh_precise(src[src_idx]);
+}
+
+// ND Optimized Tanh
+template <typename T>
+[[kernel]] void tanh_gg(device T* dst [[buffer(0)]], device const T* src [[buffer(1)]], constant const size_m* dst_strides [[buffer(2)]], constant const size_m* src_strides [[buffer(3)]], constant const size_m* src_shape [[buffer(4)]], constant const int& ndim [[buffer(5)]], uint3 index [[thread_position_in_grid]]) {
+    size_m src_idx = index.x * src_strides[ndim-1] + index.y * src_strides[ndim-2];
+    size_m dst_idx = index.x * dst_strides[ndim-1] + index.y * dst_strides[ndim-2];
+    uint remA = index.z;
+    for (int i = ndim-3; i >= 0; --i) {
+        src_idx += remA % src_shape[i] * src_strides[i];
+        dst_idx += remA % src_shape[i] * dst_strides[i];
+        remA /= src_shape[i];
+    }
+    dst[dst_idx] = tanh_precise(src[src_idx]);
+}
+
+#define INSTANTIATE_TANH_ND(type_idx, type) \
+    instantiate_kernel("TanhGPU_nd_" #type_idx "_0", tanh_gg_nd1, type); \
+    instantiate_kernel("TanhGPU_nd_" #type_idx "_1", tanh_gg_nd2, type); \
+    instantiate_kernel("TanhGPU_nd_" #type_idx "_2", tanh_gg_nd3, type); \
+    instantiate_kernel("TanhGPU_nd_" #type_idx "_3", tanh_gg, type);
+
+INSTANTIATE_TANH_ND(0, float)
+INSTANTIATE_TANH_ND(1, half)
+

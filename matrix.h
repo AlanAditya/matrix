@@ -995,6 +995,16 @@ public:
     
     static std::function<std::vector<matrix>(const std::vector<matrix>&)> multi_jit_graph_gpu(std::function<std::vector<matrix>(std::vector<matrix>)> func, const std::vector<matrix>& sample_inputs);
     static std::function<std::vector<matrix>(std::vector<matrix>)> grad_graph_gpu(std::function<std::vector<matrix>(std::vector<matrix>)> func, const std::vector<matrix>& sample_inputs);
+    // Like mx.value_and_grad: returns a function that, given the parameters, gives the loss and
+    // its gradient w.r.t. each parameter (a graph rebuilt on each call, nothing compiled).
+    //     auto [loss, grads] = matrix::value_and_grad(loss_fn)(params);
+    static std::function<std::pair<matrix, std::vector<matrix>>(std::vector<matrix>)> value_and_grad(std::function<matrix(std::vector<matrix>)> fn);
+    static std::function<std::pair<matrix, matrix>(matrix)> value_and_grad(std::function<matrix(matrix)> fn);
+    // Both throw, like MLX, if fn returns more than one element.
+    // Like mx.grad: value_and_grad without the value.
+    //     std::vector<matrix> grads = matrix::grad(loss_fn)(params);
+    static std::function<std::vector<matrix>(std::vector<matrix>)> grad(std::function<matrix(std::vector<matrix>)> fn);
+    static std::function<matrix(matrix)> grad(std::function<matrix(matrix)> fn);
     static std::vector<matrix> build_grad_graph(std::vector<matrix>& output_nodes, std::vector<matrix>& sample_input_nodes);
     // Add this inside the matrix class
     matrix dot(const matrix& b, bool transposeB = false);
@@ -1527,6 +1537,8 @@ public:
 
     static matrix tan(const matrix& input);
     void tan(matrix& output, ExecutionDevice exec_device);
+    static matrix tanh(const matrix& input);
+    void tanh(matrix& output, ExecutionDevice exec_device);
     
     static matrix sqrt(const matrix& input);
     void sqrt(matrix& output, ExecutionDevice exec_device);
@@ -1586,6 +1598,17 @@ public:
     void eval_cpu();
     void eval();
     static constexpr size_t GPU_EXECUTION_THRESHOLD = 10;
+
+    // Several at once, like mx.eval: matrix::eval(params, optimizer.state, loss). Each argument is
+    // a matrix or a std::vector<matrix>. Only evaluates; the graphs stay attached (see detach).
+    template <typename... Args> static void eval(Args&... args) { (eval_each(args), ...); }
+    // Drops each matrix's graph (releaseTape) and keeps its data, so the next step doesn't hold
+    // on to this step's graph. Call after eval. Same argument forms as eval.
+    template <typename... Args> static void detach(Args&... args) { (detach_each(args), ...); }
+    static void eval_each(matrix& m) { m.eval_metal(); }
+    static void eval_each(std::vector<matrix>& ms) { for (auto& m : ms) m.eval_metal(); }
+    static void detach_each(matrix& m) { m.releaseTape(); }
+    static void detach_each(std::vector<matrix>& ms) { for (auto& m : ms) m.releaseTape(); }
 
     void ensure_evaluated() const;
 

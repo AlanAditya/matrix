@@ -109,6 +109,8 @@ public:
     id<MTLComputePipelineState> CosComputeState_nd[4][4];
     bool TanInit_nd[4][4];
     id<MTLComputePipelineState> TanComputeState_nd[4][4];
+    bool TanhInit_nd[4][4];
+    id<MTLComputePipelineState> TanhComputeState_nd[4][4];
     bool SqrtInit_nd[4][4];
     id<MTLComputePipelineState> SqrtComputeState_nd[4][4];
     bool ExpInit_nd[4][4];
@@ -289,6 +291,7 @@ public:
                 SinInit_nd[i][j] = false;
                 CosInit_nd[i][j] = false;
                 TanInit_nd[i][j] = false;
+                TanhInit_nd[i][j] = false;
                 SqrtInit_nd[i][j] = false;
                 ExpInit_nd[i][j] = false;
                 ClampInit_nd[i][j] = false;
@@ -915,6 +918,14 @@ public:
         id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TanGPU_nd_%i_%i", type_code, cdims]];
         TanComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         TanInit_nd[type_code][cdims] = true;
+        if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
+    }
+
+    void initTanh_nd(int type_code, int cdims) {
+        NSError *error = nil;
+        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TanhGPU_nd_%i_%i", type_code, cdims]];
+        TanhComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        TanhInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
     }
     

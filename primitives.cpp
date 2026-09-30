@@ -3219,8 +3219,36 @@ public:
     matrix* get_borrowed_input() override { return &input; }
     matrix input;
     array_descriptor transpose_desc;
+    // perm[i] = the input axis that output axis i comes from. Set by the axis-order
+    // creators (transpose({...}), transpose(vector), T()); transpose(array_descriptor)
+    // leaves it unset and axis_perm() recovers it from the shapes and strides.
+    size_m perm[MAX_TENSOR_DIMS];
+    bool has_perm = false;
     TransposePrimitive(matrix& input_mat, array_descriptor input_transpose_desc): input(ensure_graph_ready(input_mat)), transpose_desc(input_transpose_desc) {
         transpose_desc.retain(input.dims);
+    }
+    void set_perm(const size_m* p) {
+        memcpy(perm, p, input.dims * sizeof(size_m));
+        has_perm = true;
+    }
+    std::vector<size_m> axis_perm() {
+        uint32_t n = input.dims;
+        if (has_perm) return std::vector<size_m>(perm, perm + n);
+        const size_m* out_shape = n <= SBO_MAX_DIMS ? transpose_desc.inline_buffer : transpose_desc.shared_arr_desc->shape();
+        const size_m* out_strides = n <= SBO_MAX_DIMS ? transpose_desc.inline_buffer + SBO_MAX_DIMS : transpose_desc.shared_arr_desc->strides(n);
+        std::vector<size_m> p(n);
+        std::vector<bool> used(n, false);
+        for (uint32_t i = 0; i < n; i++) {
+            int match = -1;
+            for (uint32_t j = 0; j < n && match < 0; j++)
+                if (!used[j] && input.shape()[j] == out_shape[i] && input.strides()[j] == out_strides[i]) match = j;
+            for (uint32_t j = 0; j < n && match < 0; j++)      // size-1 axes: any stride
+                if (!used[j] && input.shape()[j] == out_shape[i]) match = j;
+            if (match < 0) throw std::runtime_error("TransposePrimitive: output layout is not a permutation of the input's");
+            used[match] = true;
+            p[i] = match;
+        }
+        return p;
     }
     // Balances the retain() in the constructor. array_descriptor is a union with no
     // destructor, so nothing else gives back this primitive's hold on the heap
@@ -3318,11 +3346,14 @@ public:
 
     std::vector<matrix> vjp(matrix& grad_out) override {
         // a is vector a.reshape=>c soo J = (dc/da) and for reshape we didnt change anything so its 1 so J = 1 reshaped
-        return { grad_out.transpose(input.array_desc) };
+        // Undo the permutation: output axis i came from input axis perm[i].
+        std::vector<size_m> p = axis_perm(), inv(p.size());
+        for (size_t i = 0; i < p.size(); i++) inv[p[i]] = i;
+        return { grad_out.transpose(inv) };
     }
     matrix jvp(std::vector<matrix>& tangents) override {
         // a is vector a.reshape=>c soo J = (dc/da) and for reshape we didnt change anything so its 1 so J = 1 reshaped
-        return tangents[0].transpose(transpose_desc);
+        return tangents[0].transpose(axis_perm());
 
     }
 // Converts dirty=true into evaluated=false along every path leading to a dirty node,
@@ -4548,6 +4579,140 @@ public:
     matrix jvp(std::vector<matrix>& tangents) override {
         matrix cos_val = matrix::cos(input);
         return tangents[0] / (cos_val * cos_val);
+    }
+
+// Converts dirty=true into evaluated=false along every path leading to a dirty node,
+    // then resets dirty. This is needed because nodes only know their parents, not their
+    // children, so the only way to propagate "this subtree needs re-eval" is to walk down
+    // from parents and pull the signal up via return value.
+    //
+    // Memoization (last_visited_pass_id): a shared node (diamond dependency) gets visited
+    // once per pass by its first parent, which does the real work and returns the result.
+    // Every subsequent parent visiting it in the *same* pass hits the early-return and reads
+    // !evaluated instead of recomputing. This is safe specifically because this function
+    // never sets evaluated = true — it only ever leaves it untouched or forces it to false.
+    // So by the time a second parent visits, whatever the first parent already wrote to
+    // `evaluated` is final for this pass, and !evaluated is guaranteed to match what a
+    // recompute would have returned.
+    //
+    // The base-case `return false` (when !dirty && !inv) looks inconsistent with the memo
+    // branch's `return !evaluated`, but it can't actually diverge in practice: if evaluated
+    // were already false here, invariant (parent can't be evaluated=true if child is
+    // evaluated=false) guarantees every ancestor above this node already has evaluated=false
+    // too, so this function was never going to flip anything back to true regardless of what
+    // it returns. A stale re-invalidation with no exec in between is therefore a true no-op,
+    // not a correctness gap.
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (input.tape && input.tape->evaluated) { input.tape->clear_trace_checks(); }
+    }
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override {
+        return {input};
+    }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
+};
+
+// ==================== TANH PRIMITIVE ====================
+class TanhPrimitive : public Primitive {
+public:
+    matrix input;
+    CollapsedDims_2 collapsed_dims;
+    explicit TanhPrimitive(const matrix& input) : input(ensure_graph_ready(input)) {
+    }
+
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); };
+        input.update_from_trace();
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) {return;}
+
+        if (evaluated) {return;} else {evaluated = true;}
+        input.tanh(out, ExecutionDevice::CPU);
+    }
+
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) {return;}
+
+        if (evaluated) {return;} else {evaluated = true;}
+        input.tanh(out, ExecutionDevice::METAL);
+    }
+
+    // d tanh(x) / dx = 1 - tanh(x)^2
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        matrix t = matrix::tanh(input);
+        return { grad_out * (1.0f - t * t) };
+    }
+
+    matrix jvp(std::vector<matrix>& tangents) override {
+        matrix t = matrix::tanh(input);
+        return tangents[0] * (1.0f - t * t);
     }
 
 // Converts dirty=true into evaluated=false along every path leading to a dirty node,

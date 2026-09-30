@@ -49,7 +49,7 @@ This is a complete map of every public constructor, static factory, and method e
 | `matrix::concat(mats, axis=0)` | Static overload returning a new matrix; the `void` overload writes into a caller-provided `output`. |
 | `matrix::meshgrid(x, y, sparse=false)` / `meshgrid(x, y, z, sparse=false)` | Coordinate grids from 1D axis matrices (2D and 3D overloads). |
 | `matrix::cross(a, b, axis=-1)` | Cross product (static free-function style entry point; see also instance `cross_impl`). |
-| `matrix::sin/cos/tan/sqrt/exp/abs/log(input)` | Static elementwise math ops, each also has an instance overload writing into an explicit `output` (see Elementwise Math below). |
+| `matrix::sin/cos/tan/tanh/sqrt/exp/abs/log(input)` | Static elementwise math ops, each also has an instance overload writing into an explicit `output` (see Elementwise Math below). |
 | `matrix::max(a, b)` / `matrix::min(a, b)` | Static elementwise max/min between two matrices (broadcastable). |
 | `matrix::conv / conv1d / conv2d / conv3d(...)` | Static convolution entry points (see Convolution below). |
 
@@ -113,7 +113,7 @@ Note: `matrix::max(a, b)` / `matrix::min(a, b)` (static, two-matrix elementwise)
 | `add_gpu / multiply_gpu / subtract_gpu / divide_gpu(other, result, evalType=AUTO)` | Non-broadcasting GPU backends. |
 | `add_cpu_brodcasted / multiply_cpu_brodcasted / subtract_cpu_brodcasted / divide_cpu_brodcasted(other, result, evalType=AUTO)` | Broadcasting CPU backends. |
 | `add_gpu_brodcasted / multiply_gpu_brodcasted / subtract_gpu_brodcasted / divide_gpu_brodcasted(other, result, evalType=AUTO)` | Broadcasting GPU backends. |
-| `matrix::sin/cos/tan/sqrt/exp/abs/log(input)` (static) + instance `sin/cos/tan/sqrt/exp/abs/log(output, exec_device)` | Elementwise transcendental/algebraic functions. `abs`/`log` currently only expose the static-return form plus the instance-with-output form (no separate static-declared `abs`/`log`-into-output split beyond what's listed). |
+| `matrix::sin/cos/tan/tanh/sqrt/exp/abs/log(input)` (static) + instance `sin/cos/tan/tanh/sqrt/exp/abs/log(output, exec_device)` | Elementwise transcendental/algebraic functions. `abs`/`log` currently only expose the static-return form plus the instance-with-output form (no separate static-declared `abs`/`log`-into-output split beyond what's listed). |
 | `matrix::equal(a, b)` / `matrix::equal_backend(output, exec_device)` | Broadcasted elementwise `a == b`, as `1`/`0` in the promoted dtype (a mask that multiplies straight into other tensors). No gradient (zero VJP/JVP). Used by the `max`/`min` axis-reduction gradients to route the gradient to the extremum, split evenly between ties as in MLX. |
 | `clamp(min_val, max_val) const` / `clamp(output, min_val, max_val, exec_device) const` | Elementwise clamp to `[min_val, max_val]`. Gradient as in MLX's `clip`: 1 strictly inside the bounds, 0 at and beyond them. |
 | `matrix::max(a, b)` / `max(other, output, exec_device) const` / `matrix::min(a, b)` / `min(other, output, exec_device) const` | Elementwise (broadcastable) max/min between two matrices — distinct from the axis-reduction overloads above. |
@@ -165,6 +165,10 @@ Matrices carry an optional `Primitive* tape` describing how they were computed (
 | `matrix::grad_gpu(func, sample)` | **Legacy, broken, don't use** (defined in `legacy.mm`). Use `grad_graph_gpu`. |
 | `matrix::build_grad_graph(output_node, sample_input_node)` | Builds the backward graph for a single output/input pair. |
 | `matrix::jit_graph_gpu(func, sample)` / `matrix::grad_graph_gpu(func, sample)` | Graph-based (vs. flat) JIT/grad variants for a single input. |
+| `matrix::value_and_grad(fn)` | Like `mx.value_and_grad`: `fn(std::vector<matrix>) -> matrix` becomes a function returning `{value, grads}` (one gradient per parameter); the `fn(matrix) -> matrix` overload returns `{value, grad}`. Throws `std::invalid_argument`, like MLX, if `fn` returns more than one element (`build_grad_graph` itself still seeds with `ones()`, which differentiates the sum). Rebuilds the graph with `build_grad_graph` on each call; nothing is compiled. `auto [loss, grads] = matrix::value_and_grad(loss_fn)(params);` |
+| `matrix::grad(fn)` | Like `mx.grad`: `value_and_grad` without the value, same two overloads. `std::vector<matrix> grads = matrix::grad(loss_fn)(params);` |
+| `matrix::eval(a, b, ...)` / `matrix::detach(a, b, ...)` | Static, variadic; each argument is a matrix or a `std::vector<matrix>`. `eval` evaluates them all on Metal, like `mx.eval(params, optimizer.state)`, and leaves the graphs attached. `detach` then drops each one's graph (`releaseTape()`) and keeps its data, so a training loop doesn't hold on to the previous step's graph and the renderer gets plain data. Distinct from the instance `eval()` (one matrix, device picked by size). |
+| `optim::Adam(learning_rate, beta1=0.9, beta2=0.999, eps=1e-8, bias_correction=false)` (`AI/Optimizers.h`) | Like `mlx.optimizers.Adam` (same defaults): `optimizer.update(params, grads)` replaces `params` with new, lazy matrices and keeps its moments in `optimizer.state` (first moments, then second moments), then `matrix::eval(params, optimizer.state)`. Example: the `sine_fit` applet. |
 | `matrix::multi_jit_graph_gpu(func, sample_inputs)` / `matrix::grad_graph_gpu(func, sample_inputs)` (vector overload) / `matrix::build_grad_graph(output_nodes, sample_input_nodes)` (vector overload) | Multi-input/multi-output variants of the above. |
 
 ## Buffer & Reference-Count Management

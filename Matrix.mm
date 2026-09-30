@@ -978,7 +978,9 @@ matrix matrix::transpose(std::initializer_list<size_m> new_axis_order) const {
     output_view.total_size = total_size;
     output_view.flags = flags;
     output_view.flags |= NON_CONTIGUOUS_FLAG;
-    output_view.tape = new TransposePrimitive(const_cast<matrix&>(*this), output_view.array_desc);
+    auto prim = new TransposePrimitive(const_cast<matrix&>(*this), output_view.array_desc);
+    prim->set_perm(new_axis_order.begin());
+    output_view.tape = prim;
     return output_view;
 }
 
@@ -996,7 +998,9 @@ matrix matrix::transpose(const std::vector<size_m>& new_axis_order) const {
     }
     output_view.total_size = total_size;
     output_view.flags = flags | NON_CONTIGUOUS_FLAG;
-    output_view.tape = new TransposePrimitive(const_cast<matrix&>(*this), output_view.array_desc);
+    auto prim = new TransposePrimitive(const_cast<matrix&>(*this), output_view.array_desc);
+    prim->set_perm(new_axis_order.data());
+    output_view.tape = prim;
     return output_view;
 }
 
@@ -1014,7 +1018,11 @@ matrix matrix::T() const {
     output_view.total_size = total_size;
     output_view.flags      = flags;
     output_view.flags     |= NON_CONTIGUOUS_FLAG;
-    output_view.tape       = new TransposePrimitive(const_cast<matrix&>(*this), output_view.array_desc);
+    size_m reversed[MAX_TENSOR_DIMS];
+    for (int i = 0; i < dims; i++) reversed[i] = dims - 1 - i;
+    auto prim = new TransposePrimitive(const_cast<matrix&>(*this), output_view.array_desc);
+    prim->set_perm(reversed);
+    output_view.tape = prim;
     return output_view;
 }
 
@@ -1183,6 +1191,48 @@ matrix matrix::build_grad_graph(matrix& output_node, matrix& sample_input_node) 
         return it->second;
     }
     return sample_input_node.zeros();
+}
+
+// Like MLX: a gradient is only defined for a function returning a single element. Seeding a
+// bigger output with ones() would silently differentiate its sum instead (use build_grad_graph
+// for that).
+static void require_scalar_output(const matrix& value) {
+    size_t n = 1;
+    for (int i = 0; i < value.dims; i++) n *= value.shape()[i];
+    if (n == 1) return;
+    std::string shape = "(";
+    for (int i = 0; i < value.dims; i++) shape += (i ? ", " : "") + std::to_string(value.shape()[i]);
+    shape += ")";
+    throw std::invalid_argument("[value_and_grad] The return value of the function whose gradient we want to compute should be a scalar array; but " + shape + " was returned.");
+}
+
+std::function<std::pair<matrix, std::vector<matrix>>(std::vector<matrix>)> matrix::value_and_grad(std::function<matrix(std::vector<matrix>)> fn) {
+    return [fn](std::vector<matrix> params) {
+        matrix value = fn(params);
+        require_scalar_output(value);
+        std::vector<matrix> outputs = {value};
+        std::vector<matrix> grads = build_grad_graph(outputs, params);
+        return std::make_pair(value, grads);
+    };
+}
+
+std::function<std::pair<matrix, matrix>(matrix)> matrix::value_and_grad(std::function<matrix(matrix)> fn) {
+    return [fn](matrix params) {
+        matrix value = fn(params);
+        require_scalar_output(value);
+        matrix grads = build_grad_graph(value, params);
+        return std::make_pair(value, grads);
+    };
+}
+
+std::function<std::vector<matrix>(std::vector<matrix>)> matrix::grad(std::function<matrix(std::vector<matrix>)> fn) {
+    auto vg = value_and_grad(fn);
+    return [vg](std::vector<matrix> params) { return vg(params).second; };
+}
+
+std::function<matrix(matrix)> matrix::grad(std::function<matrix(matrix)> fn) {
+    auto vg = value_and_grad(fn);
+    return [vg](matrix params) { return vg(params).second; };
 }
 
 std::vector<matrix> matrix::build_grad_graph(std::vector<matrix>& output_nodes, std::vector<matrix>& sample_input_nodes) {
@@ -5658,6 +5708,134 @@ void matrix::tan(matrix& output, ExecutionDevice exec_device) {
     }
 }
 
+matrix matrix::tanh(const matrix& input) {
+    dtype out_type = promote_types(input.type, dtype::Float16);
+    matrix promoted = (input.type != out_type) ? input.astype(out_type, true) : input;
+    matrix output(promoted.dims, promoted.type);
+    memcpy(output.shape(), promoted.shape(), promoted.dims * sizeof(size_m));
+    output.total_size = promoted.total_size;
+    output.calcStrides();
+    
+    auto res = collapse_dims(promoted.shape(), output.strides(), promoted.strides(), promoted.dims, INT32_MAX);
+    TanhPrimitive* prim = new TanhPrimitive(promoted);
+    prim->collapsed_dims = res;
+    output.tape = prim;
+    return output;
+}
+
+void matrix::tanh(matrix& output, ExecutionDevice exec_device) {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+    
+    TanhPrimitive* primit = static_cast<TanhPrimitive*>(output.tape);
+    auto res = primit->collapsed_dims;
+    uint32_t cdims = res.out_dims;
+
+    if (exec_device == ExecutionDevice::METAL) {
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        int typeCode = (int)type;
+        int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+
+        if (!GlobalGPUManager.TanhInit_nd[typeCode][kernel_code]) {
+            GlobalGPUManager.initTanh_nd(typeCode, kernel_code);
+        }
+
+        setBufferOrBytes(commandEncoder, output, 0); // Output destination
+        setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
+        
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        if (cdims == 0) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.TanhComputeState_nd[typeCode][0]];
+            size_m one = 1;
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+        } else if (cdims == 1) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.TanhComputeState_nd[typeCode][0]];
+            [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.TanhComputeState_nd[typeCode][1]];
+            [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.TanhComputeState_nd[typeCode][2]];
+            [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
+            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        } else {
+            [commandEncoder setComputePipelineState:GlobalGPUManager.TanhComputeState_nd[typeCode][3]];
+            [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+            [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:5];
+            
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= res.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+        }
+
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        // CPU fallback mapping
+        dispatch_type(type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+                T* in_data = (T*)buffer;
+                if (cdims == 0) {
+                    out_data[0] = std::tanh(in_data[0]);
+                } else if (cdims == 1) {
+                    size_m out_stride = res.stridesA[0];
+                    size_m in_stride = res.stridesB[0];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        out_data[i * out_stride] = std::tanh(in_data[i * in_stride]);
+                    }
+                } else if (cdims == 2) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            out_data[i * out_stride0 + j * out_stride1] = std::tanh(in_data[i * in_stride0 + j * in_stride1]);
+                        }
+                    }
+                } else if (cdims == 3) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m out_stride2 = res.stridesA[2];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    size_m in_stride2 = res.stridesB[2];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            for (size_m k = 0; k < res.shape[2]; k++) {
+                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = std::tanh(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
+                            }
+                        }
+                    }
+                } else {
+                    for (size_m gid = 0; gid < total_size; gid++) {
+                        size_m src_idx = 0;
+                        size_m dst_idx = 0;
+                        size_m rem = gid;
+                        for (int i = cdims - 1; i >= 0; i--) {
+                            size_m idx = rem % res.shape[i];
+                            src_idx += idx * res.stridesB[i];
+                            dst_idx += idx * res.stridesA[i];
+                            rem /= res.shape[i];
+                        }
+                        out_data[dst_idx] = std::tanh(in_data[src_idx]);
+                    }
+                }
+        });
+    }
+}
+
 matrix matrix::sqrt(const matrix& input) {
     dtype out_type = promote_types(input.type, dtype::Float16);
     matrix promoted = (input.type != out_type) ? input.astype(out_type, true) : input;
@@ -5934,13 +6112,16 @@ matrix matrix::dot(const matrix& b, bool transposeB) {
         b_optimized = b.transpose(axes);
     }
     b_optimized = (b_optimized.flags & NON_CONTIGUOUS_FLAG) ? b_optimized.astype(b_optimized.type, true) : b_optimized;
-    matrix result(std::max(dims, b_optimized.dims), type);
-    auto primit = new DotPrimitive(*this, b_optimized);
+    // The backends index A as A[m * K + k] too, so a non-contiguous A (e.g. a transposed
+    // view, which the VJP's grad_out^T @ a produces) must be packed the same way as B.
+    matrix a_optimized = (flags & NON_CONTIGUOUS_FLAG) ? this->astype(type, true) : *this;
+    matrix result(std::max(a_optimized.dims, b_optimized.dims), type);
+    auto primit = new DotPrimitive(a_optimized, b_optimized);
 
     primit->desc_a = BroadcastDescriptor::create(result.dims);
     primit->desc_b = BroadcastDescriptor::create(result.dims);
-    broadcast_shapes_matmul(array_desc, b_optimized.array_desc, result.array_desc,
-                         primit->desc_a, primit->desc_b, dims, b_optimized.dims);
+    broadcast_shapes_matmul(a_optimized.array_desc, b_optimized.array_desc, result.array_desc,
+                         primit->desc_a, primit->desc_b, a_optimized.dims, b_optimized.dims);
     primit->collapsed_dims_3 = collapse_dims_matmul(
             result.shape(),
             primit->desc_a->strides(result.dims),
