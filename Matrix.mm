@@ -788,7 +788,9 @@ matrix::matrix(uint32_t rank, size_t total_size_inp, dtype type_inp) {
     if (dims > SBO_MAX_DIMS) {
         array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
     }
-    buffer = new uint8_t[total_size * dtype_size(type)];
+    // total_size describes the buffer: an empty matrix has no buffer (not a zero-byte allocation, which
+    // copying would then deep-copy and wrap in a zero-length Metal buffer).
+    buffer = total_size > 0 ? new uint8_t[total_size * dtype_size(type)] : nullptr;
     if (total_size_inp > 10) {
         buildMetalBuffer();
     }
@@ -797,7 +799,8 @@ matrix::matrix(uint32_t rank, size_t total_size_inp, dtype type_inp) {
 matrix::matrix(uint32_t rank, dtype type_inp) {
     dims = rank;
     type = type_inp;
-    
+    total_size = 0;   // no buffer yet (buffer defaults to nullptr): the caller sets both when it allocates
+
     if (dims > SBO_MAX_DIMS) {
         array_desc.shared_arr_desc = SharedArrayDescriptor::create(dims);
     }
