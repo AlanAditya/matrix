@@ -985,6 +985,8 @@ public:
 //            return output;
 //        };
 //    }
+    // LEGACY: broken and scheduled for removal; defined in legacy.mm. Use jit_graph_gpu /
+    // grad_graph_gpu. See .agents/MemoryManagement.md §8.4.
     static std::function<matrix(matrix&)> jit_gpu(std::function<matrix(matrix&)> func, matrix& sample);
     static std::function<matrix(matrix)> grad_gpu(std::function<matrix(matrix)> func, matrix sample);
     static matrix build_grad_graph(matrix& output_node, matrix& sample_input_node);

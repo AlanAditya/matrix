@@ -274,7 +274,7 @@ Checked standalone: correct values, and live buffers stay flat across calls.
 There's one `MultiInputCompilePrimitive` **per output**, and each one is the tape of its own output. Every one of them holds copies of all `outer_outputs` with tapes pointing to their siblings, plus `siblings` (the full list, **including itself**). Those in-primitive tape pointers are **raw and not counted**, so `~MultiInputCompilePrimitive` sets them to null (in its own copies and in the siblings') before the member matrices are destroyed, and removes itself from the siblings' lists. Running any sibling marks all of them `evaluated`.
 
 ### 8.4 Legacy: `jit_gpu` / `grad_gpu`
-These are **phased out and scheduled for removal.** Don't model anything on them, and don't fix them. Both are broken (reproduced standalone):
+These are **phased out and scheduled for removal**, and live in `legacy.mm` (declared in `matrix.h` under a LEGACY comment). Don't model anything on them, and don't fix them. Both are broken (reproduced standalone):
 - `jit_gpu`: sets its tape cache to null by hand (+1 per call, so every result's buffer leaks), never sets `total_size` on the result, and has a debug `printf` on each call.
 - `grad_gpu`: calls `shareBuffer` in the wrong direction, reaching `update_cache(nullptr, …)` → null `fetch_add` → crash on the first call.
 

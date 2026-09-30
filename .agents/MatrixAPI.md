@@ -155,14 +155,14 @@ Matrices carry an optional `Primitive* tape` describing how they were computed (
 | `update_from_trace()` | Pulls the cached buffer/refcount from `tape` if this instance hasn't grabbed it yet. |
 | `compile_cpu()` / `compile_metal()` | Builds a reusable compiled execution plan for the graph (CPU/Metal) without running it. |
 | `execute_cpu()` / `execute_metal()` | Runs a previously compiled plan. |
-| `clear_trace_checks()` | Resets internal flags used to detect stale/re-traced graphs (used by the `jit_gpu` family after each call). |
+| `clear_trace_checks()` | Resets internal flags used to detect stale/re-traced graphs (used by the JIT functions after each call). |
 | `make_leaf()` | Marks a matrix as a graph leaf (input placeholder) — pairs with `matrix::leaf(...)`. |
 | `matrix::leaf_scalar(value, dtype=Float)` | A 1-element leaf holding `value`, meant to be written in place (UI sliders, tweakable constants). Pair with `mark_changed()`. |
 | `mark_changed()` | After writing a node's buffer in place: bumps its `version` to `++global_epoch` and clears `evaluated`, so the next `invalidate_pass` re-runs everything downstream (and a generator re-runs its fill). Call it on the thread that owns the graph. Throws if the matrix has no tape. |
 | `matrix::host_op(shape, dtype, fn, inputs)` | A lazy node computed by host code (algorithms that aren't graph ops, e.g. RANSAC). `fn(out, ins)` fills the pre-allocated `out` from the evaluated `inputs` and re-runs when an input's version changes; on Metal the inputs' queued GPU work is finished first so `fn` can read them on the host. Pass slider parameters with `HostArg::track(ScalarArg, inputs)` and read them in `fn` with `.value(ins)`. No gradient. Example: `fovea::segment_planar_surfaces_labels`. |
 | `insert_break(lambda, exec_device=METAL) const` | Inserts a debug/inspection breakpoint node into the graph, invoking `lambda` when that point evaluates. |
-| `matrix::jit_gpu(func, sample)` | Compiles `func` against a `sample` input into a fast-path callable `matrix(matrix&)`. |
-| `matrix::grad_gpu(func, sample)` | Same, but returns the gradient function. |
+| `matrix::jit_gpu(func, sample)` | **Legacy, broken, don't use** (defined in `legacy.mm`, see [MemoryManagement.md §8.4](MemoryManagement.md)). Use `jit_graph_gpu`. |
+| `matrix::grad_gpu(func, sample)` | **Legacy, broken, don't use** (defined in `legacy.mm`). Use `grad_graph_gpu`. |
 | `matrix::build_grad_graph(output_node, sample_input_node)` | Builds the backward graph for a single output/input pair. |
 | `matrix::jit_graph_gpu(func, sample)` / `matrix::grad_graph_gpu(func, sample)` | Graph-based (vs. flat) JIT/grad variants for a single input. |
 | `matrix::multi_jit_graph_gpu(func, sample_inputs)` / `matrix::grad_graph_gpu(func, sample_inputs)` (vector overload) / `matrix::build_grad_graph(output_nodes, sample_input_nodes)` (vector overload) | Multi-input/multi-output variants of the above. |
