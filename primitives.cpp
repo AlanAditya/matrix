@@ -3868,14 +3868,20 @@ public:
         input.clamp(out, min_val, max_val, ExecutionDevice::METAL);
     }
 
+    // Like MLX's clip (maximum with min_val, then minimum with max_val): the gradient passes
+    // where min_val < x < max_val and is 0 at and beyond the bounds.
+    matrix inside_mask() {
+        return matrix::equal(input.clamp(min_val, max_val), input)
+             * (1.0f - matrix::equal(input, matrix::scalar(min_val, input.type)))
+             * (1.0f - matrix::equal(input, matrix::scalar(max_val, input.type)));
+    }
+
     std::vector<matrix> vjp(matrix& grad_out) override {
-        // TODO: User to implement
-        return {};
+        return { grad_out * inside_mask() };
     }
 
     matrix jvp(std::vector<matrix>& tangents) override {
-        // TODO: User to implement
-        return matrix(0, dtype::Float);
+        return tangents[0] * inside_mask();
     }
 
 // Converts dirty=true into evaluated=false along every path leading to a dirty node,
@@ -4190,13 +4196,10 @@ public:
         if (input.tape && input.tape->evaluated) { input.tape->clear_trace_checks(); }
     }
     std::vector<matrix> vjp(matrix& grad_out) override {
-        // a is vector a.reshape=>c soo J = (dc/da) and for reshape we didnt change anything so its 1 so J = 1 reshaped
-        return { grad_out };
+        return { grad_out / input };
     }
     matrix jvp(std::vector<matrix>& tangents) override {
-        // a is vector a.reshape=>c soo J = (dc/da) and for reshape we didnt change anything so its 1 so J = 1 reshaped
-        return matrix::scalar(1.0f);
-
+        return tangents[0] / input;
     }
 };
 
@@ -6078,7 +6081,11 @@ public:
         if (evaluated) {return;} else {evaluated = true;}
         input.argmax(out, axis, keepdims, ExecutionDevice::CPU); // Fallback to CPU
     }
-    std::vector<matrix> vjp(matrix& grad_out) override { return {}; }
+    // No gradient: one zero per input, since build_grad_graph pairs vjp()[i] with get_inputs()[i].
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        std::vector<size_m> in_shape(input.shape(), input.shape() + input.dims);
+        return { matrix::zeros(in_shape, input.type) };
+    }
     matrix jvp(std::vector<matrix>& tangents) override { return matrix(0, dtype::UInt8); }
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
@@ -6182,7 +6189,11 @@ public:
         if (evaluated) {return;} else {evaluated = true;}
         input.argmin(out, axis, keepdims, ExecutionDevice::CPU); // Fallback to CPU
     }
-    std::vector<matrix> vjp(matrix& grad_out) override { return {}; }
+    // No gradient: one zero per input, since build_grad_graph pairs vjp()[i] with get_inputs()[i].
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        std::vector<size_m> in_shape(input.shape(), input.shape() + input.dims);
+        return { matrix::zeros(in_shape, input.type) };
+    }
     matrix jvp(std::vector<matrix>& tangents) override { return matrix(0, dtype::UInt8); }
     bool invalidate_pass(uint64_t current_pass_id) override {
         if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
