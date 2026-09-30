@@ -2750,7 +2750,7 @@ matrix matrix::pad_range_normalised(const std::vector<size_m>& padding_range, co
 }
 
 
-void matrix::pad(std::vector<size_m>& padding_range, matrix& padded_mat, const matrix& value, ExecutionDevice exec_device) {
+void matrix::pad_backend(std::vector<size_m>& padding_range, matrix& padded_mat, const matrix& value, ExecutionDevice exec_device) {
     update_from_trace();
     const size_m *src_shape = this->shape();
     const size_m *src_strides = this->strides();

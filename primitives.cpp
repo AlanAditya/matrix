@@ -1445,9 +1445,11 @@ public:
     std::vector<matrix> vjp(matrix& grad_out) override {
         // a is vectors a[.., .., ...]=>c soo J = (dc/da, dc/db) = Identity padded with zeros for the orignal matrix values that were'nt in the slice
         // offset = ind[0] * strides[0] + ind[1] * strides[1] ... + ind[n-1] * strides[n-1];
-        matrix padded_grad_out(input.dims, input.type);
-        grad_out.unsqueeze(unsqeeze_mask.data(), unsqeeze_mask.size()).pad(slice_indices, padded_grad_out, {0});
-        return {padded_grad_out};
+        // A graph node: grad_out (with any indexed axes put back) placed at slice_indices inside
+        // zeros shaped like the input. (This used to call pad's backend instead of a frontend, so
+        // no node was made and the kernel was encoded against grad_out's unallocated buffer.)
+        matrix placed = grad_out.unsqueeze(unsqeeze_mask.data(), unsqeeze_mask.size());
+        return {placed.pad_range_normalised(slice_indices, input.shape(), matrix::scalar(0, grad_out.type))};
     }
     matrix jvp(std::vector<matrix>& tangents) override {
         // a are vectors a[.., .., ...]=>c soo J = (dc/da, dc/db)=>J=(1, 1) and only return the slice of the incoming derivative
@@ -2592,7 +2594,7 @@ public:
         }
         if (evaluated) {return;} else {evaluated = true;}
 
-        input.pad( padding_range, out, value, ExecutionDevice::CPU);
+        input.pad_backend(padding_range, out, value, ExecutionDevice::CPU);
 
     };
     void eval_metal(matrix &out, EvalType eval_type) override {
@@ -2632,7 +2634,7 @@ public:
         }
         if (evaluated) {return;} else {evaluated = true;}
 
-        input.pad( padding_range, out, value, ExecutionDevice::METAL);
+        input.pad_backend(padding_range, out, value, ExecutionDevice::METAL);
 
     }
 

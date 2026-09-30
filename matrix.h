@@ -720,7 +720,9 @@ public:
     static void stack(const std::vector<matrix>& mats, matrix& output, int axis = 0, ExecutionDevice exec_device = ExecutionDevice::AUTO);
     matrix pad(std::initializer_list<std::pair<size_m, size_m>> padding_range, const matrix& value) const;
     
-    void pad(std::vector<size_m>& padding_range, matrix& padded_mat, const matrix& value, ExecutionDevice exec_device = ExecutionDevice::AUTO);
+    // Backend: encodes the padding into padded_mat (already allocated, its tape is its PaddingPrimitive).
+    // Only PaddingPrimitive calls it; graph code uses the frontends.
+    void pad_backend(std::vector<size_m>& padding_range, matrix& padded_mat, const matrix& value, ExecutionDevice exec_device = ExecutionDevice::AUTO);
     matrix pad(int left, int right, int axis, const matrix& val) const;
     matrix pad(const std::vector<size_m>& padding_range, const matrix& value) const;
     matrix pad_range_normalised(const std::vector<size_m>& padding_range, const size_m* target_shape, const matrix& value) const;
