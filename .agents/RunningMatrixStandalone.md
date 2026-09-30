@@ -40,3 +40,28 @@ In the real app, `GPUManager` loads compute shaders via `[metalDevice newDefault
 - `refresh-debug.sh` patches the **copied** `Mods/GPUManager.h` (never the real source in WorldOf3D) to load that `default.metallib` by absolute path instead of calling `newDefaultLibrary`. It re-patches from a fresh copy every run, so it can't double-patch or drift; if `GPUManager.h`'s structure changes upstream (the `class GPUManager {` marker or the `newDefaultLibrary` line), the script fails loudly with a clear message rather than silently skipping the patch.
 
 Net effect: `eval_metal()`, `jit_graph_gpu`, and every broadcasted/Take/etc. GPU kernel work in `debug/tests/scratch.mm` exactly as they would on-device — this is how the `add_gpu_brodcasted` collapsed-dims bug and the `resample()`/`jit_graph_gpu` dtype-mismatch bug were both actually reproduced and fixed, not just reasoned about.
+
+## 3. CLion project with a plain `.cpp` entry point (optimised)
+
+`/Users/adityadude/Documents/C++XCODE/matrix-sync/cpp/` — open this folder in CLion. `main.cpp` is compiled as Objective-C++ (`set_source_files_properties(... LANGUAGE OBJCXX)`) because `matrix.h` uses `@import`/Metal. Its `CMakeLists.txt` runs `refresh-debug.sh` on every CMake configure (turn off with `-DMATRIX_REFRESH_ON_CONFIGURE=OFF`), then `add_subdirectory(../debug ... EXCLUDE_FROM_ALL)` for `libmatrix` + `default.metallib`. Release builds use `-O3 -DNDEBUG -mcpu=native -fno-math-errno` + LTO, applied to `libmatrix` too. CLion's default profile is Debug; add a Release profile to get the fast flags.
+
+### Renderer window (`matrix-sync/cpp/renderer/`)
+
+`renderer.h` / `renderer.mm` put the modern `Viewer`/`GeoNode`/`Controllers` path in an OpenCV-style window. The window is laid out in typed tiles, and each tile is a real `Viewer`:
+
+```cpp
+auto r = Renderer::init(1500, 800, "matrix");
+auto [graph, scene, heat] = r.subplots<GraphViewer, Viewer, PlotterViewer>(1, 3);   // rows, cols
+LineController wave = graph->plot(x, matrix::sin(x), {1, .35f, .2f, 1});   // any number of curves per graph
+PointCloudController cloud = scene->points(pts, colors, 3.0f);
+heat->update_plot(values);
+while (r.is_open()) { wave.update(x, y2); if (r.poll() != -1) break; }
+r.wait();
+```
+
+- Drawing methods live on the viewers in `SOPs/`, so the app has them too: `Viewer::points` / `mesh` / `add(controller)`, `GraphViewer::plot` / `set_bounds`. They return the controller that owns the new node: call `update()` / `clear()` on it, or reach the node through `.node`. `GraphViewer::plot` fits the graph to the first curve's data unless `auto_fit` is off.
+- `subplots<Ts...>(rows, cols)` replaces the window's layout; `r.add(viewer, {x, y, w, h})` adds one over a rectangle (fractions, top-left origin). Every tile gets its own `Camera3D`. `GraphViewer`/`PlotterViewer` are framed head-on and set `show_grid = false`; other viewers look down on the infinite grid. Background is black (`set_background`).
+- Nothing owns `main()`: the window only draws and takes input inside `r.poll()` (non-blocking, draws at most every 1/120 s), `r.show()`, `r.wait_key(ms)` (like `cv::waitKey`) and `r.wait()` (until closed). These also drain the main dispatch queue, which is where the controllers' `update()` swaps land. `r.save("x.png")` writes a frame. Everything runs on the main thread.
+- `renderer.mm` ports `drawInMTKView` (viewer/viewport/grid part only, pipelines 3-7 plus the infinite grid) and `MyMetalView`'s mouse/scroll/magnify/arrow-key handlers from `MatrixH.mm`, routing each event to the tile under the cursor with that tile's camera and viewport.
+- CMake copies `SOPs/`, `Mods/Camera3D.h`, `cpu_rasteriser.hpp`, `Shaders.metal` and `DAGShaders.metal` into `debug/` at configure time, and builds `render.metallib` from the two shader files. `libmatrix` and the renderer are built with `-fobjc-arc` to match the app.
+- `renderer.h` includes the SOPs, so they end up in several translation units: every free function or out-of-class member definition in `SOPs/` must be `inline`, or the link fails with duplicate symbols.
