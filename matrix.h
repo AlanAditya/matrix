@@ -247,6 +247,7 @@ inline std::atomic<uint64_t> global_epoch{1};
 class Primitive;
 class StackPrimitive;
 struct ScalarArg;
+struct GpuFunc;
 struct data {
     void *buffer = nullptr;
     id<MTLBuffer> metalBuffer = nil;
@@ -706,6 +707,11 @@ public:
     // first, so `fn` can read their memory on the host. The output has no gradient.
     static matrix host_op(const std::vector<size_m>& shape, dtype type,
                           std::function<void(matrix& out, std::vector<matrix>& ins)> fn,
+                          const std::vector<matrix>& inputs);
+    // A custom Metal kernel (from gpu_func) as a lazy graph node. It's encoded into the pass's
+    // own command buffer like any built-in op: no flush, nothing read on the host. Binding
+    // layout and limits are on GpuFunc. GPU only: running it on the CPU path throws.
+    static matrix host_op(const std::vector<size_m>& shape, dtype type, const GpuFunc& kernel,
                           const std::vector<matrix>& inputs);
     // Tell the graph this node's data changed in place: bumps its version to ++global_epoch
     // (so every consumer's invalidate_pass sees it) and clears `evaluated` (so a generator
@@ -1744,5 +1750,27 @@ struct HostArg {
         return v;
     }
 };
+
+// The grid a gpu_func kernel is dispatched over, one thread per cell (dispatchThreads).
+// Unset axes are 1, so {N} and {W, H} work too.
+struct DispatchGrid {
+    size_m x = 1, y = 1, z = 1;
+};
+
+// A custom Metal kernel for matrix::host_op. Every tensor is bound as a block of 4 slots:
+//     4b + 0: buffer    4b + 1: shape (size_m*)    4b + 2: strides (size_m*, elements)    4b + 3: dims (uint)
+// The output is block 0 and inputs[i] is block i + 1, so at most 6 inputs fit Metal's 31
+// buffer slots. A rank-0 tensor binds shape and strides as {1}. Declare the blocks in the
+// kernel with TENSOR_ARG (ComputeShaders/Utils.h):
+//     kernel void my_kernel(TENSOR_ARG(out, float, 0), TENSOR_ARG(x, const float, 1), uint2 gid [[thread_position_in_grid]])
+//     matrix y = matrix::host_op({H, W}, dtype::Float, gpu_func("my_kernel", {W, H, 1}), {x});
+struct GpuFunc {
+    std::string name;
+    DispatchGrid grid;
+};
+
+// Registers `name`'s compute state (GPUManager::create_custom) and returns the kernel for
+// host_op. Throws if the default Metal library has no such kernel or an axis of `grid` is 0.
+GpuFunc gpu_func(const std::string& name, DispatchGrid grid);
 
 #endif // WORLDOF3D_MATRIX_H

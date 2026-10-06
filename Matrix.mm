@@ -2255,6 +2255,65 @@ matrix matrix::host_op(const std::vector<size_m>& shape, dtype type,
     return output;
 }
 
+GpuFunc gpu_func(const std::string& name, DispatchGrid grid) {
+    if (grid.x == 0 || grid.y == 0 || grid.z == 0) {
+        throw std::invalid_argument("gpu_func: every axis of the dispatch grid of '" + name + "' must be at least 1");
+    }
+    GlobalGPUManager.create_custom(name);
+    return GpuFunc{name, grid};
+}
+
+// Binds `t` as block `block` of a gpu_func kernel: buffer, shape, strides, dims (see GpuFunc).
+static void bind_gpu_func_tensor(id<MTLComputeCommandEncoder> encoder, const matrix& t, NSUInteger block) {
+    const NSUInteger base = 4 * block;
+    setBufferOrBytes(encoder, t, base);
+    uint32_t dims = t.dims;
+    if (dims == 0) {
+        size_m one = 1;
+        [encoder setBytes:&one length:sizeof(size_m) atIndex:base + 1];
+        [encoder setBytes:&one length:sizeof(size_m) atIndex:base + 2];
+    } else {
+        [encoder setBytes:t.shape() length:dims * sizeof(size_m) atIndex:base + 1];
+        [encoder setBytes:t.strides() length:dims * sizeof(size_m) atIndex:base + 2];
+    }
+    [encoder setBytes:&dims length:sizeof(uint32_t) atIndex:base + 3];
+}
+
+matrix matrix::host_op(const std::vector<size_m>& shape, dtype type, const GpuFunc& kernel,
+                       const std::vector<matrix>& inputs) {
+    if (inputs.size() > 6) {
+        throw std::invalid_argument("host_op: gpu_func '" + kernel.name + "' takes at most 6 inputs (4 buffer slots each, 31 in all)");
+    }
+    matrix output((uint32_t)shape.size(), type);
+    memcpy(output.shape(), shape.data(), output.dims * sizeof(size_m));
+    output.calcStrides();
+    output.total_size = output.accumul(0, output.dims);
+
+    auto cpu_fn = [name = kernel.name](matrix&, std::vector<matrix>&) {
+        throw std::runtime_error("host_op: gpu_func '" + name + "' has no CPU path - evaluate it with eval_metal()");
+    };
+    // The inputs' kernels are already encoded on this thread's encoder, which runs dispatches in
+    // order, so this one reads their results without a flush.
+    auto gpu_fn = [kernel](matrix& out, std::vector<matrix>& ins) {
+        id<MTLComputePipelineState> state = GlobalGPUManager.custom_state(kernel.name);
+        id<MTLComputeCommandEncoder> encoder = GlobalGPUManager.getCommandEncoder();
+        [encoder setComputePipelineState:state];
+        bind_gpu_func_tensor(encoder, out, 0);
+        for (size_t i = 0; i < ins.size(); ++i) {
+            bind_gpu_func_tensor(encoder, ins[i], i + 1);
+        }
+
+        const DispatchGrid& g = kernel.grid;
+        NSUInteger max_threads = state.maxTotalThreadsPerThreadgroup;
+        NSUInteger tx = std::min<NSUInteger>(g.x, state.threadExecutionWidth);
+        NSUInteger ty = std::min<NSUInteger>(g.y, std::max<NSUInteger>(1, max_threads / tx));
+        NSUInteger tz = std::min<NSUInteger>(g.z, std::max<NSUInteger>(1, max_threads / (tx * ty)));
+        [encoder dispatchThreads:MTLSizeMake(g.x, g.y, g.z) threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
+    };
+    output.tape = new GeneratorPrimitive(cpu_fn, gpu_fn, inputs);
+    return output;
+}
+
 matrix matrix::leaf_scalar(float value, dtype type) {
     matrix output = matrix::scalar(value, type);  // host memory, refcounted, no tape
     output.make_leaf();

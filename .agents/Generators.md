@@ -173,3 +173,21 @@ A lazy generator can take **inputs**: 1-element matrices whose values it reads w
 
 Verified standalone (`perlin`): constant `ScalarArg`s match the float overload bit for bit; changing a tracked `Float`/`Int32` leaf propagates through a downstream graph on CPU and Metal; a CPU pass followed by a Metal pass after a change; a computed input (`slider * 2`) on Metal; reruns reuse the same buffers with a flat buffer count.
 
+
+## 7. Custom Metal Kernels: `gpu_func` + `host_op`
+
+To put your own kernel in a graph, pass `gpu_func(name, grid)` to `host_op` in place of a lambda:
+
+```cpp
+matrix y = matrix::host_op({H, W}, dtype::Float, gpu_func("my_kernel", {W, H, 1}), {x, slider});
+```
+
+- **In-pass, no flush.** The kernel is encoded on the thread's compute encoder like a built-in op, so it reads the outputs of earlier nodes in the same pass without a commit. The lambda `host_op` is different: it commits and waits first, because its host code reads the inputs' memory.
+- **`gpu_func(name, grid)`** registers the compute state through `GPUManager::create_custom(name)` (it reuses `shaderNameToIndex` / `customComputeShader`, guarded by `customComputeMutex`) and throws if the default library has no `name`, so typos fail when the graph is built. `grid` (`DispatchGrid {x, y, z}`, unset axes 1) is passed to `dispatchThreads` as is, one thread per cell; the threadgroup comes from the pipeline's `threadExecutionWidth` / `maxTotalThreadsPerThreadgroup`.
+- **Binding layout.** Each tensor is a block of 4 slots: buffer, shape (`size_m*`), strides (`size_m*`, in elements), dims (`uint`), at `4b .. 4b+3`. The output is block 0 and input `i` is block `i + 1`, so at most **6 inputs** (Metal has 31 buffer slots); more throws. A rank-0 tensor binds shape and strides `{1}`. Buffers go through `setBufferOrBytes`, so views (slices, transposes) bind at their offset and inputs ≤ 4096 bytes are inlined. Declare blocks with `TENSOR_ARG(name, T, b)` from `ComputeShaders/Utils.h` (`const T` for inputs), which also gives `name_shape`, `name_strides`, `name_dims`; index strided data with `elem_to_loc`.
+- **Slider parameters** are 1-element inputs (`leaf_scalar`) with their own block; `mark_changed()` re-runs the kernel into the same output buffer.
+- **GPU only.** The CPU path throws. `eval()` picks the CPU for outputs of ≤ 10 elements, so evaluate those with `eval_metal()`.
+- The kernel's dtype isn't checked: bind matching types. No gradient (`GeneratorPrimitive`'s zero VJP).
+- Example kernel: `gpu_func_scale` at the bottom of `ComputeShaders/custom_kernels.metal`. (`custom_kernel1..4` above it use the legacy `create_custom(name, MatrixH, MatrixH, size)` layout, which is unchanged.)
+
+Verified standalone (`matrix-sync/debug/tests/scratch_gpu_func.mm.bak`), also under `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`: values on 2D and rank 4, offset slice and transposed inputs, a chain `sin(gpu_func(x + 1, s))` in one pass, a slider change re-runs into the same buffer with a flat refcount and no change doesn't re-run, and the CPU path / unknown name / zero grid axis / 7 inputs throw.

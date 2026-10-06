@@ -7,6 +7,8 @@
 @import Metal;
 #include <string>
 #include <utility>
+#include <mutex>
+#include <stdexcept>
 
 //@import std_string;
 @import Utils;
@@ -218,8 +220,11 @@ public:
 
     NSMutableDictionary<NSString*, NSNumber*>* shaderNameToIndex;
     NSMutableArray<id<MTLComputePipelineState>>* customComputeShader;
-    
-    
+    // Guards the two containers above: gpu_func kernels are registered and looked up from
+    // whichever thread builds or runs the graph.
+    std::mutex customComputeMutex;
+
+
     GPUManager() {
         customComputeShader = [[NSMutableArray alloc] init];
         shaderNameToIndex = [[NSMutableDictionary alloc] init];
@@ -451,7 +456,37 @@ public:
     
     id<MTLComputePipelineState> DerivativeAll;
     bool DerivativeAllInit = false;
-    
+
+    // Makes sure kernel `name` has a compute state: if it's already in shaderNameToIndex it does
+    // nothing, otherwise it builds the state and stores it in customComputeShader. Throws if the
+    // default library has no such function, so a gpu_func typo fails when the graph is built.
+    void create_custom(const std::string& name) {
+        NSString* shaderName = [NSString stringWithUTF8String:name.c_str()];
+        std::lock_guard<std::mutex> lock(customComputeMutex);
+        if (shaderNameToIndex[shaderName] != nil) return;
+
+        id<MTLFunction> kernelFunction = [library newFunctionWithName:shaderName];
+        if (!kernelFunction) {
+            throw std::runtime_error("create_custom: no kernel '" + name + "' in the default Metal library");
+        }
+        NSError* error = nil;
+        id<MTLComputePipelineState> pipelineState = [metalDevice newComputePipelineStateWithFunction:kernelFunction error:&error];
+        if (!pipelineState) {
+            throw std::runtime_error("create_custom: failed to build the pipeline for '" + name + "': " +
+                                     (error ? error.localizedDescription.UTF8String : "unknown error"));
+        }
+        [customComputeShader addObject:pipelineState];
+        shaderNameToIndex[shaderName] = @([customComputeShader count] - 1);
+    }
+
+    // The compute state create_custom(name) registered, or nil if it never was.
+    id<MTLComputePipelineState> custom_state(const std::string& name) {
+        NSString* shaderName = [NSString stringWithUTF8String:name.c_str()];
+        std::lock_guard<std::mutex> lock(customComputeMutex);
+        NSNumber* indexNum = shaderNameToIndex[shaderName];
+        return indexNum ? customComputeShader[[indexNum unsignedIntegerValue]] : nil;
+    }
+
     template<int dims, typename Type>
     std::pair<id<MTLCommandBuffer>, id<MTLComputeCommandEncoder>> create_custom(std::string name, MatrixH<dims, Type> output, MatrixH<dims, Type> inp, size_t ExecutionSize) {
         NSString* shaderName = [NSString stringWithUTF8String:name.c_str()];

@@ -325,3 +325,12 @@ kernel void custom_kernel4(device uint8_t* outMat [[buffer(0)]], device const ui
     outMat[yIndex * stridesOut[0] + xIndex * stridesOut[1] + 2] = uint8_t(o.x * 255.0f);
     outMat[yIndex * stridesOut[0] + xIndex * stridesOut[1] + 3] = uint8_t(255);
 }
+
+// gpu_func example: out = x * s, any rank and any strides (views included), s a 1-element input
+// such as a slider's leaf_scalar. Dispatch one thread per element:
+//     matrix::host_op(shape, dtype::Float, gpu_func("gpu_func_scale", {out_total_size}), {x, s})
+kernel void gpu_func_scale(TENSOR_ARG(out, float, 0), TENSOR_ARG(x, const float, 1), TENSOR_ARG(s, const float, 2),
+                           uint gid [[thread_position_in_grid]]) {
+    out[elem_to_loc<int64_t>(gid, out_shape, out_strides, out_dims)] =
+        x[elem_to_loc<int64_t>(gid, x_shape, x_strides, x_dims)] * s[0];
+}
