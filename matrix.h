@@ -1576,6 +1576,16 @@ public:
     // straight into other tensors). No gradient. See .agents/MatrixAPI.md.
     static matrix equal(const matrix& a, const matrix& b);
     static void equal_backend(matrix& output, ExecutionDevice exec_device);
+    // Broadcasted elementwise binomial coefficient nCr ("n choose r") in the promoted dtype.
+    // Inputs are truncated to integers; r < 0, n < 0 or r > n give 0. Integer dtypes are exact
+    // and saturate at the dtype's max; Float/Float16 use the multiplicative formula in float
+    // (exact while the products stay below 2^24). No gradient. See .agents/MatrixAPI.md.
+    static matrix C(const matrix& n, const matrix& r);
+    template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+    static matrix C(const matrix& n, T r) { return C(n, matrix::scalar(r, n.type)); }
+    template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+    static matrix C(T n, const matrix& r) { return C(matrix::scalar(n, r.type), r); }
+    static void C_backend(matrix& output, ExecutionDevice exec_device);
     static matrix min(const matrix& a, const matrix& b);
     void min(const matrix& other, matrix& output, ExecutionDevice exec_device) const;
 

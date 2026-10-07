@@ -2103,6 +2103,138 @@ public:
     matrix& input_at(uint32_t i) override { return i == 0 ? a : b; }
 };
 
+// matrix::C(n, r): broadcasted elementwise binomial coefficient nCr. See matrix::C_backend.
+class CombinationPrimitive : public Primitive {
+public:
+    matrix n;
+    matrix r;
+    BroadcastDescriptor* desc_n = nullptr;
+    BroadcastDescriptor* desc_r = nullptr;
+    CollapsedDims_3 collapsed_dims_3;       // stridesA = n, stridesB = r, stridesC = result
+    std::vector<size_m> out_shape;          // for the (zero) tangent in jvp
+
+    CombinationPrimitive(const matrix& n, const matrix& r) : n(ensure_graph_ready(n)), r(ensure_graph_ready(r)) {}
+    ~CombinationPrimitive() {
+        if (desc_n) BroadcastDescriptor::destroy(desc_n);
+        if (desc_r) BroadcastDescriptor::destroy(desc_r);
+    }
+
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (n.tape && !n.tape->evaluated) { n.tape->eval_cpu(n, eval_type); }
+        if (r.tape && !r.tape->evaluated) { r.tape->eval_cpu(r, eval_type); }
+        n.update_from_trace();
+        r.update_from_trace();
+
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) {return;} else {evaluated = true;}
+
+        matrix::C_backend(out, ExecutionDevice::CPU);
+    }
+
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (n.tape && !n.tape->evaluated) { n.tape->eval_metal(n, eval_type); n.update_from_trace(); } else {
+            n.update_from_trace();
+            ensure_metal_buffer(n);
+        }
+        if (r.tape && !r.tape->evaluated) { r.tape->eval_metal(r, eval_type); r.update_from_trace(); } else {
+            r.update_from_trace();
+            ensure_metal_buffer(r);
+        }
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                out.begin_refcount();
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is n no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) {return;} else { evaluated = true; }
+
+        matrix::C_backend(out, ExecutionDevice::METAL);
+    }
+
+    // nCr is only defined on integers (inputs are truncated), so it is piecewise constant:
+    // zero gradient to both inputs, like equal.
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        std::vector<size_m> n_shape(n.shape(), n.shape() + n.dims);
+        std::vector<size_m> r_shape(r.shape(), r.shape() + r.dims);
+        return {matrix::zeros(n_shape, n.type), matrix::zeros(r_shape, r.type)};
+    }
+    matrix jvp(std::vector<matrix>& tangents) override {
+        return matrix::zeros(out_shape, n.type);
+    }
+
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (n.tape) {
+            if (n.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (n.tape->version > this->version) inv = true;
+            new_version = std::max(n.tape->version, new_version);
+        }
+        if (r.tape) {
+            if (r.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (r.tape->version > this->version) inv = true;
+            new_version = std::max(r.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (n.tape) { n.tape->clear_trace_checks(); }
+        if (r.tape) { r.tape->clear_trace_checks(); }
+    }
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {n, r}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? n : r; }
+};
+
 class MaxPrimitive : public Primitive {
 public:
     matrix a;

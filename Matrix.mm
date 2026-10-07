@@ -12542,6 +12542,131 @@ void matrix::equal_backend(matrix& output, ExecutionDevice exec_device) {
     }
 }
 
+matrix matrix::C(const matrix& n, const matrix& r) {
+    dtype res_type = promote_types(n.type, r.type);
+    matrix lhs = (n.type != res_type) ? n.astype(res_type) : n;
+    matrix rhs = (r.type != res_type) ? r.astype(res_type) : r;
+
+    matrix result(std::max(lhs.dims, rhs.dims), res_type);
+    auto primit = new CombinationPrimitive(lhs, rhs);
+    primit->desc_n = BroadcastDescriptor::create(result.dims);
+    primit->desc_r = BroadcastDescriptor::create(result.dims);
+    broadcast_shapes(lhs.array_desc, rhs.array_desc, result.array_desc,
+                     primit->desc_n, primit->desc_r, lhs.dims, rhs.dims);
+    primit->collapsed_dims_3 = collapse_dims(primit->desc_n->shape(), primit->desc_n->strides(result.dims), primit->desc_r->strides(result.dims), result.strides(), result.dims, INT32_MAX);
+    primit->out_shape.assign(result.shape(), result.shape() + result.dims);
+    result.total_size = result.accumul(0, result.dims);
+    result.tape = primit;
+    return result;
+}
+
+// nCr for the integer dtypes, exact in 64 bits. Each step is r = r * (n - k + i) / i, which stays
+// an integer (it is C(n - k + i, i)); dividing out g = gcd(r, i) first keeps the product from
+// overflowing before the answer does. Returns UINT64_MAX on overflow. Combination.metal does the
+// same in 32 bits.
+static uint64_t comb_u64(int64_t n, int64_t k) {
+    if (n < 0 || k < 0 || k > n) return 0;
+    k = std::min(k, n - k);
+    uint64_t r = 1;
+    for (int64_t i = 1; i <= k; i++) {
+        uint64_t g = std::gcd(r, (uint64_t)i);
+        uint64_t a = r / g, b = (uint64_t)(n - k + i) / ((uint64_t)i / g);
+        if (b != 0 && a > UINT64_MAX / b) return UINT64_MAX;
+        r = a * b;
+    }
+    return r;
+}
+
+// nCr for Float/Float16, in float. Every step's value is an integer, so it is rounded back to one,
+// which keeps the result exact while the products stay below 2^24 (and the Metal path, whose
+// division is not correctly rounded, in step). Same as comb_f32 in ComputeShaders/Combination.metal.
+static float comb_f32(float n, float k) {
+    n = std::trunc(n);
+    k = std::trunc(k);
+    if (n < 0 || k < 0 || k > n) return 0.0f;
+    k = std::min(k, n - k);
+    float r = 1.0f;
+    for (float i = 1.0f; i <= k && !std::isinf(r); i += 1.0f) r = std::rint(r * (n - k + i) / i);
+    return r;
+}
+
+void matrix::C_backend(matrix& output, ExecutionDevice exec_device) {
+    CombinationPrimitive* primit = static_cast<CombinationPrimitive*>(output.tape);
+    const matrix& n = primit->n;
+    const matrix& r = primit->r;
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = output.total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+
+    // Both-scalar inputs collapse to rank 0: run it as one element in 1D.
+    CollapsedDims_3 res = primit->collapsed_dims_3;
+    if (res.out_dims == 0) {
+        res.out_dims = 1;
+        res.shape[0] = 1;
+        res.stridesA[0] = res.stridesB[0] = res.stridesC[0] = 0;
+    }
+    uint32_t cdims = res.out_dims;
+    if (output.total_size == 0) return;
+
+    if (exec_device == ExecutionDevice::METAL) {
+        int typeCode = (int)output.type;
+        int kernelCode = cdims > 3 ? 3 : cdims - 1;
+        if (!GlobalGPUManager.CombinationInit[typeCode][kernelCode]) {
+            GlobalGPUManager.initCombination(typeCode, kernelCode);
+        }
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+        [commandEncoder setComputePipelineState:GlobalGPUManager.CombinationComputeState[typeCode][kernelCode]];
+
+        setBufferOrBytes(commandEncoder, output, 0);
+        setBufferOrBytes(commandEncoder, n, 1);
+        setBufferOrBytes(commandEncoder, r, 2);
+        [commandEncoder setBytes:res.stridesC length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:5];
+
+        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
+        MTLSize _dispatchExecutionSize;
+        if (cdims == 1) {
+            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+        } else if (cdims == 2) {
+            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        } else if (cdims == 3) {
+            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        } else {
+            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:6];
+            int ndims = cdims;
+            [commandEncoder setBytes:&ndims length:sizeof(int) atIndex:7];
+            size_m acc = 1;
+            for (uint32_t i = 0; i < cdims - 2; i++) { acc *= res.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
+        }
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    } else {
+        dispatch_type(output.type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+            const T* n_data = (const T*)n.buffer;
+            const T* r_data = (const T*)r.buffer;
+            for (size_t gid = 0; gid < output.total_size; gid++) {
+                size_m rem = gid;
+                size_t ni = 0, ri = 0, oi = 0;
+                for (int d = cdims - 1; d >= 0; --d) {
+                    size_m idx = rem % res.shape[d];
+                    ni += idx * res.stridesA[d];
+                    ri += idx * res.stridesB[d];
+                    oi += idx * res.stridesC[d];
+                    rem /= res.shape[d];
+                }
+                if constexpr (std::is_same_v<T, float> || std::is_same_v<T, float16_t>) {
+                    out_data[oi] = (T)comb_f32((float)n_data[ni], (float)r_data[ri]);
+                } else {
+                    uint64_t v = comb_u64((int64_t)n_data[ni], (int64_t)r_data[ri]);
+                    out_data[oi] = v > (uint64_t)std::numeric_limits<T>::max() ? std::numeric_limits<T>::max() : (T)v;
+                }
+            }
+        });
+    }
+}
+
 matrix matrix::min(const matrix& a, const matrix& b) {
     dtype res_type = promote_types(a.type, b.type);
     matrix result(std::max(a.dims, b.dims), res_type);
