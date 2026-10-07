@@ -5431,54 +5431,62 @@ void matrix::abs(matrix& output, ExecutionDevice exec_device) {
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
     } else {
         // CPU fallback mapping
-//        dispatch_type(type, output.buffer, [&](auto *out_data) {
-//            using T = std::decay_t<decltype(*out_data)>;
-//                T* in_data = (T*)buffer;
-//                if (cdims == 1) {
-//                    size_m out_stride = res.stridesA[0];
-//                    size_m in_stride = res.stridesB[0];
-//                    for (size_m i = 0; i < res.shape[0]; i++) {
-//                        out_data[i * out_stride] = std::abs(in_data[i * in_stride]);
-//                    }
-//                } else if (cdims == 2) {
-//                    size_m out_stride0 = res.stridesA[0];
-//                    size_m out_stride1 = res.stridesA[1];
-//                    size_m in_stride0 = res.stridesB[0];
-//                    size_m in_stride1 = res.stridesB[1];
-//                    for (size_m i = 0; i < res.shape[0]; i++) {
-//                        for (size_m j = 0; j < res.shape[1]; j++) {
-//                            out_data[i * out_stride0 + j * out_stride1] = std::abs(in_data[i * in_stride0 + j * in_stride1]);
-//                        }
-//                    }
-//                } else if (cdims == 3) {
-//                    size_m out_stride0 = res.stridesA[0];
-//                    size_m out_stride1 = res.stridesA[1];
-//                    size_m out_stride2 = res.stridesA[2];
-//                    size_m in_stride0 = res.stridesB[0];
-//                    size_m in_stride1 = res.stridesB[1];
-//                    size_m in_stride2 = res.stridesB[2];
-//                    for (size_m i = 0; i < res.shape[0]; i++) {
-//                        for (size_m j = 0; j < res.shape[1]; j++) {
-//                            for (size_m k = 0; k < res.shape[2]; k++) {
-//                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = std::abs(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
-//                            }
-//                        }
-//                    }
-//                } else {
-//                    for (size_m gid = 0; gid < total_size; gid++) {
-//                        size_m src_idx = 0;
-//                        size_m dst_idx = 0;
-//                        size_m rem = gid;
-//                        for (int i = cdims - 1; i >= 0; i--) {
-//                            size_m idx = rem % res.shape[i];
-//                            src_idx += idx * res.stridesB[i];
-//                            dst_idx += idx * res.stridesA[i];
-//                            rem /= res.shape[i];
-//                        }
-//                        out_data[dst_idx] = std::abs(in_data[src_idx]);
-//                    }
-//                }
-//        });
+        dispatch_type(type, output.buffer, [&](auto *out_data) {
+            using T = std::decay_t<decltype(*out_data)>;
+                // Not std::abs: it's ambiguous for uint32_t, and dispatch_type instantiates every dtype
+                // (matrix::abs returns unsigned inputs as-is, so they never get here).
+                auto abs_of = [](T v) -> T {
+                    if constexpr (std::is_unsigned_v<T>) return v;
+                    else return v < T(0) ? T(-v) : v;
+                };
+                T* in_data = (T*)buffer;
+                if (cdims == 0) {
+                    out_data[0] = abs_of(in_data[0]);
+                } else if (cdims == 1) {
+                    size_m out_stride = res.stridesA[0];
+                    size_m in_stride = res.stridesB[0];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        out_data[i * out_stride] = abs_of(in_data[i * in_stride]);
+                    }
+                } else if (cdims == 2) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            out_data[i * out_stride0 + j * out_stride1] = abs_of(in_data[i * in_stride0 + j * in_stride1]);
+                        }
+                    }
+                } else if (cdims == 3) {
+                    size_m out_stride0 = res.stridesA[0];
+                    size_m out_stride1 = res.stridesA[1];
+                    size_m out_stride2 = res.stridesA[2];
+                    size_m in_stride0 = res.stridesB[0];
+                    size_m in_stride1 = res.stridesB[1];
+                    size_m in_stride2 = res.stridesB[2];
+                    for (size_m i = 0; i < res.shape[0]; i++) {
+                        for (size_m j = 0; j < res.shape[1]; j++) {
+                            for (size_m k = 0; k < res.shape[2]; k++) {
+                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = abs_of(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
+                            }
+                        }
+                    }
+                } else {
+                    for (size_m gid = 0; gid < total_size; gid++) {
+                        size_m src_idx = 0;
+                        size_m dst_idx = 0;
+                        size_m rem = gid;
+                        for (int i = cdims - 1; i >= 0; i--) {
+                            size_m idx = rem % res.shape[i];
+                            src_idx += idx * res.stridesB[i];
+                            dst_idx += idx * res.stridesA[i];
+                            rem /= res.shape[i];
+                        }
+                        out_data[dst_idx] = abs_of(in_data[src_idx]);
+                    }
+                }
+        });
     }
 }
 

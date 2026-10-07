@@ -53,4 +53,5 @@ template <typename T>
 INSTANTIATE_ABS(0, float)
 INSTANTIATE_ABS(1, half)
 INSTANTIATE_ABS(3, int)
+INSTANTIATE_ABS(4, short)
 
