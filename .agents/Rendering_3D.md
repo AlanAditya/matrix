@@ -92,7 +92,7 @@ The `Viewer` ([SOPs/Viewer.cpp](../SOPs/Viewer.cpp)) is responsible for traversi
 | `pipeline_state` | Meaning | Shader | Draw call |
 |---|---|---|---|
 | 3 | SOA Mesh (default) | `DAGNodeVertexShader` / `DAGNodeFragmentShader` ([Shaders.metal](../Shaders.metal)) | `drawIndexedPrimitives` (triangles, uses `mesh.indices`) |
-| 4 | SOA Thick Line | `vertex_line3d` / `fragment_line3d` ([DAGShaders.metal](../DAGShaders.metal)) | `drawPrimitives` triangle-strip, `pointCount * 2` verts (camera-facing billboarded line, width from `material.line_width`) |
+| 4 | SOA Thick Line | `vertex_line3d` / `fragment_line3d` ([DAGShaders.metal](../DAGShaders.metal)) | `drawPrimitives` triangles, `pointCount * 12` verts: a quad per segment (6), then a disc per point (6, trimmed to a circle in the fragment shader). A pipe's outline: constant screen width from `material.line_width`, each segment extruded in the screen plane across its on-screen direction, and the discs round every joint and both ends |
 | 5 | SOA Point Cloud | `vertex_dag_pointcloud` / `fragment_dag_pointcloud` | `drawPrimitives` point list |
 | 6 | SOA Edge Topology | `vertex_edge3d` / `fragment_edge3d` | `drawPrimitives` triangles, `num_edges * 6` verts, reads `node->topology.edges` as a second buffer — used for wireframe/edge overlays that need constant screen-space width |
 
