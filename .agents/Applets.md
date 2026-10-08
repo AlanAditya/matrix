@@ -55,6 +55,7 @@ The old SwiftUI `ControlPanel` over `UIComponent`s is commented out in `3D_Edito
 - Buttons: push buttons (macOS), Liquid Glass buttons on iOS 26 (tinted before).
 - Toggles: `NSSwitch` / `UISwitch`.
 - `setValue:forSliderTitled:` moves a slider without calling its `onChange` (used by `SliderGroup::set`).
+- Readouts: `addReadoutWithTitle:value:` adds a read-only row (title left, value right in monospaced digits) for live metrics; `setText:forReadoutTitled:` updates it from any thread (titles must be unique). Not wrapped by `SliderGroup`: call `self.appletPanel` directly (`kitti_replay`'s memory / accuracy panel).
 - Every method is safe from any thread (UI work hops to main); callbacks arrive on main.
 
 ### iOS panel modes (`3D_Editor.swift`)
@@ -84,6 +85,7 @@ A small Liquid Glass capsule at the **bottom right of the renderer** (a thin mat
 - Adding is safe from any thread; callbacks run on **main**, the thread the renderer draws on, so they can write `pRender` state (`renderInfiniteGrid`, `cam`) directly.
 - Defaults added in `init` (`addDefaultToolbarItems`), present for every applet: an **Infinite Grid** toggle (`pRender->renderInfiniteGrid`) and a **"..." Camera** menu (Top / Front / Right via `Camera3D::setViewDirection`, which keeps the orbit distance: Front = -z, the side the camera starts on; Right = +x; Top = +y). Applets append after them; `removeAll` clears the defaults too.
 - An applet that writes `renderInfiniteGrid` itself (e.g. `particle_sim`) leaves the toggle's highlight out of date.
+- **Legend**: `[self.appletToolbar setLegend:@[...]]` shows a translucent card right above the capsule saying what each colour means: `AppletLegendEntry` sections, filled swatches (surfaces / points), outlined swatches (wireframe boxes) and notes. Colours are the renderer's linear values (the swatch matches the scene). One call replaces the whole legend; nil / empty hides it; `removeAll` clears it. The card doesn't take clicks (drags reach the renderer). `kitti_replay` rebuilds it when By class or a box / car toggle changes.
 
 ## 5. Renderer hand-off helpers (`SOPs/Controllers.cpp`)
 - `PointCloudController::update(points, colours)` / `clear()`: swapped in on the main thread. `clear()` swaps in a truly empty mesh (no buffer, no Metal wrapper). Don't hide by sending a 0-point cloud through `update()`: that creates a zero-length Metal buffer.
