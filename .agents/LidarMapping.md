@@ -22,6 +22,7 @@ LiDAR scan (x forward, y left, z up, metres)                 kitti::Sequence (AI
   -> class per point (20 SemanticKITTI classes -> 3 groups)  ai::labels_for_points, kitti::group_of
   -> foveated 2.5D grid (heights + class per cell)           foveated::Grid (AI/FoveatedGrid.h)
   -> tiles for the renderer                                  foveated::tiles -> TriangleMeshController
+  -> a box per car: BEV clustering + L-shape fit             bbox::fit_boxes (AI/BoundingBoxes.h) -> WireBoxController
 ```
 
 | Piece | Status |
@@ -31,6 +32,9 @@ LiDAR scan (x forward, y left, z up, metres)                 kitti::Sequence (AI
 | Foveated 2.5D grid | done |
 | Replay dashboard (`kitti_replay`) | done (accuracy/timing to the console) |
 | Benchmark (`tools/salsanext/benchmark_kitti.cpp`) | done |
+| Car bounding boxes (`AI/BoundingBoxes.h`: 0.3 m BEV 8-connected clustering + L-shape closeness fit, <1 ms/scan). On predictions: pixel owners only (`ai::owns_pixel`: points that lost their range-image pixel inherit the front point's label, which made ghost cars behind real ones) + mean car probability >= 0.9 + width >= 0.3 m. Seq 08, every 5th of 500 scans: precision 46% -> 96.5%, GT cars (>= 30 pts) found 96% -> 92% | done |
+| Pedestrian boxes (class 6: 0.2 m cells, >= 8 points, no min width; GT labels find every person with >= 10 points, SalsaNext's ~75% precision / ~54% recall: network-limited, 71% of person points labelled person) | done |
+| Speed per box (`AI/Tracking.h`: world frame via poses, 1.5 s least-squares fit; parked cars 90% < 1.0 m/s, moving 9.7-10.4 m/s; standing people 90% < 0.35 m/s) | done |
 | KNN post-processing (SalsaNext's optional edge clean-up) | not done |
 | Moving vs parked (ego-motion from poses + tracking) | not done (`FoveaCluster.h` has a tracker without ego-motion) |
 | Grid accumulated over time, free space by ray casting, costmap, Hybrid A* | not done (deck's Phase 3) |
