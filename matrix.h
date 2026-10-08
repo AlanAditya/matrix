@@ -958,6 +958,21 @@ public:
     matrix operator[](AxisRange range);
     matrix operator[](AxisRange range1, AxisRange range2);
     matrix operator[](AxisRange range1, AxisRange range2, AxisRange range3);
+    matrix operator[](const matrix& idx, int axis = 0);
+    
+    // Compound assignment on lvalues
+    matrix& operator+=(const matrix& other) &;
+    matrix& operator-=(const matrix& other) &;
+    matrix& operator*=(const matrix& other) &;
+    matrix& operator/=(const matrix& other) &;
+
+    // Compound assignment on temporaries
+    void operator+=(const matrix& other) &&;
+    void operator-=(const matrix& other) &&;
+    void operator*=(const matrix& other) &&;
+
+    // Copy assignment
+    void operator=(const matrix& other) &&;
     
     void CopyToTexture(id<MTLTexture> texture,
                        Execution exec = Execution::EncodeAndExecute);
@@ -1689,8 +1704,8 @@ public:
     
     matrix(const matrix &other);
     matrix(matrix &&other) noexcept;
-    matrix &operator=(matrix &&other);
-    matrix &operator=(const matrix &other);
+    matrix &operator=(matrix &&other) &;
+    matrix &operator=(const matrix &other) &;
     
     ~matrix();
 };

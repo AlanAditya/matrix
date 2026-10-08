@@ -5492,6 +5492,7 @@ public:
     matrix source;
     matrix indices;
     int axis;
+    matrix* scatter_handle = nullptr;
 
     TakePrimitive(const matrix& source_in, const matrix& indices_in, int axis_in)
         : source(source_in), indices(indices_in), axis(axis_in) {}

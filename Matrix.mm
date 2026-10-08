@@ -3083,6 +3083,84 @@ matrix matrix::operator[](AxisRange range1, AxisRange range2) {
 matrix matrix::operator[](AxisRange range1, AxisRange range2, AxisRange range3) {
     return slice({range1, range2, range3});
 }
+matrix matrix::operator[](const matrix& idx, int axis) {
+    if (axis < 0)
+        axis += this->dims;
+    matrix output = this->take(idx, axis);
+    TakePrimitive* prim = static_cast<TakePrimitive*>(output.tape);
+    prim->scatter_handle = this;
+    return output;
+}
+
+matrix& matrix::operator+=(const matrix& other) & {
+    *this = *this + other;
+    return *this;
+}
+
+matrix& matrix::operator-=(const matrix& other) & {
+    *this = *this - other;
+    return *this;
+}
+
+matrix& matrix::operator*=(const matrix& other) & {
+    *this = *this * other;
+    return *this;
+}
+
+matrix& matrix::operator/=(const matrix& other) & {
+    *this = *this / other;
+    return *this;
+}
+
+void matrix::operator+=(const matrix& other) && {
+    if (this->tape && typeid(*this->tape) == typeid(TakePrimitive)) {
+        TakePrimitive* prim = static_cast<TakePrimitive*>(this->tape);
+        if (!prim->scatter_handle) return;
+        *prim->scatter_handle = matrix::scatter(prim->source, prim->indices, other, prim->axis, ScatterMode::ADD);
+        return;
+    }
+
+    return;
+}
+
+void matrix::operator-=(const matrix& other) && {
+    if (this->tape && typeid(*this->tape) == typeid(TakePrimitive)) {
+        TakePrimitive* prim = static_cast<TakePrimitive*>(this->tape);
+        if (!prim->scatter_handle) return;
+        *prim->scatter_handle = matrix::scatter(prim->source, prim->indices, -1 * other, prim->axis, ScatterMode::ADD);
+        return;
+    }
+
+    return;
+}
+
+void matrix::operator*=(const matrix& other) && {
+    if (this->tape && typeid(*this->tape) == typeid(TakePrimitive)) {
+        TakePrimitive* prim = static_cast<TakePrimitive*>(this->tape);
+        if (!prim->scatter_handle) return;
+        *prim->scatter_handle = matrix::scatter(prim->source, prim->indices, other, prim->axis, ScatterMode::PROD);
+        return;
+    }
+
+    return;
+}
+
+
+// copy assignment on temporaries
+void matrix::operator=(const matrix& other) && {
+    if (this->tape && typeid(*this->tape) == typeid(TakePrimitive)) {
+        TakePrimitive* prim = static_cast<TakePrimitive*>(this->tape);
+        if (!prim->scatter_handle) return;
+        *prim->scatter_handle = matrix::scatter(prim->source, prim->indices, other, prim->axis, ScatterMode::SET);
+        return;
+    }
+    
+    //legacy path for slice we do inplace modifications to call the operator= for &
+    *this = other;
+
+    return;
+}
+
 
 //matrix matrix::operator[](int i, int j) const {
 //#ifdef SAFE_MODE
@@ -7866,7 +7944,7 @@ matrix::matrix(matrix &&other) noexcept {
     other.metalBuffer = nil;
 }
 
-matrix &matrix::operator=(matrix &&other) {
+matrix &matrix::operator=(matrix &&other) & {
     if (&other == this) {
         return *this;
     }
@@ -7911,7 +7989,7 @@ matrix &matrix::operator=(matrix &&other) {
 }
 
 // copy assignment
-matrix &matrix::operator=(const matrix &other) {
+matrix &matrix::operator=(const matrix &other) & {
 
     if (this == &other) {
         return *this;
