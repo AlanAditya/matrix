@@ -185,11 +185,11 @@ public:
     bool Concat_2M[4];
     id<MTLComputePipelineState> Concat_2M_ComputeState[4];
     
-    bool CopyInplace[6][6][6];
-    id<MTLComputePipelineState> CopyInplace_ComputeState[6][6][6];
+    bool CopyInplace[7][7][4];   // [dst dtype][src dtype][dim specialisation]
+    id<MTLComputePipelineState> CopyInplace_ComputeState[7][7][4];
     
-    bool PaddingInit[6][4];
-    id<MTLComputePipelineState> Padding_ComputeState[6][4];
+    bool PaddingInit[7][4];
+    id<MTLComputePipelineState> Padding_ComputeState[7][4];
     
     // LEGACY: PCG-based RNG (ComputeShaders/Random.metal). Superseded by the
     // Threefry-based kernels below. Kept for this iteration only - phase out next.
@@ -330,14 +330,14 @@ public:
         for (int i = 0; i < 4; i++) {
             Concat_2M[i] = false;
         }
-        for (int i = 0; i < 6; i++) {
-            for (int j = 0; j < 6; j++) {
-                for (int k = 0; k < 6; k++) {
+        for (int i = 0; i < 7; i++) {
+            for (int j = 0; j < 7; j++) {
+                for (int k = 0; k < 4; k++) {
                     CopyInplace[i][j][k] = false;
                 }
             }
         }
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < 7; i++) {
             for (int k = 0; k < 4; k++) {
                 PaddingInit[i][k] = false;
             }
