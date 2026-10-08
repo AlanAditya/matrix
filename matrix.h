@@ -16,6 +16,8 @@
 #include <arm_neon.h>
 #include <atomic>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 #include <iomanip>
 #include <sstream>
 #include <type_traits>
@@ -1697,26 +1699,68 @@ matrix operator-(const matrix &a, const matrix &b);
 matrix operator*(const matrix &a, const matrix &b);
 matrix operator/(const matrix &a, const matrix &b);
 
+// The dtype a C++ scalar takes next to a matrix of dtype m (MLX's "weak" Python scalars): it
+// adopts m's dtype, so uint8 * 2 stays uint8 and half * 0.5f stays Float16. Unlike a plain cast,
+// it never loses the value:
+//   - a float scalar next to an integer matrix is Float (int32 * 0.5f is Float, not * 0), as MLX;
+//   - an int that doesn't fit m (-1 or 300 next to uint8, 70000 next to int16) takes the
+//     narrowest of Int32 / UInt32 that holds it, and promote_types settles the result. MLX
+//     throws here instead; we only throw when nothing fits (there are no 64-bit dtypes);
+//   - a scalar beyond Float16's range (+-65504) next to Float16 is Float, not inf.
+template <typename T>
+inline bool scalar_fits(T v, int64_t lo, int64_t hi) {
+    if constexpr (std::is_floating_point_v<T>) return v >= (T)lo && v <= (T)hi;
+    else if constexpr (std::is_signed_v<T>) return (int64_t)v >= lo && (int64_t)v <= hi;
+    else return (uint64_t)v <= (uint64_t)hi;   // lo <= 0 for every dtype
+}
+
+template <typename T>
+inline dtype scalar_operand_type(T scalar, dtype m) {
+    static_assert(std::is_arithmetic_v<T>, "matrix op with a non-arithmetic scalar");
+    if (m == dtype::Float) return m;
+    if (m == dtype::Float16) return scalar_fits(scalar, -65504, 65504) ? m : dtype::Float;
+    if constexpr (std::is_floating_point_v<T>) {
+        return dtype::Float;
+    } else {
+        auto fits = [&](dtype d) {
+            switch (d) {
+                case dtype::UInt8:  return scalar_fits(scalar, 0, UINT8_MAX);
+                case dtype::UInt16: return scalar_fits(scalar, 0, UINT16_MAX);
+                case dtype::UInt32: return scalar_fits(scalar, 0, UINT32_MAX);
+                case dtype::Int16:  return scalar_fits(scalar, INT16_MIN, INT16_MAX);
+                case dtype::Int32:  return scalar_fits(scalar, INT32_MIN, INT32_MAX);
+                default:            return false;
+            }
+        };
+        if (fits(m)) return m;
+        if (fits(dtype::Int32)) return dtype::Int32;
+        // Too big for Int32 but not negative: UInt32 keeps it, unless m is signed (Int32 wins the promotion and would wrap it).
+        bool m_unsigned = m == dtype::UInt8 || m == dtype::UInt16 || m == dtype::UInt32;
+        if (m_unsigned && fits(dtype::UInt32)) return dtype::UInt32;
+        throw std::overflow_error("matrix op: scalar " + std::to_string(scalar) + " doesn't fit any dtype it could promote to");
+    }
+}
+
 // matrix + scalar, scalar + matrix
 template <typename T>
-matrix operator+(const matrix& m, T scalar) { return m + matrix::scalar(scalar, m.type); }
+matrix operator+(const matrix& m, T scalar) { return m + matrix::scalar(scalar, scalar_operand_type(scalar, m.type)); }
 template <typename T>
-matrix operator+(T scalar, const matrix& m) { return matrix::scalar(scalar, m.type) + m; }
+matrix operator+(T scalar, const matrix& m) { return matrix::scalar(scalar, scalar_operand_type(scalar, m.type)) + m; }
 // matrix - scalar, scalar - matrix
 template <typename T>
-matrix operator-(const matrix& m, T scalar) { return m - matrix::scalar(scalar, m.type); }
+matrix operator-(const matrix& m, T scalar) { return m - matrix::scalar(scalar, scalar_operand_type(scalar, m.type)); }
 template <typename T>
-matrix operator-(T scalar, const matrix& m) { return matrix::scalar(scalar, m.type) - m; }
+matrix operator-(T scalar, const matrix& m) { return matrix::scalar(scalar, scalar_operand_type(scalar, m.type)) - m; }
 // matrix * scalar, scalar * matrix
 template <typename T>
-matrix operator*(const matrix& m, T scalar) { return m * matrix::scalar(scalar, m.type); }
+matrix operator*(const matrix& m, T scalar) { return m * matrix::scalar(scalar, scalar_operand_type(scalar, m.type)); }
 template <typename T>
-matrix operator*(T scalar, const matrix& m) { return matrix::scalar(scalar, m.type) * m; }
+matrix operator*(T scalar, const matrix& m) { return matrix::scalar(scalar, scalar_operand_type(scalar, m.type)) * m; }
 // matrix / scalar, scalar / matrix
 template <typename T>
-matrix operator/(const matrix& m, T scalar) { return m / matrix::scalar(scalar, m.type); }
+matrix operator/(const matrix& m, T scalar) { return m / matrix::scalar(scalar, scalar_operand_type(scalar, m.type)); }
 template <typename T>
-matrix operator/(T scalar, const matrix& m) { return matrix::scalar(scalar, m.type) / m; }
+matrix operator/(T scalar, const matrix& m) { return matrix::scalar(scalar, scalar_operand_type(scalar, m.type)) / m; }
 
 bool compare_shapes(const matrix &a, const matrix &b);
 
