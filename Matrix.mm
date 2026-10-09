@@ -5136,18 +5136,25 @@ void matrix::conv3d_gpu(const matrix& kernel, matrix& output) {
     [commandEncoder setBytes:output.shape() length:output.dims * sizeof(size_m) atIndex:5];
     
     ConvolvePrimitive* prim = (ConvolvePrimitive*)output.tape;
-    [commandEncoder setBytes:prim->padding.data() length:prim->padding.size() * sizeof(int) atIndex:6];
-    [commandEncoder setBytes:prim->stride.data() length:prim->stride.size() * sizeof(int) atIndex:7];
-    [commandEncoder setBytes:prim->dilation.data() length:prim->dilation.size() * sizeof(int) atIndex:8];
+    // the kernel takes int3, which is 16 bytes (padded to 4 ints), not 3 * sizeof(int)
+    simd_int3 pad = {prim->padding[0], prim->padding[1], prim->padding[2]};
+    simd_int3 stride = {prim->stride[0], prim->stride[1], prim->stride[2]};
+    simd_int3 dilation = {prim->dilation[0], prim->dilation[1], prim->dilation[2]};
+    [commandEncoder setBytes:&pad length:sizeof(simd_int3) atIndex:6];
+    [commandEncoder setBytes:&stride length:sizeof(simd_int3) atIndex:7];
+    [commandEncoder setBytes:&dilation length:sizeof(simd_int3) atIndex:8];
     [commandEncoder setBytes:&prim->groups length:sizeof(int) atIndex:9];
     
     [commandEncoder setBytes:this->strides() length:this->dims * sizeof(size_m) atIndex:10];
     [commandEncoder setBytes:kernel.strides() length:kernel.dims * sizeof(size_m) atIndex:11];
     [commandEncoder setBytes:output.strides() length:output.dims * sizeof(size_m) atIndex:12];
     
+    // GID: [Out_C, Out_W, [Batch, Out_D, Out_H]], what the kernel decodes
     auto max_threads = [GlobalGPUManager.Conv3dComputeState[typeCode] maxTotalThreadsPerThreadgroup];
-    auto _dispatchExecutionSize = MTLSizeMake(output.total_size, 1, 1);
-    auto _threadsPerThreadgroup = MTLSizeMake(max_threads, 1, 1);
+    NSUInteger w = MIN(16, max_threads);
+    NSUInteger h = MIN(16, max_threads / w);
+    auto _dispatchExecutionSize = MTLSizeMake(output.shape()[4], output.shape()[3], output.shape()[0] * output.shape()[1] * output.shape()[2]);
+    auto _threadsPerThreadgroup = MTLSizeMake(w, h, 1);
     
     [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
 }
