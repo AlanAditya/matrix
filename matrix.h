@@ -812,10 +812,12 @@ public:
                                                     kCFStringEncodingUTF8);
     CFURLRef url =
     CFURLCreateWithFileSystemPath(NULL, path, kCFURLPOSIXPathStyle, false);
-    CGImageSourceRef source;
-    CGImageRef cgImage;
+    CGImageSourceRef source = nullptr;
+    CGImageRef cgImage = nullptr;
     for (int i = 0; i < 3; i++) {
+        if (source) CFRelease(source);   // the failed attempt's
         source = CGImageSourceCreateWithURL(url, NULL);
+        if (!source) continue;
         cgImage = CGImageSourceCreateImageAtIndex(source, 0, NULL);
         if (cgImage) {
             break;
@@ -825,11 +827,13 @@ public:
     CFRelease(path);
     if (meta_out && source)
         *meta_out = CGImageSourceCopyPropertiesAtIndex(source, 0, nullptr);
+    if (source) CFRelease(source);       // cgImage and the properties hold their own references
 #endif
-    
+
 #if TARGET_OS_IPHONE
     UIImage *image = [UIImage imageNamed:@"IMG_1278"];
-    CGImageRef cgImage = image.CGImage;
+    // image.CGImage isn't ours; retain it so the CGImageRelease below balances
+    CGImageRef cgImage = CGImageRetain(image.CGImage);
 #endif
     
 
