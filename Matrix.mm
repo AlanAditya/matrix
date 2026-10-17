@@ -8028,7 +8028,19 @@ matrix &matrix::operator=(const matrix &other) & {
             }
             return *this;
         } else {
-            matrix Brodcasted_other = other.broadcast_toV2(shape(), dims);
+            matrix Brodcasted_other;
+            try {
+                Brodcasted_other = other.broadcast_toV2(shape(), dims);
+            } catch (const std::invalid_argument& e) {
+                auto shape_str = [](const size_m* s, uint32_t n) {
+                    std::string out = "[";
+                    for (uint32_t i = 0; i < n; i++) out += (i ? ", " : "") + std::to_string(s[i]);
+                    return out + "]";
+                };
+                throw std::invalid_argument(std::string(e.what()) + "\n" +
+                    std::format("matrix: cannot assign to a view: a {} matrix can't be broadcast into the view's shape {}",
+                                shape_str(other.shape(), other.dims), shape_str(shape(), dims)));
+            }
             if (total_size > 10) {
 //                eval_metal();
 //                Brodcasted_other.eval_metal();
