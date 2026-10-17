@@ -60,7 +60,7 @@ The `GeoNode` is the fundamental building block of the 3D scene graph (DAG - Dir
 **Structural Mutation API:**
 - `add_child(child)` — detaches `child` from any existing parent, reparents it to `this`, and recursively rebuilds `child`'s (and its descendants') `world_transform` links.
 - `set_local_transform(m)` — replaces `local_transform` and immediately recomputes `world_transform` down the subtree.
-- `invalidate()` — call this after mutating a transform's underlying buffer *in place* (e.g. via `SIMD_MAT(i) = ...` rather than reassigning the whole matrix) so the DAG's dirty-tracking (`clear_trace_checks()`) knows to re-walk the subtree. Reassigning `local_transform` wholesale (as `set_local_transform` does) doesn't need this; mutating in place does.
+- `local_transform` always has a tape: the default is a lazy `eye(4)`, and `set_local_transform` turns a tapeless matrix (e.g. `transform_of(...)`) into a leaf. In-place edits (`SIMD_MAT(i) = ...`) therefore just bump its version (`local_transform.tape->version = ++global_epoch`, as the gizmo/drag code in `Viewer.cpp` and `GraphViewer` do); the Viewer's per-frame `invalidate_pass` finds it and re-evaluates only that dirty path. There is no `GeoNode::invalidate()` any more: it called `clear_trace_checks()`, which re-runs the whole subgraph regardless of versions. `clear_trace_checks()` is for JIT re-runs and benchmarks only, never hidden inside another function.
 
 **Combinatorial Tensor Broadcasting**
 Transform resolution does not use standard 1-to-1 matrix multiplication. Because every node is treated as an instanced array `[N, 4, 4]`, the engine leverages ML-style tensor broadcasting to automatically calculate nested instances (e.g., placing a 10-instance Arrow onto a 100-instance Grid).
