@@ -2193,7 +2193,11 @@ matrix matrix::randn(std::initializer_list<size_m> shapeI, dtype type) {
 matrix matrix::eye(uint m, uint n, int k, dtype type ) {
     matrix output = matrix::zeros({ m, n }, type);
     output.eval(); // zeros() is now lazy; need the zero-filled buffer materialized before writing the diagonal directly
-    uint iteration = MIN(m, n-std::abs(k));
+    // Diagonal length: k >= 0 starts at [0, k] and runs out of columns first; k < 0 starts at
+    // [|k|, 0] and runs out of rows. Past the edge (|k| >= n or m) there's no diagonal at all.
+    uint ak = (uint)std::abs(k);
+    uint iteration = k >= 0 ? (ak < n ? MIN(m, n - ak) : 0)
+                            : (ak < m ? MIN(m - ak, n) : 0);
     dispatch_type(type, output.buffer, [&](auto *outBuff) {
         
         if (0 <= k) {
@@ -2212,6 +2216,10 @@ matrix matrix::eye(uint m, uint n, int k, dtype type ) {
         }
     });
 
+    // The diagonal was written by hand, so the zeros() tape must go: re-running it (clear_trace_checks)
+    // zero-filled the buffer again. Tapeless, like matrix::of: the caller decides whether it's a leaf.
+    output.releaseTape();   // the matrix keeps its own hold on the buffer; the cache's goes with the tape
+    if (!output.metalBuffer && output.total_size > 10) output.buildMetalBuffer();
     return output;
 }
 
