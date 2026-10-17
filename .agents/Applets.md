@@ -94,9 +94,9 @@ A small Liquid Glass capsule at the **bottom right of the renderer** (a thin mat
 - Hand these **plain copies** (tapeless matrices), never a handle into a graph another thread is running (see [[Concurrency]]).
 - Coordinates: the viewer is y up, looking down -z. KITTI / sensor coordinates (x forward, y left, z up) map to the viewer as `(-y, z, -x)`.
 
-### Viewers, viewports and pages (`SOPs/Viewer.cpp`, `SOPs/ImageViewer.h`)
+### Viewers, viewports and pages (`SOPs/Viewer.cpp`)
 - Every `Viewer` has `visible` (hidden = not drawn, no events), `viewport` (x, y, w, h as fractions of the drawable, top-left origin; the renderer sets the Metal viewport + a clamped scissor rect) and an optional `camera` (null = `pRender->cam`; the renderer keeps its aspect in step with the viewport). Defaults = the old behaviour. macOS hit-testing still uses `pRender->cam` over the whole view.
-- `ImageViewer` (`[pRender makeImageViewer]`): the base image as a Viewer; `update([H, W, 4] BGRA)` from any thread.
+- Images: `viewer->image(img)` adds an `ImageController` (`SOPs/Controllers.cpp`): a textured quad through the normal mesh path, 1 tall and W/H wide, row 0 at the top. `update(img, Order::RGBA | Order::BGRA)` from any thread ([H, W, 3|4], UInt8 or Float in [0, 1]). Give the viewer its own `Camera3D` first and `image()` frames it head-on (pan/zoom work). It replaced `ImageViewer`, which needed its own pipeline from `-[Renderer makeImageViewer]`.
 - **Pages (iOS only)**: `[self showPages:std::vector<std::shared_ptr<Viewer>>{a, b} titles:@[...]]` shows the viewers one at a time over the whole renderer. A horizontal swipe on the panel (not on a control, so sliders still work) or a tap on its page dots moves between them, with a spring settle; mid-swipe both pages are drawn side by side in one pass (shifted viewports). Orbit / pan / zoom (rerouted through `Viewer::handle_camera`) and the toolbar Camera menu move the current page's camera; `interactive = false` pages ignore them. The grid is drawn per page (`show_grid`). Skip work for hidden pages with `[pRender isPageOnScreen:i]` (any thread).
 
 ## 6. Applet catalogue
