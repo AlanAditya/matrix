@@ -2774,7 +2774,11 @@ public:
     std::vector<matrix> vjp(matrix& grad_out) override {
         // a, c are vectors (padding ... a .. padding)=>c soo J = (dc/da, dc/db) and for addition its 1 so J = (1, 1)
         matrix grad_sliced = grad_out.slice(input.array_desc, padding_range, {}, offset);
-        return { grad_sliced };
+        // One gradient per get_inputs() entry: value fills every cell outside the slice, so its
+        // gradient is grad_out summed over those cells. (Returning only input's made
+        // build_grad_graph read past the end of this vector, a garbage matrix it then copied.)
+        matrix grad_value = grad_out.sum() - grad_sliced.sum();
+        return { grad_sliced, grad_value };
     }
     matrix jvp(std::vector<matrix>& tangents) override {
         // a, b, c are vectors (a,b)=>c soo J = (dc/da, dc/db) and for stack we just need to stack the derivative

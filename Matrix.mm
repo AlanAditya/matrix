@@ -1173,6 +1173,9 @@ matrix matrix::build_grad_graph(matrix& output_node, matrix& sample_input_node) 
         
         auto input_grads = m.tape->vjp(current_grad);
         auto inputs = m.tape->get_inputs();
+        if (input_grads.size() != inputs.size()) {
+            throw std::logic_error("matrix: build_grad_graph => a vjp returned " + std::to_string(input_grads.size()) + " gradients for " + std::to_string(inputs.size()) + " inputs");
+        }
         
         for (int i = 0; i < inputs.size(); i++) {
             void* in_id = get_id(inputs[i]);
@@ -1306,6 +1309,9 @@ std::vector<matrix> matrix::build_grad_graph(std::vector<matrix>& output_nodes, 
         
         auto input_grads = m.tape->vjp(current_grad);
         auto inputs = m.tape->get_inputs();
+        if (input_grads.size() != inputs.size()) {
+            throw std::logic_error("matrix: build_grad_graph => a vjp returned " + std::to_string(input_grads.size()) + " gradients for " + std::to_string(inputs.size()) + " inputs");
+        }
         
         for (int i = 0; i < inputs.size(); i++) {
             void* in_id = get_id(inputs[i]);
