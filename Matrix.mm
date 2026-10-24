@@ -1140,7 +1140,7 @@ std::function<matrix(matrix)> matrix::grad_graph_gpu(std::function<matrix(matrix
 
 matrix matrix::build_grad_graph(matrix& output_node, matrix& sample_input_node) {
     std::vector<matrix> topo;
-    std::unordered_set<void*> visited;
+    std::unordered_map<void*, bool> depends;
     std::unordered_map<void*, matrix> grads;
     
     auto get_id = [](const matrix& m) -> void* {
@@ -1149,23 +1149,34 @@ matrix matrix::build_grad_graph(matrix& output_node, matrix& sample_input_node) 
     
     std::function<void(matrix&)> dfs = [&](matrix& m) {
         void* uuid = get_id(m);
-        if (visited.count(uuid)) return;
-        visited.insert(uuid);
+        if (depends.count(uuid)) return;
+        
+        bool dependent_input = false;
         if (m.tape) {
             for (auto& inp : m.tape->get_inputs()) {
                 dfs(inp);
+                if (depends[get_id(inp)])
+                    dependent_input = true;
+                
             }
         }
+        
+        if (uuid == get_id(sample_input_node) || dependent_input)
+            depends[uuid] = true;
+        else
+            depends[uuid] = false;
+        
         topo.push_back(m);
     };
     
     dfs(output_node);
+    if (!depends[get_id(output_node)]) return sample_input_node.zeros();
     
     grads.insert({get_id(output_node), output_node.ones()});
     
     for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
         matrix& m = *it;
-        if (!m.tape) { continue; }
+        if (!m.tape || !depends[get_id(m)]) { continue; } // a leaf, or node is not dependent
         matrix current_grad = grads.at(get_id(m));
         
         auto input_grads = m.tape->vjp(current_grad);
@@ -1177,6 +1188,7 @@ matrix matrix::build_grad_graph(matrix& output_node, matrix& sample_input_node) 
         for (int i = 0; i < inputs.size(); i++) {
             void* in_id = get_id(inputs[i]);
             auto it = grads.find(in_id);
+            if (!depends[in_id]) continue; // node is dependent but one of its input is not
             if (it != grads.end()) {
                 // Already exists, accumulate!
                 it->second = it->second + input_grads[i];
