@@ -68,6 +68,16 @@ public:
     
     virtual matrix* get_borrowed_input() { return nullptr; }
 
+protected:
+    // Creating a tape matrix's refCount is its primitive's job, and no one else's: only a
+    // primitive's first allocation calls this, right after `out.buffer = new uint8_t[...]`.
+    // matrix::begin_refcount() refuses to do it for a matrix with a tape. Protected, so only
+    // primitives can call it. See .agents/MemoryManagement.md §3.8.
+    static void begin_output_refcount(matrix& out) {
+        out.refCount = new std::atomic<uint32_t>(1);
+    }
+public:
+
     virtual ~Primitive() {
         if (out_refcount) {
             if (out_refcount->fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -206,7 +216,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -239,7 +249,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -399,7 +409,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -432,7 +442,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -560,7 +570,7 @@ class SubtractionPrimitive : public Primitive {
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -591,7 +601,7 @@ class SubtractionPrimitive : public Primitive {
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -715,7 +725,7 @@ class MultiplicationPrimitive : public Primitive {
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -746,7 +756,7 @@ class MultiplicationPrimitive : public Primitive {
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -879,7 +889,7 @@ class DivisionPrimitive : public Primitive {
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -910,7 +920,7 @@ class DivisionPrimitive : public Primitive {
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -1040,7 +1050,7 @@ public:
                 if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -1069,7 +1079,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -1192,7 +1202,7 @@ public:
                 if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -1221,7 +1231,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -1537,7 +1547,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -1576,7 +1586,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -1710,7 +1720,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -1738,7 +1748,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -1851,7 +1861,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -1879,7 +1889,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -2002,7 +2012,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -2033,7 +2043,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -2133,7 +2143,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -2164,7 +2174,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -2267,7 +2277,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -2298,7 +2308,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -2422,7 +2432,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -2453,7 +2463,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -2567,7 +2577,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -2596,7 +2606,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -2714,7 +2724,7 @@ public:
                 if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
@@ -2742,7 +2752,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -3037,7 +3047,7 @@ public:
                 out.refCount->fetch_add(1);
             } else if (REQUIRES_NEW_BUFFER) {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
@@ -3091,7 +3101,7 @@ public:
             } else if (REQUIRES_NEW_BUFFER) {
                 // If input buffer is non contigious we create a new buffer and first make it contiguous and change the shape and strides
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -3234,7 +3244,7 @@ public:
                 if (eval_type == EvalType::COMPILE_TRACE) {return;}
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -3261,7 +3271,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -3572,7 +3582,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -3620,7 +3630,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -3782,7 +3792,7 @@ public:
                     out_i.refCount->fetch_add(1);
                 } else if (out_i.tape) {
                     out_i.buffer = new uint8_t[out_i.effectiveBufferSize() * dtype_size(out_i.type)];
-                    out_i.begin_refcount();
+                    begin_output_refcount(out_i);
                     out_i.tape->out_buffer = (uint8_t*)out_i.buffer;
                     out_i.tape->out_metal_buffer = out_i.metalBuffer;
                     out_i.tape->out_refcount = out_i.refCount;
@@ -3846,7 +3856,7 @@ public:
                     out_i.refCount->fetch_add(1);
                 } else if (out_i.tape) {
                     out_i.buffer = new uint8_t[out_i.effectiveBufferSize() * dtype_size(out_i.type)];
-                    out_i.begin_refcount();
+                    begin_output_refcount(out_i);
                     out_i.buildMetalBuffer();
                     out_i.tape->out_buffer = (uint8_t*)out_i.buffer;
                     out_i.tape->out_metal_buffer = out_i.metalBuffer;
@@ -3982,7 +3992,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4011,7 +4021,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -4126,7 +4136,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4155,7 +4165,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -4262,7 +4272,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4288,7 +4298,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
                 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -4391,7 +4401,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4419,7 +4429,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -4525,7 +4535,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4552,7 +4562,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -4657,7 +4667,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4684,7 +4694,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -4790,7 +4800,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4817,7 +4827,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -4923,7 +4933,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -4951,7 +4961,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -5055,7 +5065,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -5083,7 +5093,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -5199,7 +5209,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -5230,7 +5240,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -5359,7 +5369,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -5397,7 +5407,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -5517,7 +5527,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -5548,7 +5558,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -5697,7 +5707,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[alloc_bytes(out)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -5737,7 +5747,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[alloc_bytes(out)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -5858,7 +5868,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -5885,7 +5895,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -5987,7 +5997,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
                 out.tape->out_refcount = out.refCount;
@@ -6015,7 +6025,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -6210,7 +6220,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -6238,7 +6248,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -6336,7 +6346,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -6362,7 +6372,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
@@ -6444,7 +6454,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;
                 out.tape->out_metal_buffer = out.metalBuffer;
@@ -6470,7 +6480,7 @@ public:
                 out.refCount->fetch_add(1);
             } else {
                 out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-                out.begin_refcount();
+                begin_output_refcount(out);
                 out.buildMetalBuffer();
 
                 out.tape->out_buffer = (uint8_t*)out.buffer;

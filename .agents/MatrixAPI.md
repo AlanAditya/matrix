@@ -180,7 +180,7 @@ See [[MemoryManagement]] for the full ownership model this section implements.
 
 | Method | Purpose |
 |---|---|
-| `beginReferenceCounting()` / `begin_refcount()` | Initializes `refCount = 1` for a freshly allocated buffer. |
+| `begin_refcount()` | Refcounts a tapeless matrix; syncs a matrix with a tape to its tape's cache; throws on an unevaluated one. A tape matrix's counter is created only by its primitive, through `Primitive::begin_output_refcount(out)` (`protected`, primitives only). See MemoryManagement.md §3.8. |
 | `shareBuffer(matrix&) const` | `a.shareBuffer(b)` puts **a's** `buffer`/`metalBuffer`/`refCount` into **b** (+1), and updates `b.tape`'s cache via `update_cache`. Direction matters. |
 | `buildMetalBuffer()` | Wraps the current CPU `buffer` in an `MTLBuffer` (`newBufferWithBytesNoCopy`). |
 | `releaseBuffer()` | Drops this handle's **buffer** hold (`fetch_sub`, frees on the last one) and clears `buffer`/`refCount`/`metalBuffer`. Never touches `tape`: it's used to rebind a matrix while it stays the same graph node. |

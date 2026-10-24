@@ -486,7 +486,6 @@ public:
     }
     void shareBuffer(matrix &mat) const;
     
-    void beginReferenceCounting();
     void calcStrides();
     
     size_t accumul(uint32_t start, uint32_t end) const;

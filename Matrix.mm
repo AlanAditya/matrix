@@ -912,9 +912,6 @@ inline void matrix::update_from_trace() {
 //        }
     }
 }
-inline void matrix::beginReferenceCounting() {
-    refCount = new std::atomic<uint32_t>(1);
-}
 void matrix::calcStrides() {
     size_m *l_strides = strides();
     size_m *l_shape = shape();
@@ -1215,14 +1212,15 @@ static void require_scalar_output(const matrix& value) {
 // the buffer. Same as grad_graph_gpu does for its sample. The transforms take their parameters
 // by const reference and refcount the caller's own matrices, so the caller can pass them on to
 // build_grad_graph too. (A view's copies already share its memory.)
-static void share_param_buffer(const matrix& param) {
+// See .agents/MemoryManagement.md §8.5.
+static void refcount_tapeless(const matrix& param) {
     matrix& p = const_cast<matrix&>(param);
     if (!p.tape && p.buffer && !(p.flags & NON_OWNERSHIP_FLAG)) p.begin_refcount();
 }
 
 std::function<std::pair<matrix, std::vector<matrix>>(const std::vector<matrix>&)> matrix::value_and_grad(std::function<matrix(std::vector<matrix>)> fn) {
     return [fn](const std::vector<matrix>& params) {
-        for (auto& p : params) share_param_buffer(p);
+        for (auto& p : params) refcount_tapeless(p);
         matrix value = fn(params);
         require_scalar_output(value);
         std::vector<matrix> outputs = {value};
@@ -1234,7 +1232,7 @@ std::function<std::pair<matrix, std::vector<matrix>>(const std::vector<matrix>&)
 
 std::function<std::pair<matrix, matrix>(const matrix&)> matrix::value_and_grad(std::function<matrix(matrix)> fn) {
     return [fn](const matrix& params) {
-        share_param_buffer(params);
+        refcount_tapeless(params);
         matrix value = fn(params);
         require_scalar_output(value);
         matrix input = params;
@@ -4611,14 +4609,23 @@ std::vector<matrix> matrix::pointsFromPLY(const std::string& path, const std::ve
 //    }
 
 void matrix::begin_refcount() {
+    // A tape matrix's buffer and refCount are its primitive's to allocate, when the graph is
+    // evaluated (Primitive::begin_output_refcount()). Here it can only sync to the tape, the
+    // source of truth: a stale instance (D = C; D.eval(), then C) takes the cache. Unevaluated,
+    // there's nothing to count yet, and creating a counter here would be someone else doing the
+    // primitive's job.
+    if (tape) {
+        if (tape->out_refcount) update_from_trace();
+        if (refCount != nullptr) return;
+        throw std::logic_error("matrix: begin_refcount => this matrix has a tape but hasn't been evaluated: its primitive allocates its buffer and refCount when it evaluates");
+    }
     // Already counted: nothing to create. This includes an evaluated slice whose tape was
     // released: it shares its parent's refCount (+1), so it's a counted user, not an owner.
     if (refCount != nullptr)
         return;
-    // With a tape the flag says nothing about ownership (the tape and refCount decide; e.g. a
-    // reshape that copies a view owns its new buffer but keeps the view's flags). A tapeless view
-    // really doesn't own its buffer: a new refcount would make its last release delete[] it.
-    if ((flags & NON_OWNERSHIP_FLAG) && !tape)
+    // A tapeless view really doesn't own its buffer: a new refcount would make its last release
+    // delete[] it.
+    if (flags & NON_OWNERSHIP_FLAG)
         throw std::runtime_error(
                                  "matrix: cannot begin refcount on non-owning matrix");
     refCount = new std::atomic<uint32_t>(1);

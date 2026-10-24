@@ -89,7 +89,7 @@ Every real primitive's `eval_cpu(matrix& out, EvalType eval_type)` follows the s
        } else {
            // allocate fresh, and publish into the tape's cache for siblings to adopt later
            out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
-           out.begin_refcount();
+           begin_output_refcount(out);   // Primitive's protected allocator: begin_refcount() throws on an unevaluated tape (MemoryManagement.md §3.8)
            out.tape->out_buffer = (uint8_t*)out.buffer;
            out.tape->out_metal_buffer = out.metalBuffer;
            out.tape->out_refcount = out.refCount;

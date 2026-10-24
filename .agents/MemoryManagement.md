@@ -27,6 +27,7 @@ A `shared_ptr` would make most of these bugs impossible, but it would bring back
 7. **Views (transient primitives) own nothing, not even a wrapper.** A view borrows the parent's buffer at an offset and inherits the parent's Metal wrapper. It never builds one. → §7
 8. **A view's rebind check compares against `parent + offset`**, and its rebind updates the cache through `update_cache()`. → §7.3
 9. **Rank > 3 shape descriptors are counted too.** Never overwrite `shared_arr_desc` without releasing it, and every `retain(dims)` needs a `release(dims)`. → §3.3c
+10. **Only a primitive allocates a tape matrix's buffer and refCount**, when the graph evaluates (`Primitive::begin_output_refcount()`, `protected`). `begin_refcount()` on a matrix with a tape only syncs it to the tape; unevaluated, it throws. → §3.8
 
 ---
 
@@ -73,7 +74,7 @@ The cache lives on the primitive rather than in `matrix` for the reason given in
 ### The evaluation lifecycle (why the cache holds +1)
 When an unevaluated matrix instance is forced to evaluate (e.g., by calling `.at<float>()` or `ensure_evaluated()`), this happens:
 
-1. **Allocation:** the primitive allocates the memory buffer, assigns it to the evaluating `matrix` instance, and calls `begin_refcount()` (`refCount = 1`, the instance's hold).
+1. **Allocation:** the primitive allocates the memory buffer, assigns it to the evaluating `matrix` instance, and calls `begin_output_refcount(out)` (`refCount = 1`, the instance's hold; §3.8).
 2. **Caching (the trick):** the primitive caches the raw pointers (`out_buffer`, `out_refcount`, and on Metal `out_metal_buffer`) inside itself and does `out_refcount->fetch_add(1)` (the cache's hold).
    - *Why +1?* The primitive must act as a co-owner of the data it caches. If the evaluating matrix is a temporary instance (e.g., an internal copy created inside `.min()`) and is destroyed immediately, the primitive's `+1` ensures the cached buffer isn't deleted, so other instances of the matrix can still use it.
 3. **Sharing:** when another instance of this matrix needs the data, it calls `update_from_trace()`. It sees the primitive's cache, takes `out_buffer`/`out_metal_buffer`, copies `out_refcount`, and increments `refCount` for itself.
@@ -140,6 +141,15 @@ Updates `mat.tape`'s cache with `update_cache(this…)`, then `mat.releaseBuffer
 
 ---
 
+### 3.8 `begin_refcount()` vs `Primitive::begin_output_refcount()`: who creates a counter
+Partition of responsibility: a matrix with a tape is an instance, and its buffer and refCount are a cache of what its **primitive** allocates when the graph evaluates. Before that, neither exists. So:
+- **`Primitive::begin_output_refcount(out)`**: a bare `out.refCount = new std::atomic<uint32_t>(1)`, a **`protected` static** member of the `Primitive` base, so only primitive classes can call it (not `matrix`, not app code, not `Matrix.mm` outside a primitive). Primitives call it in their first-allocation branch, right after `out.buffer = new uint8_t[...]` (all 76 owning-output sites in `primitives.cpp`, including `MultiInputCompilePrimitive`'s `out_i`). It used to be the public `matrix::beginReferenceCounting()`, which anyone could call.
+- **`begin_refcount()`**, everyone else:
+  - **With a tape:** if the tape's cache is filled, `update_from_trace()` (a stale instance, e.g. `C` after `D = C; D.eval()`, takes the tape's buffer and counter) and return. If the cache is empty, the graph hasn't been evaluated, so it **throws** `std::logic_error`: creating the counter is the primitive's job. (It used to create one silently, a counter that counted no buffer, or a different one than the tape's.)
+  - **Tapeless:** already counted → return; a `NON_OWNERSHIP_FLAG` view → throws (a counter would make its last release `delete[]` memory it doesn't own); otherwise creates the counter.
+- **Don't** call `update_from_trace()` unguarded inside a primitive's first allocation: the cache is still empty there, so it would `delete[]` the fresh buffer and `fetch_add` a null counter.
+- **To refcount a leaf before building a view on it**, refcount the leaf, not the view: `rc(matrix::of(...)).reshape(2, 2, 3)`, not `rc(matrix::of(...).reshape(2, 2, 3))` (the latter throws).
+
 ## 4. Execution modes and the compile/execute rule
 
 `EvalType` (Mods/Utils.h):
@@ -172,7 +182,7 @@ void eval_metal(matrix& out, EvalType eval_type) override {
     // (2) Output memory: take it from the tape cache, or allocate once and fill the (empty) cache.
     if (!out.buffer) {
         if (out.tape->out_buffer) { /* take cache: buffer, metalBuffer, refCount (+1) */ }
-        else { /* new uint8_t[]; begin_refcount(); buildMetalBuffer(); fill cache directly (+1) */ }
+        else { /* new uint8_t[]; begin_output_refcount(out); buildMetalBuffer(); fill cache directly (+1) */ }
     }
     // (3) Output wrapper: the CPU -> Metal rerun guard (§6).
     if (!out_metal_buffer) { out.buildMetalBuffer(); out_metal_buffer = out.metalBuffer; }
@@ -277,6 +287,22 @@ There's one `MultiInputCompilePrimitive` **per output**, and each one is the tap
 These are **phased out and scheduled for removal**, and live in `legacy.mm` (declared in `matrix.h` under a LEGACY comment). Don't model anything on them, and don't fix them. Both are broken (reproduced standalone):
 - `jit_gpu`: sets its tape cache to null by hand (+1 per call, so every result's buffer leaks), never sets `total_size` on the result, and has a debug `printf` on each call.
 - `grad_gpu`: calls `shareBuffer` in the wrong direction, reaching `update_cache(nullptr, …)` → null `fetch_add` → crash on the first call.
+
+### 8.5 Autodiff: why `value_and_grad` refcounts tapeless parameters (`refcount_tapeless`)
+`value_and_grad` (and so `grad` and `laplacian`) calls `refcount_tapeless()` on every parameter before running `fn`. It looks removable. **It isn't.** Without it, gradients of plain parameters silently come back as **zeros** (no crash). The chain:
+1. `build_grad_graph` identifies a node by `get_id(m) = m.tape ? m.tape : m.buffer`. A tapeless parameter (`matrix::of(...)`) is found **by its buffer pointer**.
+2. `fn` takes `matrix` **by value**, and copying a tapeless, non-refcounted, owning matrix is a **deep copy** (§3.7): a new buffer. So `fn` builds its graph on the copy's buffer.
+3. `value_and_grad` then copies the parameter again (`matrix input = params;`) to look its gradient up, and gets another new buffer. The lookup misses, so it returns `sample_input_node.zeros()`.
+4. `ensure_graph_ready()` (§8.1) doesn't save it: it refcounts the **primitive's own copy**, after the deep copy already happened.
+
+`begin_refcount()` on the caller's matrix turns every later copy into a shallow share of the same buffer, so the graph, the lookup copy and the caller all have the same id. It's the same thing `grad_graph_gpu` does with `sample.begin_refcount()`.
+
+- It skips matrices with a tape (found by tape, not buffer) and `NON_OWNERSHIP_FLAG` views (their copies already share the memory).
+- It mutates the caller's `const&` matrix through a `const_cast` (it becomes refcounted). That's intentional: the caller can then pass the same matrices straight to `build_grad_graph`.
+- A parameter **with** a tape is never touched, including a stale instance (`C = A + B; D = C; D.eval();` leaves `C` with no buffer and no `refCount`, but its tape holds the cache). That's right: the tape is the source of truth and `build_grad_graph` finds `C` by tape. `begin_refcount()` handles that case too (§3.8): a stale instance syncs to the tape instead of getting a counter of its own.
+- Calling `build_grad_graph` **directly** gets none of this: its tapeless leaves must already be refcounted, or their gradient is zeros.
+
+Checked standalone by making it a no-op: `scratch_slice_vjp` went from all ok to 15 FAIL (`1D index slice(2,0)` gave `0 0 0 0` instead of `0 0 5 0`), `scratch_laplacian_fn` to 19 FAIL, `scratch_plain_leaf_grad` to 82 mismatches. Tests whose parameters were already refcounted or had a tape (`scratch_grad_overloads`, `scratch_laplacian`) still passed, which is why it's easy to think it does nothing.
 
 ---
 
