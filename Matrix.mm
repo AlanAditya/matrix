@@ -1287,35 +1287,52 @@ std::function<matrix(const std::vector<matrix>&)> matrix::laplacian(std::functio
 
 std::vector<matrix> matrix::build_grad_graph(std::vector<matrix>& output_nodes, std::vector<matrix>& sample_input_nodes) {
     std::vector<matrix> topo;
-    std::unordered_set<void*> visited;
+    std::unordered_map<void*, bool> depends;
     std::unordered_map<void*, matrix> grads;
     
     auto get_id = [](const matrix& m) -> void* {
         return m.tape ? m.tape : m.buffer;
     };
     
+    std::unordered_set<void*> param_ids;
+    for (auto& sample_input_node : sample_input_nodes) {
+        param_ids.insert(get_id(sample_input_node));
+    }
+    
     std::function<void(matrix&)> dfs = [&](matrix& m) {
         void* uuid = get_id(m);
-        if (visited.count(uuid)) return;
-        visited.insert(uuid);
+        if (depends.count(uuid)) return;
+        
+        bool dependent_input = false;
         if (m.tape) {
             for (auto& inp : m.tape->get_inputs()) {
                 dfs(inp);
+                if (depends[get_id(inp)])
+                    dependent_input = true;
             }
         }
+        
+        if (param_ids.count(uuid) || dependent_input)
+            depends[uuid] = true;
+        else
+            depends[uuid] = false;
+        
         topo.push_back(m);
     };
     
     for (auto& output_node : output_nodes) {
         dfs(output_node);
-        grads.insert({get_id(output_node), output_node.ones()});
+        if (depends[get_id(output_node)])
+            grads.insert({get_id(output_node), output_node.ones()});
     }
     
     
     for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
         matrix& m = *it;
-        if (!m.tape) { continue; }
-        matrix current_grad = grads.at(get_id(m));
+        if (!m.tape || !depends[get_id(m)]) { continue; } // a leaf, or node is not dependent
+        auto g = grads.find(get_id(m));
+        if (g == grads.end()) { continue; } // dependent, but no output's gradient reaches it
+        matrix current_grad = g->second;
         
         auto input_grads = m.tape->vjp(current_grad);
         auto inputs = m.tape->get_inputs();
@@ -1325,6 +1342,7 @@ std::vector<matrix> matrix::build_grad_graph(std::vector<matrix>& output_nodes, 
         
         for (int i = 0; i < inputs.size(); i++) {
             void* in_id = get_id(inputs[i]);
+            if (!depends[in_id]) continue; // node is dependent but one of its input is not
             auto it = grads.find(in_id);
             if (it != grads.end()) {
                 // Already exists, accumulate!
