@@ -1139,7 +1139,9 @@ std::function<matrix(matrix)> matrix::grad_graph_gpu(std::function<matrix(matrix
 }
 
 matrix matrix::build_grad_graph(matrix& output_node, matrix& sample_input_node) {
-    std::vector<matrix> topo;
+    // Pointers to the graph's own matrices (the output, and the primitives' input members via
+    // input_at()): get_inputs() would copy every handle, a vector allocation plus refcount atomics.
+    std::vector<matrix*> topo;
     std::unordered_map<void*, bool> depends;
     std::unordered_map<void*, matrix> grads;
     
@@ -1153,7 +1155,8 @@ matrix matrix::build_grad_graph(matrix& output_node, matrix& sample_input_node) 
         
         bool dependent_input = false;
         if (m.tape) {
-            for (auto& inp : m.tape->get_inputs()) {
+            for (uint32_t i = 0; i < m.tape->num_inputs(); i++) {
+                matrix& inp = m.tape->input_at(i);
                 dfs(inp);
                 if (depends[get_id(inp)])
                     dependent_input = true;
@@ -1166,7 +1169,7 @@ matrix matrix::build_grad_graph(matrix& output_node, matrix& sample_input_node) 
         else
             depends[uuid] = false;
         
-        topo.push_back(m);
+        topo.push_back(&m);
     };
     
     dfs(output_node);
@@ -1175,18 +1178,18 @@ matrix matrix::build_grad_graph(matrix& output_node, matrix& sample_input_node) 
     grads.insert({get_id(output_node), output_node.ones()});
     
     for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
-        matrix& m = *it;
+        matrix& m = **it;
         if (!m.tape || !depends[get_id(m)]) { continue; } // a leaf, or node is not dependent
         matrix current_grad = grads.at(get_id(m));
         
         auto input_grads = m.tape->vjp(current_grad);
-        auto inputs = m.tape->get_inputs();
-        if (input_grads.size() != inputs.size()) {
-            throw std::logic_error("matrix: build_grad_graph => a vjp returned " + std::to_string(input_grads.size()) + " gradients for " + std::to_string(inputs.size()) + " inputs");
+        uint32_t num_inputs = m.tape->num_inputs();
+        if (input_grads.size() != num_inputs) {
+            throw std::logic_error("matrix: build_grad_graph => a vjp returned " + std::to_string(input_grads.size()) + " gradients for " + std::to_string(num_inputs) + " inputs");
         }
         
-        for (int i = 0; i < inputs.size(); i++) {
-            void* in_id = get_id(inputs[i]);
+        for (uint32_t i = 0; i < num_inputs; i++) {
+            void* in_id = get_id(m.tape->input_at(i));
             auto it = grads.find(in_id);
             if (!depends[in_id]) continue; // node is dependent but one of its input is not
             if (it != grads.end()) {
@@ -1286,7 +1289,9 @@ std::function<matrix(const std::vector<matrix>&)> matrix::laplacian(std::functio
 }
 
 std::vector<matrix> matrix::build_grad_graph(std::vector<matrix>& output_nodes, std::vector<matrix>& sample_input_nodes) {
-    std::vector<matrix> topo;
+    // Pointers to the graph's own matrices (the output, and the primitives' input members via
+    // input_at()): get_inputs() would copy every handle, a vector allocation plus refcount atomics.
+    std::vector<matrix*> topo;
     std::unordered_map<void*, bool> depends;
     std::unordered_map<void*, matrix> grads;
     
@@ -1305,7 +1310,8 @@ std::vector<matrix> matrix::build_grad_graph(std::vector<matrix>& output_nodes, 
         
         bool dependent_input = false;
         if (m.tape) {
-            for (auto& inp : m.tape->get_inputs()) {
+            for (uint32_t i = 0; i < m.tape->num_inputs(); i++) {
+                matrix& inp = m.tape->input_at(i);
                 dfs(inp);
                 if (depends[get_id(inp)])
                     dependent_input = true;
@@ -1317,7 +1323,7 @@ std::vector<matrix> matrix::build_grad_graph(std::vector<matrix>& output_nodes, 
         else
             depends[uuid] = false;
         
-        topo.push_back(m);
+        topo.push_back(&m);
     };
     
     for (auto& output_node : output_nodes) {
@@ -1328,20 +1334,20 @@ std::vector<matrix> matrix::build_grad_graph(std::vector<matrix>& output_nodes, 
     
     
     for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
-        matrix& m = *it;
+        matrix& m = **it;
         if (!m.tape || !depends[get_id(m)]) { continue; } // a leaf, or node is not dependent
         auto g = grads.find(get_id(m));
         if (g == grads.end()) { continue; } // dependent, but no output's gradient reaches it
         matrix current_grad = g->second;
         
         auto input_grads = m.tape->vjp(current_grad);
-        auto inputs = m.tape->get_inputs();
-        if (input_grads.size() != inputs.size()) {
-            throw std::logic_error("matrix: build_grad_graph => a vjp returned " + std::to_string(input_grads.size()) + " gradients for " + std::to_string(inputs.size()) + " inputs");
+        uint32_t num_inputs = m.tape->num_inputs();
+        if (input_grads.size() != num_inputs) {
+            throw std::logic_error("matrix: build_grad_graph => a vjp returned " + std::to_string(input_grads.size()) + " gradients for " + std::to_string(num_inputs) + " inputs");
         }
         
-        for (int i = 0; i < inputs.size(); i++) {
-            void* in_id = get_id(inputs[i]);
+        for (uint32_t i = 0; i < num_inputs; i++) {
+            void* in_id = get_id(m.tape->input_at(i));
             if (!depends[in_id]) continue; // node is dependent but one of its input is not
             auto it = grads.find(in_id);
             if (it != grads.end()) {
