@@ -13414,6 +13414,25 @@ matrix matrix::rms() const {
     return matrix::sqrt(m);
 }
 
+// L2 norm: sqrt of the sum of squares (np.linalg.norm / mx.linalg.norm with ord=None).
+matrix matrix::norm(int axis, bool keepdims) const {
+    matrix sq = (*this) * (*this);
+    matrix s = sq.sum(axis, keepdims);
+    return matrix::sqrt(s);
+}
+
+matrix matrix::norm(int start, int end, bool keepdims) const {
+    matrix sq = (*this) * (*this);
+    matrix s = sq.sum(start, end, keepdims);
+    return matrix::sqrt(s);
+}
+
+matrix matrix::norm() const {
+    matrix sq = (*this) * (*this);
+    matrix s = sq.sum();
+    return matrix::sqrt(s);
+}
+
 //matrix matrix::operator[](int index) {
 //    if (dims == 0) throw std::runtime_error("Cannot slice a 0-dimensional matrix");
 //    if (index >= shape()[0]) throw std::runtime_error("Index out of bounds");

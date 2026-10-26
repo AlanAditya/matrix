@@ -941,6 +941,13 @@ public:
     matrix rms(int start, int end = -1, bool keepdims = false) const;
     matrix rms() const; // global rms
 
+    matrix norm(int axis, bool keepdims = false) const;
+    matrix norm(int start, int end, bool keepdims = false) const;
+    matrix norm() const; // global L2 norm
+    static matrix norm(const matrix& x, int axis, bool keepdims = false) { return x.norm(axis, keepdims); }
+    static matrix norm(const matrix& x, int start, int end, bool keepdims = false) { return x.norm(start, end, keepdims); }
+    static matrix norm(const matrix& x) { return x.norm(); }
+
     matrix argmax(int axis, bool keepdims = false) const;
     void argmax(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device = ExecutionDevice::AUTO) const;
     matrix argmin(int axis, bool keepdims = false) const;

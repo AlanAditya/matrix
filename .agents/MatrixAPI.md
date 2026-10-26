@@ -97,6 +97,7 @@ This is a complete map of every public constructor, static factory, and method e
 | `sum_legacy(axis, keepdims=false)` / `sum_legacy(output, axis, keepdims, eval_type=AUTO)` / `SumNoRed(output, axis, eval_type=AUTO)` | Older/alternate sum backends kept alongside the current implementation. |
 | `mean(axis, keepdims=false) const` / `mean(start, end=-1, keepdims=false) const` / `mean() const` | Mean along an axis, over a range, or globally. |
 | `rms(axis, keepdims=false) const` / `rms(start, end=-1, keepdims=false) const` / `rms() const` | Root-mean-square, same shape of overloads as `mean`. |
+| `norm(axis, keepdims=false) const` / `norm(start, end, keepdims=false) const` / `norm() const` | L2 norm (sqrt of the sum of squares), same overloads as `sum` (`end` has no default, so `norm(1)` isn't ambiguous the way `mean(1)` / `rms(1)` are); like `np.linalg.norm(x, axis=...)`. Static forms `matrix::norm(x)` / `matrix::norm(x, axis, keepdims=false)` / `matrix::norm(x, start, end, keepdims=false)` call the members. |
 | `max(axis, keepdims=false) const` / `max(output, axis, keepdims, exec_device=AUTO)` / `max(start, end, keepdims=false) const` / `max() const` | Max along an axis, into an output, over a range, or globally. |
 | `min(...)` | Same overload set as `max`, for minimum. |
 
