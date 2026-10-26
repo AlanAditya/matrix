@@ -6,7 +6,7 @@
 
 Only these files are required — not the rest of the project:
 
-- `matrix.h`, `Matrix.mm`, `primitives.cpp` (primitives.cpp is `#include`d by `Matrix.mm`, not compiled separately)
+- `matrix/matrix.h`, `matrix/Matrix.mm`, `matrix/primitives.cpp` (primitives.cpp is `#include`d by `Matrix.mm`, not compiled separately)
 - `Mods/GPUManager.h`, `Mods/Utils.h`, `Mods/Utils.mm` — `matrix.h` does `@import GPUManager;`, which does `@import Utils;`. **`Mods/Utils.mm` is easy to miss**: it defines `collapse_dims`/`collapse_dims_matmul`/`collapse_dims_reduce` (declared in `Utils.h`) but is never `#include`d anywhere — Xcode just compiles every `.mm` in the target. Leaving it out compiles fine and fails at *link* time.
 - `module.modulemap` — wires up the `@import GPUManager;` / `@import Utils;` clang modules
 - `ComputeShaders/*.metal` — compiled into `default.metallib` (§2); needed for GPU-path ops to dispatch, not needed to link
@@ -31,7 +31,7 @@ cmake -S . -B build && cmake --build build
 Put a repro in `debug/tests/scratch.mm` (`#include "matrix.h"`, needs a `main()`). The `scratch` target only exists when that file does (appended by `refresh-debug.sh`).
 
 What `refresh-debug.sh` does, every run:
-- copies `matrix.h`, `Matrix.mm`, `primitives.cpp`, `Mods/{GPUManager.h,Utils.h,Utils.mm}`, `module.modulemap`;
+- copies `matrix/{matrix.h,Matrix.mm,primitives.cpp}` to the **root** of `debug/` (the sandbox and the published mirror stay flat; only WorldOf3D nests them), plus `Mods/{GPUManager.h,Utils.h,Utils.mm}` and `module.modulemap`. It deletes any `debug/matrix/` folder, where a stale copy would satisfy the SOPs' `../matrix/matrix.h`;
 - syncs `ComputeShaders/` with `rsync -a --delete --exclude default.metallib` (in place, so the built metallib survives a refresh);
 - patches the **copied** `GPUManager.h` to load `debug/ComputeShaders/default.metallib` by absolute path instead of `newDefaultLibrary` (a bare CLI binary has no app bundle). It re-patches from a fresh copy every run and fails loudly if the `class GPUManager {` marker or the `newDefaultLibrary` line changes upstream;
 - writes `debug/CMakeLists.txt` only when its content changed (rewriting it every time made CMake reconfigure on every build, which re-ran the script).
@@ -44,7 +44,7 @@ What `refresh-debug.sh` does, every run:
 
 Open the folder in CLion. Its `CMakeLists.txt`:
 - runs `refresh-debug.sh` on every CMake configure (`-DMATRIX_REFRESH_ON_CONFIGURE=OFF` to skip), then `add_subdirectory(../debug matrix EXCLUDE_FROM_ALL)` for `libmatrix` + `default.metallib`;
-- syncs the renderer's sources into `debug/` **in place** (`rsync -a --delete` for `SOPs/`, `cmake -E copy_if_different` for `Mods/Camera3D.h`, `cpu_rasteriser.hpp`, and `Shaders.metal`/`DAGShaders.metal` → `debug/RenderShaders/`). The SOPs' relative includes (`./../matrix.h`) need them next to `matrix.h`;
+- syncs the renderer's sources into `debug/` **in place** (`copy-flat.py` for `SOPs/` (mirrored, deleting what WorldOf3D no longer has), `Mods/Camera3D.h`, `cpu_rasteriser.hpp` and `inputs/VideoFileInput.{h,mm}`; `cmake -E copy_if_different` for `Shaders.metal`/`DAGShaders.metal` → `debug/RenderShaders/`). Those copies go through `matrix-sync/copy-flat.py`, which rewrites their `../matrix/matrix.h` / `../matrix/primitives.cpp` includes to the flat `../matrix.h` / `../primitives.cpp` and only writes a file whose content changed (so a reload doesn't rebuild everything);
 - builds `render.metallib` (in `build/`) from the two render shaders, and a `renderer` static library (`renderer/renderer.{h,mm}`);
 - Release flags `-O3 -DNDEBUG -mcpu=native -fno-math-errno` + LTO, applied to `libmatrix` too. **CLion's default profile is Debug**: add a Release profile for the fast flags;
 - builds `libmatrix`, the renderer and every executable with `-fobjc-arc`, to match the app.
