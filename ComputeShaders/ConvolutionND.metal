@@ -30,16 +30,18 @@ kernel void conv1d_gpu(
     constant size_m* in_strides [[buffer(10)]],
     constant size_m* kernel_strides [[buffer(11)]],
     constant size_m* out_strides [[buffer(12)]],
+    constant int* dilation_lhs [[buffer(15)]],   // input dilation; buffer(8) is kernel dilation
+    constant int& flip [[buffer(16)]],           // 1 = read the kernel back to front (true convolution)
     uint3 gid [[thread_position_in_grid]])
 {
     int batch_size = in_shape[0];
-    int in_l = in_shape[1];
+    int in_l = (in_shape[1] - 1) * dilation_lhs[0] + 1; // dialated input length
     int in_c = in_shape[2];
     
     int out_c = out_shape[2];
     int out_l = out_shape[1];
     
-    int k_l = kernel_shape[1];
+    int k_l = kernel_shape[1]; // non dialated kernel length
     int in_c_per_group = kernel_shape[2];
     
     int pad_l = padding[0];
@@ -64,13 +66,15 @@ kernel void conv1d_gpu(
         // offset is the index of the kernel element relative to COM [-2, -1, 0, 1, 2]
         // gid + offset < 0 means the kerenl element is outside even the padding
         int offset = ((int)i - (k_l / 2)) * dilation_l;
-        if (in_x + offset < 0 || in_x + offset >= in_l) {
+        int in_x_ = (in_x + offset) / dilation_lhs[0]; // in non dialated input space
+        if (in_x + offset < 0 || in_x + offset >= in_l || in_x + offset != in_x_ * dilation_lhs[0]) {
             sum += 0;
             continue;
         }
         
+        int ki = flip ? (k_l - 1 - (int)i) : (int)i; // flip reads the kernel back to front; the sample position stays i
         for (uint32_t j = 0; j < in_c_per_group; j++) {
-            sum += Kernel[oc * kernel_strides[0] + i * kernel_strides[1] + j * kernel_strides[2]] * inMat[b * in_strides[0] + in_strides[1] * (in_x + offset) + (in_c_start + j) * in_strides[2]];
+            sum += Kernel[oc * kernel_strides[0] + ki * kernel_strides[1] + j * kernel_strides[2]] * inMat[b * in_strides[0] + in_strides[1] * (in_x_) + (in_c_start + j) * in_strides[2]];
         }
 
     }
@@ -100,20 +104,23 @@ kernel void conv2d_gpu(
     constant size_m* in_strides [[buffer(10)]],
     constant size_m* kernel_strides [[buffer(11)]],
     constant size_m* out_strides [[buffer(12)]],
+    constant int2& dilation_lhs [[buffer(15)]],   // input dilation; buffer(8) is kernel dilation
+    constant int& flip [[buffer(16)]],           // 1 = read the kernel back to front (true convolution)
     uint3 gid [[thread_position_in_grid]])
 {
     
 
-    int in_h = in_shape[1];
-    int in_w = in_shape[2];
+    int in_h = (in_shape[1] - 1) * dilation_lhs[0] + 1; // dialated input height
+    int in_w = (in_shape[2] - 1) * dilation_lhs[1] + 1; // dialated input width
     int out_c = out_shape[3];
     int out_w = out_shape[2];
     int out_h = out_shape[1];
-    
-    int k_h = kernel_shape[1];
-    int k_w = kernel_shape[2];
+
+    int k_h = kernel_shape[1]; // non dialated kernel height
+    int k_w = kernel_shape[2]; // non dialated kernel width
     int in_c_per_group = kernel_shape[3];
-    
+
+    int2 dia_lhs = dilation_lhs;
     int2 k_shape = int2(k_h, k_w); // x=height, y=width
     // Deconstruct 1D Grid ID
     int oc = gid.x;
@@ -135,20 +142,21 @@ kernel void conv2d_gpu(
             
             int2 offset = ( int2(i, j) - k_shape / 2 ) * dilation;
             int2 sample = in_index + offset;
+            int2 sample_ = sample / dia_lhs; // in non dialated input space
+
+            if (sample.x < 0 || sample.x >= in_h || sample.y < 0 || sample.y >= in_w || sample.x != sample_.x * dia_lhs.x || sample.y != sample_.y * dia_lhs.y) continue;
             
-            if (sample.x < 0 || sample.x >= in_h || sample.y < 0 || sample.y >= in_w) continue;
-            
-            int k_spatial_offset = i * kernel_strides[1] + j * kernel_strides[2];
-            int in_spatial_offset = sample.x * in_strides[1] + sample.y * in_strides[2];
+            int ki = flip ? (k_h - 1 - i) : i; // flip reads the kernel back to front; the sample position stays (i, j)
+            int kj = flip ? (k_w - 1 - j) : j;
+            int k_spatial_offset = ki * kernel_strides[1] + kj * kernel_strides[2];
+            int in_spatial_offset = sample_.x * in_strides[1] + sample_.y * in_strides[2];
             
             for (int c = 0; c < in_c_per_group; c++) {
                 sum += Kernel[kernel_base_offset + k_spatial_offset + c * kernel_strides[3]] * inMat[in_base_offset + in_spatial_offset + c * in_strides[3]];
             }
         }
     }
-    
-    // TODO: Write your custom conv2d kernel inner logic here!
-    
+
     outMat[out_strides[0] * b + out_strides[1] * out_index.x + out_strides[2] * out_index.y + out_strides[3] * oc] = sum;
 }
 
@@ -173,24 +181,27 @@ kernel void conv3d_gpu(
     constant size_m* in_strides [[buffer(10)]],
     constant size_m* kernel_strides [[buffer(11)]],
     constant size_m* out_strides [[buffer(12)]],
+    constant int3& dilation_lhs [[buffer(15)]],   // input dilation; buffer(8) is kernel dilation
+    constant int& flip [[buffer(16)]],           // 1 = read the kernel back to front (true convolution)
     uint3 gid [[thread_position_in_grid]])
 {
     int batch_size = in_shape[0];
-    int in_d = in_shape[1];
-    int in_h = in_shape[2];
-    int in_w = in_shape[3];
+    int in_d = (in_shape[1] - 1) * dilation_lhs[0] + 1; // dialated input depth
+    int in_h = (in_shape[2] - 1) * dilation_lhs[1] + 1; // dialated input height
+    int in_w = (in_shape[3] - 1) * dilation_lhs[2] + 1; // dialated input width
     int in_c = in_shape[4];
-    
+
     int out_c = out_shape[4];
     int out_w = out_shape[3];
     int out_h = out_shape[2];
     int out_d = out_shape[1];
-    
-    int k_d = kernel_shape[1];
-    int k_h = kernel_shape[2];
-    int k_w = kernel_shape[3];
+
+    int k_d = kernel_shape[1]; // non dialated kernel depth
+    int k_h = kernel_shape[2]; // non dialated kernel height
+    int k_w = kernel_shape[3]; // non dialated kernel width
     int in_c_per_group = kernel_shape[4];
-    
+
+    int3 dia_lhs = dilation_lhs;
     int3 k_shape = int3(k_d, k_h, k_w); // x=depth, y=height, z=width
     
     // Deconstruct 3D Grid ID
@@ -221,11 +232,15 @@ kernel void conv3d_gpu(
                 
                 int3 offset = ( int3(i, j, k) - k_shape / 2 ) * dilation;
                 int3 sample = in_index + offset;
-                
-                if (sample.x < 0 || sample.x >= in_d || sample.y < 0 || sample.y >= in_h || sample.z < 0 || sample.z >= in_w) continue;
-                
-                int k_spatial_offset = i * kernel_strides[1] + j * kernel_strides[2] + k * kernel_strides[3];
-                int in_spatial_offset = sample.x * in_strides[1] + sample.y * in_strides[2] + sample.z * in_strides[3];
+                int3 sample_ = sample / dia_lhs; // in non dialated input space
+
+                if (sample.x < 0 || sample.x >= in_d || sample.y < 0 || sample.y >= in_h || sample.z < 0 || sample.z >= in_w || sample.x != sample_.x * dia_lhs.x || sample.y != sample_.y * dia_lhs.y || sample.z != sample_.z * dia_lhs.z) continue;
+
+                int ki = flip ? (k_d - 1 - i) : i; // flip reads the kernel back to front; the sample position stays (i, j, k)
+                int kj = flip ? (k_h - 1 - j) : j;
+                int kk = flip ? (k_w - 1 - k) : k;
+                int k_spatial_offset = ki * kernel_strides[1] + kj * kernel_strides[2] + kk * kernel_strides[3];
+                int in_spatial_offset = sample_.x * in_strides[1] + sample_.y * in_strides[2] + sample_.z * in_strides[3];
                 
                 for (int c = 0; c < in_c_per_group; c++) {
                     sum += Kernel[kernel_base_offset + k_spatial_offset + c * kernel_strides[4]] * inMat[in_base_offset + in_spatial_offset + c * in_strides[4]];
@@ -277,6 +292,8 @@ kernel void conv_gpu(
     constant size_m* out_strides [[buffer(12)]],
     constant int& num_spatial_dims [[buffer(13)]],
     constant int& kernel_dot_size [[buffer(14)]],
+    constant int* dilation_lhs [[buffer(15)]],   // input dilation; buffer(8) is kernel dilation
+    constant int& flip [[buffer(16)]],           // 1 = read the kernel back to front (true convolution)
     uint3 gid [[thread_position_in_grid]])
 {
     
@@ -335,9 +352,14 @@ kernel void conv_gpu(
         for (int j = num_spatial_dims; j >= 1; j--) {
             kernel_idx_along_axis = rem_k % kernel_shape[j];
             int kernel_offset_along_axis = ( kernel_idx_along_axis - (kernel_shape[j] / 2) ) * dilation[j-1];
-            if (in_index[j] + kernel_offset_along_axis < 0 || in_index[j] + kernel_offset_along_axis >= in_shape[j]) {valid = false; break;}
-            k_gid += kernel_idx_along_axis * kernel_strides[j];
-            in_gid += (in_index[j] + kernel_offset_along_axis) * in_strides[j];
+            // signed: in_index is size_m (uint), so padding below 0 only shows up after the cast
+            int sample = (int)in_index[j] + kernel_offset_along_axis;
+            int in_l = ((int)in_shape[j] - 1) * dilation_lhs[j-1] + 1; // dialated input length along axis j
+            int sample_ = sample / dilation_lhs[j-1]; // in non dialated input space
+            if (sample < 0 || sample >= in_l || sample != sample_ * dilation_lhs[j-1]) {valid = false; break;}
+            int k_read = flip ? ((int)kernel_shape[j] - 1 - kernel_idx_along_axis) : kernel_idx_along_axis; // flip: kernel back to front
+            k_gid += k_read * kernel_strides[j];
+            in_gid += sample_ * in_strides[j];
             rem_k /= kernel_shape[j];
         }
         

@@ -77,6 +77,8 @@ This is a complete map of every public constructor, static factory, and method e
 | `flatten(start_dim=0, end_dim=-1) const` | Collapses a contiguous range of axes into one. |
 | `transpose({new_axis_order...})` / `transpose(vector<size_m>)` / `transpose(array_descriptor)` | Permutes axes. |
 | `T() const` | Shorthand full transpose (reverses all axes). |
+| `swapaxes(axis1, axis2) const` / `matrix::swapaxes(a, axis1, axis2)` | Like `mx.swapaxes`: exchanges two axes. A `transpose` view, so no copy. Negative axes count from the end; still out of range throws `std::invalid_argument`. |
+| `moveaxis(source, destination) const` / `matrix::moveaxis(a, source, destination)` | Like `mx.moveaxis`: moves one axis to `destination` and shifts the others along (`moveaxis(-1, 0)` turns `[B, H, W, C]` into `[C, B, H, W]`). A `transpose` view; same axis rules as `swapaxes`. |
 | `broadcast_to(target_shape, target_dims) const` / `broadcast_toV2(...)` (2 overloads) / `broadcast_to_impl(...)` | Produces a zero-stride broadcasted view to a larger shape. |
 | `broadcast_shapes(...)` / `broadcast_shapes_matmul(...)` (free functions) | Computes the common broadcast shape + `BroadcastDescriptor`s for two operands, with a matmul-specific variant that leaves the last two axes alone. |
 | `unbroadcast_shape(target_shape, target_dims) const` / `unbrodcast(output, target)` | Reduces a broadcasted matrix back down to a smaller target shape (used in the backward pass for gradients). |
@@ -133,10 +135,11 @@ Note: `matrix::max(a, b)` / `matrix::min(a, b)` (static, two-matrix elementwise)
 
 | Method | Purpose |
 |---|---|
-| `matrix::conv(input, kernel, padding, stride, dilation, groups=1)` | Generic N-D convolution entry point taking `std::vector<int>` params. |
-| `matrix::conv1d(input, kernel, padding=0, stride=1, dilation=1, groups=1)` | 1D convenience wrapper. |
-| `matrix::conv2d(input, kernel, pad_h=0, pad_w=0, stride_h=1, stride_w=1, dilation_h=1, dilation_w=1, groups=1)` | 2D convenience wrapper. |
-| `matrix::conv3d(input, kernel, pad_d=0, pad_h=0, pad_w=0, stride_d=1, stride_h=1, stride_w=1, dilation_d=1, dilation_h=1, dilation_w=1, groups=1)` | 3D convenience wrapper. |
+| `matrix::conv(input, kernel, stride={}, padding={}, kernel_dilation={}, input_dilation={}, groups=1, flip=false)` | Generic N-D convolution, argument order as MLX's `conv_general`. `std::vector<int>` params, one entry per spatial axis; empty means the default (stride/dilations 1, padding 0). `input_dilation` puts `l-1` zeros between input samples (transposed conv / conv VJP); `flip` reads the kernel back to front (true convolution). Padding may be negative (crops the dilated input). Throws `std::invalid_argument` on bad ranks, vector lengths, groups (`C_in`/`C_out` divisible, kernel last axis = `C_in/groups`), values < 1, or a dilated kernel larger than the padded, dilated input. |
+| `matrix::conv(input, kernel, stride, matrix::ConvPadding{lows, highs}, kernel_dilation={}, input_dilation={}, groups=1, flip=false)` | Asymmetric padding, as MLX's `padding=(lows, highs)`: `conv(x, w, {1, 1}, {{0, 0}, {1, 1}})`. A struct rather than `std::pair` so a symmetric `{1, 1}` can't also convert to it. In 1D write `ConvPadding{{0}, {1}}` explicitly (`{{0}, {1}}` is also a valid `std::vector<int>`). Only the low side reaches the kernels; the high side only grows the output, so it's what the conv VJP's output-padding fix-up uses. |
+| `matrix::conv1d(input, kernel, stride=1, padding=0, dilation=1, groups=1, input_dilation=1, flip=false)` | 1D wrapper over `conv`. First four params in MLX's `conv1d` order; `input_dilation`/`flip` (only on MLX's `conv_general`) come after `groups`. |
+| `matrix::conv2d(input, kernel, stride_h=1, stride_w=1, pad_h=0, pad_w=0, dilation_h=1, dilation_w=1, groups=1, input_dilation_h=1, input_dilation_w=1, flip=false)` | 2D wrapper, same order as `conv1d`, one scalar per axis. |
+| `matrix::conv3d(input, kernel, stride_d/h/w=1, pad_d/h/w=0, dilation_d/h/w=1, groups=1, input_dilation_d/h/w=1, flip=false)` | 3D wrapper, same order. |
 | `conv1d_gpu / conv2d_gpu / conv3d_gpu(kernel, output)` / `conv_gpu(kernel, output)` | GPU backends invoked by the static wrappers. |
 
 ## Type Conversion

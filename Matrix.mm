@@ -1001,6 +1001,35 @@ matrix matrix::transpose(const std::vector<size_m>& new_axis_order) const {
     return output_view;
 }
 
+// wraps a negative axis (counts from the end) and throws if it's still out of range, as MLX does
+static size_m normalize_axis(int axis, uint32_t dims, const char* op) {
+    int a = axis < 0 ? axis + (int)dims : axis;
+    if (a < 0 || a >= (int)dims) {
+        throw std::invalid_argument(std::string(op) + ": axis " + std::to_string(axis) + " is out of range for a " + std::to_string(dims) + "-dim matrix");
+    }
+    return (size_m)a;
+}
+
+matrix matrix::swapaxes(int axis1, int axis2) const {
+    size_m a = normalize_axis(axis1, dims, "swapaxes");
+    size_m b = normalize_axis(axis2, dims, "swapaxes");
+    std::vector<size_m> order(dims);
+    for (uint32_t i = 0; i < dims; i++) order[i] = i;
+    std::swap(order[a], order[b]);
+    return transpose(order);
+}
+
+matrix matrix::moveaxis(int source, int destination) const {
+    size_m src = normalize_axis(source, dims, "moveaxis");
+    size_m dst = normalize_axis(destination, dims, "moveaxis");
+    // take `src` out of 0..dims-1, then put it back at `dst`
+    std::vector<size_m> order;
+    order.reserve(dims);
+    for (uint32_t i = 0; i < dims; i++) if (i != src) order.push_back(i);
+    order.insert(order.begin() + dst, src);
+    return transpose(order);
+}
+
 
 matrix matrix::T() const {
     matrix output_view(dims, type);
@@ -5051,52 +5080,40 @@ matrix matrix::unbroadcast_shape(const size_m* target_shape, int target_dims) co
 }
 
 
-matrix matrix::conv1d(const matrix& input, const matrix& kernel, int padding, int stride, int dilation, int groups) {
+// conv1d/2d/3d keep the MLX/JAX-style scalar API and forward to matrix::conv, so the
+// output-shape math and the argument checks live in one place. eval still picks the
+// 1D/2D/3D kernel from input.dims.
+matrix matrix::conv1d(const matrix& input, const matrix& kernel, int stride, int padding, int dilation, int groups, int input_dilation, bool flip) {
     // input shape [batch, X, channels]
     // kernel shape [out_channel, x, in_channel]
     // output shape [batch, X' , out_channel]
     // in_channel = channels/groups
-    matrix output(input.dims, input.type);
-    output.shape()[0] = input.shape()[0];
-    output.shape()[1] = (input.shape()[1] + 2 * padding - dilation * (kernel.shape()[1] - 1) - 1) / stride + 1;
-    output.shape()[2] = kernel.shape()[0];
-    output.calcStrides();
-    output.total_size = output.accumul(0, output.dims);
-    output.tape = new ConvolvePrimitive(input, kernel, {padding}, {stride}, {dilation}, groups);
-    return output;
+    if (input.dims != 3) {
+        throw std::invalid_argument("conv1d: input must be [batch, X, channels], got " + std::to_string(input.dims) + " dims");
+    }
+    return conv(input, kernel, {stride}, {padding}, {dilation}, {input_dilation}, groups, flip);
 }
 
-matrix matrix::conv2d(const matrix& input, const matrix& kernel, int pad_h, int pad_w, int stride_h, int stride_w, int dilation_h, int dilation_w, int groups) {
+matrix matrix::conv2d(const matrix& input, const matrix& kernel, int stride_h, int stride_w, int pad_h, int pad_w, int dilation_h, int dilation_w, int groups, int input_dilation_h, int input_dilation_w, bool flip) {
     // input shape [batch, H, W, channels]
     // kernel shape [out_channel, h, w, in_channel]
     // output shape [batch, H', W', out_channel]
     // in_channel = channels/groups
-    matrix output(input.dims, input.type);
-    output.shape()[0] = input.shape()[0];
-    output.shape()[1] = (input.shape()[1] + 2 * pad_h - dilation_h * (kernel.shape()[1] - 1) - 1) / stride_h + 1;
-    output.shape()[2] = (input.shape()[2] + 2 * pad_w - dilation_w * (kernel.shape()[2] - 1) - 1) / stride_w + 1;
-    output.shape()[3] = kernel.shape()[0];
-    output.calcStrides();
-    output.total_size = output.accumul(0, output.dims);
-    output.tape = new ConvolvePrimitive(input, kernel, {pad_h, pad_w}, {stride_h, stride_w}, {dilation_h, dilation_w}, groups);
-    return output;
+    if (input.dims != 4) {
+        throw std::invalid_argument("conv2d: input must be [batch, H, W, channels], got " + std::to_string(input.dims) + " dims");
+    }
+    return conv(input, kernel, {stride_h, stride_w}, {pad_h, pad_w}, {dilation_h, dilation_w}, {input_dilation_h, input_dilation_w}, groups, flip);
 }
 
-matrix matrix::conv3d(const matrix& input, const matrix& kernel, int pad_d, int pad_h, int pad_w, int stride_d, int stride_h, int stride_w, int dilation_d, int dilation_h, int dilation_w, int groups) {
+matrix matrix::conv3d(const matrix& input, const matrix& kernel, int stride_d, int stride_h, int stride_w, int pad_d, int pad_h, int pad_w, int dilation_d, int dilation_h, int dilation_w, int groups, int input_dilation_d, int input_dilation_h, int input_dilation_w, bool flip) {
     // input shape [batch, D, H, W, channels]
     // kernel shape [out_channel, d, h, w, in_channel]
     // output shape [batch, D', H', W', out_channel]
     // in_channel = channels/groups
-    matrix output(input.dims, input.type);
-    output.shape()[0] = input.shape()[0];
-    output.shape()[1] = (input.shape()[1] + 2 * pad_d - dilation_d * (kernel.shape()[1] - 1) - 1) / stride_d + 1;
-    output.shape()[2] = (input.shape()[2] + 2 * pad_h - dilation_h * (kernel.shape()[2] - 1) - 1) / stride_h + 1;
-    output.shape()[3] = (input.shape()[3] + 2 * pad_w - dilation_w * (kernel.shape()[3] - 1) - 1) / stride_w + 1;
-    output.shape()[4] = kernel.shape()[0];
-    output.calcStrides();
-    output.total_size = output.accumul(0, output.dims);
-    output.tape = new ConvolvePrimitive(input, kernel, {pad_d, pad_h, pad_w}, {stride_d, stride_h, stride_w}, {dilation_d, dilation_h, dilation_w}, groups);
-    return output;
+    if (input.dims != 5) {
+        throw std::invalid_argument("conv3d: input must be [batch, D, H, W, channels], got " + std::to_string(input.dims) + " dims");
+    }
+    return conv(input, kernel, {stride_d, stride_h, stride_w}, {pad_d, pad_h, pad_w}, {dilation_d, dilation_h, dilation_w}, {input_dilation_d, input_dilation_h, input_dilation_w}, groups, flip);
 }
 
 void matrix::conv1d_gpu(const matrix& kernel, matrix& output) {
@@ -5121,7 +5138,9 @@ void matrix::conv1d_gpu(const matrix& kernel, matrix& output) {
     ConvolvePrimitive* prim = (ConvolvePrimitive*)output.tape;
     [commandEncoder setBytes:prim->padding.data() length:prim->padding.size() * sizeof(int) atIndex:6];
     [commandEncoder setBytes:prim->stride.data() length:prim->stride.size() * sizeof(int) atIndex:7];
-    [commandEncoder setBytes:prim->dilation.data() length:prim->dilation.size() * sizeof(int) atIndex:8];
+    [commandEncoder setBytes:prim->dilation_rhs.data() length:prim->dilation_rhs.size() * sizeof(int) atIndex:8];
+    [commandEncoder setBytes:prim->dilation_lhs.data() length:prim->dilation_lhs.size() * sizeof(int) atIndex:15];
+    [commandEncoder setBytes:&prim->flip length:sizeof(int) atIndex:16];
     [commandEncoder setBytes:&prim->groups length:sizeof(int) atIndex:9];
     
     [commandEncoder setBytes:this->strides() length:this->dims * sizeof(size_m) atIndex:10];
@@ -5159,7 +5178,9 @@ void matrix::conv2d_gpu(const matrix& kernel, matrix& output) {
     ConvolvePrimitive* prim = (ConvolvePrimitive*)output.tape;
     [commandEncoder setBytes:prim->padding.data() length:prim->padding.size() * sizeof(int) atIndex:6];
     [commandEncoder setBytes:prim->stride.data() length:prim->stride.size() * sizeof(int) atIndex:7];
-    [commandEncoder setBytes:prim->dilation.data() length:prim->dilation.size() * sizeof(int) atIndex:8];
+    [commandEncoder setBytes:prim->dilation_rhs.data() length:prim->dilation_rhs.size() * sizeof(int) atIndex:8];
+    [commandEncoder setBytes:prim->dilation_lhs.data() length:prim->dilation_lhs.size() * sizeof(int) atIndex:15];
+    [commandEncoder setBytes:&prim->flip length:sizeof(int) atIndex:16];
     [commandEncoder setBytes:&prim->groups length:sizeof(int) atIndex:9];
     
     [commandEncoder setBytes:this->strides() length:this->dims * sizeof(size_m) atIndex:10];
@@ -5198,10 +5219,13 @@ void matrix::conv3d_gpu(const matrix& kernel, matrix& output) {
     // the kernel takes int3, which is 16 bytes (padded to 4 ints), not 3 * sizeof(int)
     simd_int3 pad = {prim->padding[0], prim->padding[1], prim->padding[2]};
     simd_int3 stride = {prim->stride[0], prim->stride[1], prim->stride[2]};
-    simd_int3 dilation = {prim->dilation[0], prim->dilation[1], prim->dilation[2]};
+    simd_int3 dilation = {prim->dilation_rhs[0], prim->dilation_rhs[1], prim->dilation_rhs[2]};
     [commandEncoder setBytes:&pad length:sizeof(simd_int3) atIndex:6];
     [commandEncoder setBytes:&stride length:sizeof(simd_int3) atIndex:7];
     [commandEncoder setBytes:&dilation length:sizeof(simd_int3) atIndex:8];
+    simd_int3 dilation_lhs = {prim->dilation_lhs[0], prim->dilation_lhs[1], prim->dilation_lhs[2]};
+    [commandEncoder setBytes:&dilation_lhs length:sizeof(simd_int3) atIndex:15];
+    [commandEncoder setBytes:&prim->flip length:sizeof(int) atIndex:16];
     [commandEncoder setBytes:&prim->groups length:sizeof(int) atIndex:9];
     
     [commandEncoder setBytes:this->strides() length:this->dims * sizeof(size_m) atIndex:10];
@@ -5216,6 +5240,230 @@ void matrix::conv3d_gpu(const matrix& kernel, matrix& output) {
     auto _threadsPerThreadgroup = MTLSizeMake(w, h, 1);
     
     [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+}
+
+// CPU twins of the ConvolutionND.metal kernels: same body, the grid becomes for loops.
+void matrix::conv1d_cpu(const matrix& kernel, matrix& output) const {
+    ConvolvePrimitive* prim = (ConvolvePrimitive*)output.tape;
+    const size_m* in_shape = shape();
+    const size_m* kernel_shape = kernel.shape();
+    const size_m* out_shape = output.shape();
+    const size_m* in_strides = strides();
+    const size_m* kernel_strides = kernel.strides();
+    const size_m* out_strides = output.strides();
+    int groups = prim->groups;
+
+    int batch_size = in_shape[0];
+    int dilation_lhs_l = prim->dilation_lhs[0];
+    int in_l = (in_shape[1] - 1) * dilation_lhs_l + 1; // dialated input length
+
+    int out_c = out_shape[2];
+    int out_l = out_shape[1];
+
+    int k_l = kernel_shape[1];
+    int in_c_per_group = kernel_shape[2];
+
+    int pad_l = prim->padding[0];
+    int stride_l = prim->stride[0];
+    int dilation_l = prim->dilation_rhs[0];
+    int flip = prim->flip;
+
+    dispatch_type(output.type, output.buffer, [&](auto* outMat) {
+        using T = std::remove_pointer_t<decltype(outMat)>;
+        const T* inMat = (const T*)buffer;
+        const T* Kernel = (const T*)kernel.buffer;
+
+        // GID: [Batch, X, Out_C]
+        for (int b = 0; b < batch_size; b++) {
+            for (int out_x = 0; out_x < out_l; out_x++) {
+                for (int oc = 0; oc < out_c; oc++) {
+                    int in_virtually_paddex_x = (out_x) * stride_l + dilation_l * (k_l/2);
+                    int in_x = in_virtually_paddex_x - pad_l;
+
+                    int group_idx = oc / (out_c / groups);
+                    int in_c_start = group_idx * in_c_per_group;
+
+                    T sum = 0;
+
+                    for (int i = 0; i < k_l; i++) {
+                        int offset = (i - (k_l / 2)) * dilation_l;
+                        int in_x_ = (in_x + offset) / dilation_lhs_l; // in non dialated input space
+                        if (in_x + offset < 0 || in_x + offset >= in_l || in_x + offset != in_x_ * dilation_lhs_l) continue;
+
+                        int ki = flip ? (k_l - 1 - i) : i; // flip reads the kernel back to front; the sample position stays i
+                        for (int j = 0; j < in_c_per_group; j++) {
+                            sum += Kernel[oc * kernel_strides[0] + ki * kernel_strides[1] + j * kernel_strides[2]] * inMat[b * in_strides[0] + in_strides[1] * (in_x_) + (in_c_start + j) * in_strides[2]];
+                        }
+                    }
+
+                    outMat[b * out_strides[0] + out_x * out_strides[1] + oc * out_strides[2]] = sum;
+                }
+            }
+        }
+    });
+}
+
+void matrix::conv2d_cpu(const matrix& kernel, matrix& output) const {
+    ConvolvePrimitive* prim = (ConvolvePrimitive*)output.tape;
+    const size_m* in_shape = shape();
+    const size_m* kernel_shape = kernel.shape();
+    const size_m* out_shape = output.shape();
+    const size_m* in_strides = strides();
+    const size_m* kernel_strides = kernel.strides();
+    const size_m* out_strides = output.strides();
+    int groups = prim->groups;
+
+    int dilation_lhs_h = prim->dilation_lhs[0], dilation_lhs_w = prim->dilation_lhs[1];
+    int in_h = (in_shape[1] - 1) * dilation_lhs_h + 1; // dialated input height
+    int in_w = (in_shape[2] - 1) * dilation_lhs_w + 1; // dialated input width
+    int out_c = out_shape[3];
+    int out_w = out_shape[2];
+    int out_h = out_shape[1];
+
+    int k_h = kernel_shape[1];
+    int k_w = kernel_shape[2];
+    int in_c_per_group = kernel_shape[3];
+
+    int pad_h = prim->padding[0], pad_w = prim->padding[1];
+    int stride_h = prim->stride[0], stride_w = prim->stride[1];
+    int dilation_h = prim->dilation_rhs[0], dilation_w = prim->dilation_rhs[1];
+    int flip = prim->flip;
+
+    dispatch_type(output.type, output.buffer, [&](auto* outMat) {
+        using T = std::remove_pointer_t<decltype(outMat)>;
+        const T* inMat = (const T*)buffer;
+        const T* Kernel = (const T*)kernel.buffer;
+
+        // GID: [[Batch, Out_H], Out_W, Out_C]
+        for (int bh = 0; bh < (int)(out_shape[0] * out_h); bh++) {
+            int b = bh / out_h;
+            int out_x = bh % out_h;
+            for (int out_y = 0; out_y < out_w; out_y++) {
+                for (int oc = 0; oc < out_c; oc++) {
+                    int group_idx = oc / (out_c / groups);
+                    int in_c_start = group_idx * in_c_per_group;
+
+                    int in_x = out_x * stride_h + dilation_h * (k_h / 2) - pad_h;
+                    int in_y = out_y * stride_w + dilation_w * (k_w / 2) - pad_w;
+
+                    int in_base_offset = b * in_strides[0] + in_c_start * in_strides[3];
+                    int kernel_base_offset = oc * kernel_strides[0];
+
+                    T sum = 0;
+                    for (int i = 0; i < k_h; i++) {
+                        for (int j = 0; j < k_w; j++) {
+                            int sample_x = in_x + (i - k_h / 2) * dilation_h;
+                            int sample_y = in_y + (j - k_w / 2) * dilation_w;
+                            int sample_x_ = sample_x / dilation_lhs_h; // in non dialated input space
+                            int sample_y_ = sample_y / dilation_lhs_w;
+
+                            if (sample_x < 0 || sample_x >= in_h || sample_y < 0 || sample_y >= in_w || sample_x != sample_x_ * dilation_lhs_h || sample_y != sample_y_ * dilation_lhs_w) continue;
+
+                            int ki = flip ? (k_h - 1 - i) : i; // flip reads the kernel back to front; the sample position stays (i, j)
+                            int kj = flip ? (k_w - 1 - j) : j;
+                            int k_spatial_offset = ki * kernel_strides[1] + kj * kernel_strides[2];
+                            int in_spatial_offset = sample_x_ * in_strides[1] + sample_y_ * in_strides[2];
+
+                            for (int c = 0; c < in_c_per_group; c++) {
+                                sum += Kernel[kernel_base_offset + k_spatial_offset + c * kernel_strides[3]] * inMat[in_base_offset + in_spatial_offset + c * in_strides[3]];
+                            }
+                        }
+                    }
+
+                    outMat[out_strides[0] * b + out_strides[1] * out_x + out_strides[2] * out_y + out_strides[3] * oc] = sum;
+                }
+            }
+        }
+    });
+}
+
+void matrix::conv3d_cpu(const matrix& kernel, matrix& output) const {
+    ConvolvePrimitive* prim = (ConvolvePrimitive*)output.tape;
+    const size_m* in_shape = shape();
+    const size_m* kernel_shape = kernel.shape();
+    const size_m* out_shape = output.shape();
+    const size_m* in_strides = strides();
+    const size_m* kernel_strides = kernel.strides();
+    const size_m* out_strides = output.strides();
+    int groups = prim->groups;
+
+    int batch_size = in_shape[0];
+    int dilation_lhs_d = prim->dilation_lhs[0], dilation_lhs_h = prim->dilation_lhs[1], dilation_lhs_w = prim->dilation_lhs[2];
+    int in_d = (in_shape[1] - 1) * dilation_lhs_d + 1; // dialated input depth
+    int in_h = (in_shape[2] - 1) * dilation_lhs_h + 1; // dialated input height
+    int in_w = (in_shape[3] - 1) * dilation_lhs_w + 1; // dialated input width
+
+    int out_c = out_shape[4];
+    int out_w = out_shape[3];
+    int out_h = out_shape[2];
+    int out_d = out_shape[1];
+
+    int k_d = kernel_shape[1];
+    int k_h = kernel_shape[2];
+    int k_w = kernel_shape[3];
+    int in_c_per_group = kernel_shape[4];
+
+    int pad_d = prim->padding[0], pad_h = prim->padding[1], pad_w = prim->padding[2];
+    int stride_d = prim->stride[0], stride_h = prim->stride[1], stride_w = prim->stride[2];
+    int dilation_d = prim->dilation_rhs[0], dilation_h = prim->dilation_rhs[1], dilation_w = prim->dilation_rhs[2];
+    int flip = prim->flip;
+
+    dispatch_type(output.type, output.buffer, [&](auto* outMat) {
+        using T = std::remove_pointer_t<decltype(outMat)>;
+        const T* inMat = (const T*)buffer;
+        const T* Kernel = (const T*)kernel.buffer;
+
+        // GID: [Out_C, Out_W, [Batch, Out_D, Out_H]]
+        for (int rem0 = 0; rem0 < batch_size * out_d * out_h; rem0++) {
+            int rem = rem0;
+            int out_h_idx = rem % out_h;
+            rem /= out_h;
+            int out_d_idx = rem % out_d;
+            int b = rem / out_d;
+            for (int out_w_idx = 0; out_w_idx < out_w; out_w_idx++) {
+                for (int oc = 0; oc < out_c; oc++) {
+                    int group_idx = oc / (out_c / groups);
+                    int in_c_start = group_idx * in_c_per_group;
+
+                    int in_x = out_d_idx * stride_d + dilation_d * (k_d / 2) - pad_d;
+                    int in_y = out_h_idx * stride_h + dilation_h * (k_h / 2) - pad_h;
+                    int in_z = out_w_idx * stride_w + dilation_w * (k_w / 2) - pad_w;
+
+                    int in_base_offset = b * in_strides[0] + in_c_start * in_strides[4];
+                    int kernel_base_offset = oc * kernel_strides[0];
+
+                    T sum = 0;
+
+                    for (int i = 0; i < k_d; i++) {
+                        for (int j = 0; j < k_h; j++) {
+                            for (int k = 0; k < k_w; k++) {
+                                int sample_x = in_x + (i - k_d / 2) * dilation_d;
+                                int sample_y = in_y + (j - k_h / 2) * dilation_h;
+                                int sample_z = in_z + (k - k_w / 2) * dilation_w;
+                                int sample_x_ = sample_x / dilation_lhs_d; // in non dialated input space
+                                int sample_y_ = sample_y / dilation_lhs_h;
+                                int sample_z_ = sample_z / dilation_lhs_w;
+
+                                if (sample_x < 0 || sample_x >= in_d || sample_y < 0 || sample_y >= in_h || sample_z < 0 || sample_z >= in_w || sample_x != sample_x_ * dilation_lhs_d || sample_y != sample_y_ * dilation_lhs_h || sample_z != sample_z_ * dilation_lhs_w) continue;
+
+                                int ki = flip ? (k_d - 1 - i) : i; // flip reads the kernel back to front; the sample position stays (i, j, k)
+                                int kj = flip ? (k_h - 1 - j) : j;
+                                int kk = flip ? (k_w - 1 - k) : k;
+                                int k_spatial_offset = ki * kernel_strides[1] + kj * kernel_strides[2] + kk * kernel_strides[3];
+                                int in_spatial_offset = sample_x_ * in_strides[1] + sample_y_ * in_strides[2] + sample_z_ * in_strides[3];
+
+                                for (int c = 0; c < in_c_per_group; c++) {
+                                    sum += Kernel[kernel_base_offset + k_spatial_offset + c * kernel_strides[4]] * inMat[in_base_offset + in_spatial_offset + c * in_strides[4]];
+                                }
+                            }
+                        }
+                    }
+
+                    outMat[out_strides[0] * b + out_strides[1] * out_d_idx + out_strides[2] * out_h_idx + out_strides[3] * out_w_idx + out_strides[4] * oc] = sum;
+                }
+            }
+        }
+    });
 }
 
 void matrix::unbrodcast(matrix& output, matrix& target) {
@@ -11587,25 +11835,71 @@ bool compare_shapes(const matrix &a, const matrix &b) {
 //
 //};
 
-matrix matrix::conv(const matrix& input, const matrix& kernel, const std::vector<int>& padding, const std::vector<int>& stride, const std::vector<int>& dilation, int groups) {
-    // generic ND convolution
+matrix matrix::conv(const matrix& input, const matrix& kernel, const std::vector<int>& stride, const std::vector<int>& padding, const std::vector<int>& kernel_dilation, const std::vector<int>& input_dilation, int groups, bool flip) {
+    // symmetric padding: the same amount on the low and high side of every axis
+    return conv(input, kernel, stride, ConvPadding{padding, padding}, kernel_dilation, input_dilation, groups, flip);
+}
+
+matrix matrix::conv(const matrix& input, const matrix& kernel, const std::vector<int>& stride_, const ConvPadding& padding_, const std::vector<int>& kernel_dilation_, const std::vector<int>& input_dilation_, int groups, bool flip) {
+    // generic ND convolution, argument order as MLX's conv_general
     // input shape [batch, S1, S2, ..., SN, channels]
     // kernel shape [out_channel, K1, K2, ..., KN, in_channel]
-    // padding, stride, dilation lengths are N
+    // stride, padding lows/highs, kernel_dilation, input_dilation lengths are N (or empty for the default)
     // N = input.dims - 2
-    
+
+    if (input.dims < 3) {
+        throw std::invalid_argument("conv: input must be [batch, spatial..., channels], got " + std::to_string(input.dims) + " dims");
+    }
+    if (kernel.dims != input.dims) {
+        throw std::invalid_argument("conv: kernel dims (" + std::to_string(kernel.dims) + ") must match input dims (" + std::to_string(input.dims) + ")");
+    }
+
+    int N = input.dims - 2;
+    auto or_default = [N](const std::vector<int>& v, int value) { return v.empty() ? std::vector<int>(N, value) : v; };
+    std::vector<int> stride = or_default(stride_, 1);
+    std::vector<int> padding = or_default(padding_.lo, 0);     // low side: the only one the kernels use
+    std::vector<int> padding_hi = or_default(padding_.hi, 0);  // high side: only grows the output
+    std::vector<int> dilation_rhs = or_default(kernel_dilation_, 1);
+    std::vector<int> dilation_lhs = or_default(input_dilation_, 1);
+    if ((int)stride.size() != N || (int)padding.size() != N || (int)padding_hi.size() != N || (int)dilation_rhs.size() != N || (int)dilation_lhs.size() != N) {
+        throw std::invalid_argument("conv: stride, padding (lows and highs), kernel_dilation and input_dilation must each have " + std::to_string(N) + " entries (or be empty)");
+    }
+
+    int in_c = (int)input.shape()[input.dims - 1];
+    int out_c = (int)kernel.shape()[0];
+    int kernel_in_c = (int)kernel.shape()[kernel.dims - 1];
+    if (groups < 1) {
+        throw std::invalid_argument("conv: groups must be >= 1, got " + std::to_string(groups));
+    }
+    if (in_c % groups != 0 || out_c % groups != 0) {
+        throw std::invalid_argument("conv: in_channels (" + std::to_string(in_c) + ") and out_channels (" + std::to_string(out_c) + ") must both be divisible by groups (" + std::to_string(groups) + ")");
+    }
+    if (kernel_in_c != in_c / groups) {
+        throw std::invalid_argument("conv: kernel's last axis (" + std::to_string(kernel_in_c) + ") must be in_channels / groups (" + std::to_string(in_c / groups) + ")");
+    }
+
     matrix output(input.dims, input.type);
     output.shape()[0] = input.shape()[0];
-    
-    int N = input.dims - 2;
+
     for (int i = 0; i < N; i++) {
-        output.shape()[i + 1] = (input.shape()[i + 1] + 2 * padding[i] - dilation[i] * (kernel.shape()[i + 1] - 1) - 1) / stride[i] + 1;
+        if (stride[i] < 1 || dilation_lhs[i] < 1 || dilation_rhs[i] < 1) {
+            throw std::invalid_argument("conv: stride, kernel_dilation and input_dilation must be >= 1 (axis " + std::to_string(i) + ")");
+        }
+        int dialated_input = dilation_lhs[i] * ((int)input.shape()[i + 1] - 1) + 1;
+        int dialated_kernel = dilation_rhs[i] * ((int)kernel.shape()[i + 1] - 1) + 1;
+
+        int span = dialated_input + padding[i] + padding_hi[i] - dialated_kernel;
+        // C++ division truncates toward zero, so a negative span would still give a size of 1
+        if (span < 0) {
+            throw std::invalid_argument("conv: dilated kernel (" + std::to_string(dialated_kernel) + ") is larger than the padded, dilated input (" + std::to_string(dialated_input + padding[i] + padding_hi[i]) + ") on axis " + std::to_string(i));
+        }
+        output.shape()[i + 1] = span / stride[i] + 1;
     }
-    
+
     output.shape()[input.dims - 1] = kernel.shape()[0];
     output.calcStrides();
     output.total_size = output.accumul(0, output.dims);
-    output.tape = new ConvolvePrimitive(input, kernel, padding, stride, dilation, groups);
+    output.tape = new ConvolvePrimitive(input, kernel, padding, padding_hi, stride, dilation_lhs, dilation_rhs, groups, flip);
     return output;
 }
 
@@ -11652,7 +11946,9 @@ void matrix::conv_gpu(const matrix& kernel, matrix& output) {
     
     [commandEncoder setBytes:prim->padding.data() length:prim->padding.size() * sizeof(int) atIndex:6];
     [commandEncoder setBytes:prim->stride.data() length:prim->stride.size() * sizeof(int) atIndex:7];
-    [commandEncoder setBytes:prim->dilation.data() length:prim->dilation.size() * sizeof(int) atIndex:8];
+    [commandEncoder setBytes:prim->dilation_rhs.data() length:prim->dilation_rhs.size() * sizeof(int) atIndex:8];
+    [commandEncoder setBytes:prim->dilation_lhs.data() length:prim->dilation_lhs.size() * sizeof(int) atIndex:15];
+    [commandEncoder setBytes:&prim->flip length:sizeof(int) atIndex:16];
     [commandEncoder setBytes:&groups length:sizeof(int) atIndex:9];
     
     [commandEncoder setBytes:strides() length:dims * sizeof(size_m) atIndex:10];
@@ -11669,6 +11965,110 @@ void matrix::conv_gpu(const matrix& kernel, matrix& output) {
     [commandEncoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 }
 
+void matrix::conv_cpu(const matrix& kernel, matrix& output) const {
+    ConvolvePrimitive* prim = (ConvolvePrimitive*)output.tape;
+    const size_m* in_shape = shape();
+    const size_m* kernel_shape = kernel.shape();
+    const size_m* out_shape = output.shape();
+    const size_m* in_strides = strides();
+    const size_m* kernel_strides = kernel.strides();
+    const size_m* out_strides = output.strides();
+    const int* padding = prim->padding.data();
+    const int* stride = prim->stride.data();
+    const int* dilation = prim->dilation_rhs.data();
+    const int* dilation_lhs = prim->dilation_lhs.data();
+    int groups = prim->groups;
+    int flip = prim->flip;
+
+    int num_spatial_dims = output.dims - 2;
+
+    size_t batch_and_remaining_spatial = out_shape[0];
+    for (int i = 1; i < num_spatial_dims; i++) {
+        batch_and_remaining_spatial *= out_shape[i];
+    }
+
+    int kernel_dot_size = 1;
+    for (int i = 1; i < kernel.dims; i++) {
+        kernel_dot_size *= kernel_shape[i];
+    }
+
+    int out_c = out_shape[num_spatial_dims+1];
+    int in_c_per_group = kernel_shape[num_spatial_dims+1];
+
+    // signed: padding sends in_index below 0 (the Metal kernel relies on uint wraparound)
+    std::vector<int64_t> out_index(output.dims), in_index(output.dims);
+
+    dispatch_type(output.type, output.buffer, [&](auto* outMat) {
+        using T = std::remove_pointer_t<decltype(outMat)>;
+        const T* inMat = (const T*)buffer;
+        const T* Kernel = (const T*)kernel.buffer;
+
+        // GID: [Channels, Last Spatial Dim, Batch * Spatial Dims(except last)]
+        for (size_t gid_z = 0; gid_z < batch_and_remaining_spatial; gid_z++) {
+            for (size_m gid_y = 0; gid_y < out_shape[num_spatial_dims]; gid_y++) {
+                for (int oc = 0; oc < out_c; oc++) {
+                    int group_idx = oc / (out_c / groups);
+                    int in_c_start = group_idx * in_c_per_group;
+
+                    T sum = 0;
+
+                    int rem = (int)gid_z;
+
+                    out_index[num_spatial_dims+1] = oc;
+                    in_index[num_spatial_dims+1] = in_c_start;
+
+                    out_index[num_spatial_dims] = gid_y;
+                    in_index[num_spatial_dims] = out_index[num_spatial_dims] * stride[num_spatial_dims-1] + dilation[num_spatial_dims-1] * (kernel_shape[num_spatial_dims]/2) - padding[num_spatial_dims-1];
+
+                    for (int i = num_spatial_dims-1; i >= 1; i--) {
+                        out_index[i] = rem % out_shape[i];
+                        in_index[i] = out_index[i] * stride[i-1] + dilation[i-1] * (kernel_shape[i]/2) - padding[i-1];
+                        rem /= out_shape[i];
+                    }
+
+                    int b = rem;
+                    out_index[0] = b;
+                    in_index[0] = b;
+
+                    int out_gid = 0;
+                    for (int i = 0; i < num_spatial_dims+2; i++) {
+                        out_gid += out_index[i] * out_strides[i];
+                    }
+
+                    for (int i = 0; i < kernel_dot_size; i++) {
+                        int in_gid = b * in_strides[0];
+                        int k_gid = oc * kernel_strides[0];
+
+                        int kernel_idx_along_axis = (i % kernel_shape[num_spatial_dims+1]);
+                        k_gid += kernel_idx_along_axis * kernel_strides[num_spatial_dims+1];
+                        int rem_k = i / kernel_shape[num_spatial_dims+1];
+
+                        in_gid += (in_c_start + kernel_idx_along_axis) * in_strides[num_spatial_dims+1];
+
+                        bool valid = true;
+                        for (int j = num_spatial_dims; j >= 1; j--) {
+                            kernel_idx_along_axis = rem_k % kernel_shape[j];
+                            int kernel_offset_along_axis = ( kernel_idx_along_axis - (int)(kernel_shape[j] / 2) ) * dilation[j-1];
+                            int64_t sample = in_index[j] + kernel_offset_along_axis;
+                            int64_t in_l = ((int64_t)in_shape[j] - 1) * dilation_lhs[j-1] + 1; // dialated input length along axis j
+                            int64_t sample_ = sample / dilation_lhs[j-1]; // in non dialated input space
+                            if (sample < 0 || sample >= in_l || sample != sample_ * dilation_lhs[j-1]) {valid = false; break;}
+                            int k_read = flip ? ((int)kernel_shape[j] - 1 - kernel_idx_along_axis) : kernel_idx_along_axis; // flip: kernel back to front
+                            k_gid += k_read * kernel_strides[j];
+                            in_gid += sample_ * in_strides[j];
+                            rem_k /= kernel_shape[j];
+                        }
+
+                        if (valid) {
+                            sum += Kernel[k_gid] * inMat[in_gid];
+                        }
+                    }
+                    outMat[out_gid] = sum;
+                }
+            }
+        }
+    });
+}
 // MARK: Resample (generic ND nearest / N-linear resize)
 
 // Scans backward from the last axis and returns the smallest index `k` such that every

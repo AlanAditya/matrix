@@ -193,13 +193,16 @@ class ConvolvePrimitive : public Primitive {
 public:
     matrix input;
     matrix kernel;
-    std::vector<int> padding;
+    std::vector<int> padding;        // low side; the kernels only ever need this one
+    std::vector<int> padding_hi;     // high side; only sets the output shape, kept to rebuild the conv (jvp)
     std::vector<int> stride;
-    std::vector<int> dilation;
+    std::vector<int> dilation_lhs;   // input dilation: (l - 1) zeros between input samples
+    std::vector<int> dilation_rhs;   // kernel dilation: (d - 1) gaps between kernel taps
     int groups;
+    int flip;                        // 1 = true convolution (kernel read back to front); int so it goes straight to Metal
 
-    ConvolvePrimitive(const matrix& input, const matrix& kernel, const std::vector<int>& padding, const std::vector<int>& stride, const std::vector<int>& dilation, int groups)
-        : input(ensure_graph_ready(input)), kernel(ensure_graph_ready(kernel)), padding(padding), stride(stride), dilation(dilation), groups(groups) {
+    ConvolvePrimitive(const matrix& input, const matrix& kernel, const std::vector<int>& padding, const std::vector<int>& padding_hi, const std::vector<int>& stride, const std::vector<int>& dilation_lhs, const std::vector<int>& dilation_rhs, int groups, bool flip)
+        : input(ensure_graph_ready(input)), kernel(ensure_graph_ready(kernel)), padding(padding), padding_hi(padding_hi), stride(stride), dilation_lhs(dilation_lhs), dilation_rhs(dilation_rhs), groups(groups), flip(flip ? 1 : 0) {
     }
 
     void eval_cpu(matrix& out, EvalType eval_type) override {
@@ -229,7 +232,15 @@ public:
         }
         if (evaluated) {return;} else {evaluated = true;}
 
-        // input.conv_cpu(kernel, out, eval_type);
+        if (input.dims == 3) {
+            input.conv1d_cpu(kernel, out);
+        } else if (input.dims == 4) {
+            input.conv2d_cpu(kernel, out);
+        } else if (input.dims == 5) {
+            input.conv3d_cpu(kernel, out);
+        } else {
+            input.conv_cpu(kernel, out);
+        }
     }
 
     void eval_metal(matrix& out, EvalType eval_type) override {
@@ -285,11 +296,17 @@ public:
     }
 
     matrix jvp(std::vector<matrix>& tangents) override {
-        throw std::runtime_error("JVP not implemented for ConvolvePrimitive");
+        // conv is bilinear, so d(conv(x, w)) = conv(dx, w) + conv(x, dw).
+        // matrix::conv builds the same ConvolvePrimitive as conv1d/2d/3d; eval picks the kernel by dims.
+        matrix::ConvPadding pad{padding, padding_hi};
+        return matrix::conv(tangents[0], kernel, stride, pad, dilation_rhs, dilation_lhs, groups, flip) + matrix::conv(input, tangents[1], stride, pad, dilation_rhs, dilation_lhs, groups, flip);
     }
 
     std::vector<matrix> vjp(matrix& grad_out) override {
-        throw std::runtime_error("VJP not implemented for ConvolvePrimitive");
+        std::vector<int> stride_g(grad_out.dims - 2, 1);
+        std::vector<int> pad_lo(grad_out.dims - 2, 1);
+        std::vector<int> pad_hi(grad_out.dims - 2, 1);
+        return {matrix::conv(grad_out, kernel.swapaxes(0, -1), dilation_lhs, matrix::ConvPadding{pad_lo, pad_hi}, dilation_rhs, stride, groups, !flip)};
     }
 
     matrix* get_borrowed_input() override {

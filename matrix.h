@@ -920,6 +920,12 @@ public:
     matrix transpose(const std::vector<size_m>& new_axis_order) const;
     matrix transpose(array_descriptor transpose_desc) const;
     matrix T() const;
+    // MLX/JAX-style axis permutes, built on transpose (a view). Negative axes count from the end.
+    // swapaxes exchanges two axes; moveaxis moves one axis to `destination` and shifts the rest.
+    matrix swapaxes(int axis1, int axis2) const;
+    matrix moveaxis(int source, int destination) const;
+    static matrix swapaxes(const matrix& a, int axis1, int axis2) { return a.swapaxes(axis1, axis2); }
+    static matrix moveaxis(const matrix& a, int source, int destination) { return a.moveaxis(source, destination); }
     
     matrix broadcast_to(const size_m *target_shape, int target_dims) const;
     void SumNoRed(matrix& output, int axis, EvalType eval_type = EvalType::EVAL_AUTO);
@@ -1616,11 +1622,28 @@ public:
     static matrix min(const matrix& a, const matrix& b);
     void min(const matrix& other, matrix& output, ExecutionDevice exec_device) const;
 
-    static matrix conv(const matrix& input, const matrix& kernel, const std::vector<int>& padding, const std::vector<int>& stride, const std::vector<int>& dilation, int groups = 1);
+    // Argument order mirrors MLX's conv_general(input, weight, stride, padding, kernel_dilation, input_dilation, groups, flip).
+    // kernel_dilation = gaps between kernel taps, input_dilation = zeros between input samples,
+    // flip = true convolution (kernel read back to front) instead of cross-correlation.
+    // An empty vector means the default for every spatial axis (stride/dilations 1, padding 0).
+    // Padding may be negative (crops the dilated input), which the conv VJP needs.
+    static matrix conv(const matrix& input, const matrix& kernel, const std::vector<int>& stride = {}, const std::vector<int>& padding = {}, const std::vector<int>& kernel_dilation = {}, const std::vector<int>& input_dilation = {}, int groups = 1, bool flip = false);
     
-    static matrix conv1d(const matrix& input, const matrix& kernel, int padding = 0, int stride = 1, int dilation = 1, int groups = 1);
-    static matrix conv2d(const matrix& input, const matrix& kernel, int pad_h = 0, int pad_w = 0, int stride_h = 1, int stride_w = 1, int dilation_h = 1, int dilation_w = 1, int groups = 1);
-    static matrix conv3d(const matrix& input, const matrix& kernel, int pad_d = 0, int pad_h = 0, int pad_w = 0, int stride_d = 1, int stride_h = 1, int stride_w = 1, int dilation_d = 1, int dilation_h = 1, int dilation_w = 1, int groups = 1);
+    // Asymmetric padding, as MLX's padding=(lows, highs): all low sides, then all high sides.
+    // A struct (not std::pair) so a symmetric {1, 1} can't also convert to it: conv(x, w, {1, 1}, {{0, 0}, {1, 1}}).
+    // In 1D spell it out, ConvPadding{{0}, {1}}, since {{0}, {1}} is also a valid std::vector<int>.
+    // Kernels only use the low side; the high side only grows the output shape.
+    struct ConvPadding {
+        std::vector<int> lo, hi;
+        ConvPadding(const std::vector<int>& lo, const std::vector<int>& hi) : lo(lo), hi(hi) {}
+    };
+    static matrix conv(const matrix& input, const matrix& kernel, const std::vector<int>& stride, const ConvPadding& padding, const std::vector<int>& kernel_dilation = {}, const std::vector<int>& input_dilation = {}, int groups = 1, bool flip = false);
+
+    // Mirror MLX's conv1d/2d/3d(input, weight, stride, padding, dilation, groups); input_dilation and
+    // flip (MLX only has them on conv_general) come after groups so MLX-style calls port positionally.
+    static matrix conv1d(const matrix& input, const matrix& kernel, int stride = 1, int padding = 0, int dilation = 1, int groups = 1, int input_dilation = 1, bool flip = false);
+    static matrix conv2d(const matrix& input, const matrix& kernel, int stride_h = 1, int stride_w = 1, int pad_h = 0, int pad_w = 0, int dilation_h = 1, int dilation_w = 1, int groups = 1, int input_dilation_h = 1, int input_dilation_w = 1, bool flip = false);
+    static matrix conv3d(const matrix& input, const matrix& kernel, int stride_d = 1, int stride_h = 1, int stride_w = 1, int pad_d = 0, int pad_h = 0, int pad_w = 0, int dilation_d = 1, int dilation_h = 1, int dilation_w = 1, int groups = 1, int input_dilation_d = 1, int input_dilation_h = 1, int input_dilation_w = 1, bool flip = false);
 
     // useAccelerateCPU opts the CPU tail path into Accelerate/vImage when the tail
     // shape qualifies (leading_rank==2, tail_size in {1,4}, Float/UInt8, packed rows --
@@ -1647,6 +1670,10 @@ public:
     void conv2d_gpu(const matrix& kernel, matrix& output);
     void conv3d_gpu(const matrix& kernel, matrix& output);
     void conv_gpu(const matrix& kernel, matrix& output);
+    void conv1d_cpu(const matrix& kernel, matrix& output) const;
+    void conv2d_cpu(const matrix& kernel, matrix& output) const;
+    void conv3d_cpu(const matrix& kernel, matrix& output) const;
+    void conv_cpu(const matrix& kernel, matrix& output) const;
 
     
     void eval_metal();
