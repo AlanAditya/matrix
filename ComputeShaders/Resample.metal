@@ -12,6 +12,17 @@
 
 using namespace metal;
 
+// Nearest source index along one axis, exactly: output i sits at i * (in - 1) / (out - 1) of the
+// input (linspace(0, in - 1, out)), rounded half away from zero. Integer math, so exact .5 ties and
+// large sizes pick the same element as the CPU (resample_nearest_index in Matrix.mm). The float
+// scale used to round differently here (float product) and on the CPU (double product).
+inline size_m resample_nearest_index(size_m i, size_m in_size, size_m out_size) {
+    if (in_size <= 1 || out_size <= 1) return 0;
+    const ulong num = (ulong)i * (in_size - 1);
+    const ulong den = out_size - 1;
+    return (size_m)((2 * num + den) / (2 * den));
+}
+
 // =====================================================================
 // Nearest
 // =====================================================================
@@ -24,13 +35,11 @@ kernel void resample_nearest_nd1(
     constant const size_m& out_stride [[buffer(2)]],
     constant const size_m& in_stride [[buffer(3)]],
     constant const size_m& in_shape [[buffer(4)]],
-    constant const float& scale [[buffer(5)]],
+    constant const size_m& out_shape [[buffer(5)]],
     uint index [[thread_position_in_grid]])
 {
     size_m out_idx = index;
-    float coord = float(out_idx) * scale;
-    size_m in_idx = (size_m) round(coord);
-    if (in_idx >= in_shape) in_idx = in_shape - 1;
+    size_m in_idx = resample_nearest_index(out_idx, in_shape, out_shape);
     outMat[out_idx * out_stride] = inMat[in_idx * in_stride];
 }
 
@@ -42,17 +51,15 @@ kernel void resample_nearest_nd2(
     constant const size_m* out_strides [[buffer(2)]],
     constant const size_m* in_strides [[buffer(3)]],
     constant const size_m* in_shape [[buffer(4)]],
-    constant const float* scale [[buffer(5)]],
+    constant const size_m* out_shape [[buffer(5)]],
     uint2 gid [[thread_position_in_grid]])
 {
     size_m out_idx0 = gid.y;
     size_m out_idx1 = gid.x;
     size_m out_off = out_idx0 * out_strides[0] + out_idx1 * out_strides[1];
 
-    size_m in_idx0 = (size_m) round(float(out_idx0) * scale[0]);
-    if (in_idx0 >= in_shape[0]) in_idx0 = in_shape[0] - 1;
-    size_m in_idx1 = (size_m) round(float(out_idx1) * scale[1]);
-    if (in_idx1 >= in_shape[1]) in_idx1 = in_shape[1] - 1;
+    size_m in_idx0 = resample_nearest_index(out_idx0, in_shape[0], out_shape[0]);
+    size_m in_idx1 = resample_nearest_index(out_idx1, in_shape[1], out_shape[1]);
 
     outMat[out_off] = inMat[in_idx0 * in_strides[0] + in_idx1 * in_strides[1]];
 }
@@ -65,7 +72,7 @@ kernel void resample_nearest_nd3(
     constant const size_m* out_strides [[buffer(2)]],
     constant const size_m* in_strides [[buffer(3)]],
     constant const size_m* in_shape [[buffer(4)]],
-    constant const float* scale [[buffer(5)]],
+    constant const size_m* out_shape [[buffer(5)]],
     uint3 gid [[thread_position_in_grid]])
 {
     size_m out_idx0 = gid.z;
@@ -73,12 +80,9 @@ kernel void resample_nearest_nd3(
     size_m out_idx2 = gid.x;
     size_m out_off = out_idx0 * out_strides[0] + out_idx1 * out_strides[1] + out_idx2 * out_strides[2];
 
-    size_m in_idx0 = (size_m) round(float(out_idx0) * scale[0]);
-    if (in_idx0 >= in_shape[0]) in_idx0 = in_shape[0] - 1;
-    size_m in_idx1 = (size_m) round(float(out_idx1) * scale[1]);
-    if (in_idx1 >= in_shape[1]) in_idx1 = in_shape[1] - 1;
-    size_m in_idx2 = (size_m) round(float(out_idx2) * scale[2]);
-    if (in_idx2 >= in_shape[2]) in_idx2 = in_shape[2] - 1;
+    size_m in_idx0 = resample_nearest_index(out_idx0, in_shape[0], out_shape[0]);
+    size_m in_idx1 = resample_nearest_index(out_idx1, in_shape[1], out_shape[1]);
+    size_m in_idx2 = resample_nearest_index(out_idx2, in_shape[2], out_shape[2]);
 
     outMat[out_off] = inMat[in_idx0 * in_strides[0] + in_idx1 * in_strides[1] + in_idx2 * in_strides[2]];
 }
@@ -92,7 +96,6 @@ kernel void resample_nearest_gg(
     constant const size_m* out_strides [[buffer(2)]],
     constant const size_m* in_strides [[buffer(3)]],
     constant const size_m* in_shape [[buffer(4)]],
-    constant const float* scale [[buffer(5)]],
     constant const size_m* out_shape [[buffer(6)]],
     constant const int& ndim [[buffer(7)]],
     uint3 gid [[thread_position_in_grid]])
@@ -111,8 +114,7 @@ kernel void resample_nearest_gg(
     size_m in_off = 0;
     for (int i = 0; i < ndim; i++) {
         out_off += out_idx[i] * out_strides[i];
-        size_m in_idx = (size_m) round(float(out_idx[i]) * scale[i]);
-        if (in_idx >= in_shape[i]) in_idx = in_shape[i] - 1;
+        size_m in_idx = resample_nearest_index(out_idx[i], in_shape[i], out_shape[i]);
         in_off += in_idx * in_strides[i];
     }
 
@@ -328,16 +330,14 @@ kernel void resample_nearest_tail_nd1(
     constant const size_m& out_stride [[buffer(2)]],
     constant const size_m& in_stride [[buffer(3)]],
     constant const size_m& in_shape [[buffer(4)]],
-    constant const float& scale [[buffer(5)]],
+    constant const size_m& out_shape [[buffer(5)]],
     constant const size_m& tail_size [[buffer(6)]],
     constant const size_m& in_tail_stride [[buffer(7)]],
     constant const size_m& out_tail_stride [[buffer(8)]],
     uint index [[thread_position_in_grid]])
 {
     size_m out_idx = index;
-    float coord = float(out_idx) * scale;
-    size_m in_idx = (size_m) round(coord);
-    if (in_idx >= in_shape) in_idx = in_shape - 1;
+    size_m in_idx = resample_nearest_index(out_idx, in_shape, out_shape);
 
     size_m out_off = out_idx * out_stride;
     size_m in_off = in_idx * in_stride;
@@ -354,7 +354,7 @@ kernel void resample_nearest_tail_nd2(
     constant const size_m* out_strides [[buffer(2)]],
     constant const size_m* in_strides [[buffer(3)]],
     constant const size_m* in_shape [[buffer(4)]],
-    constant const float* scale [[buffer(5)]],
+    constant const size_m* out_shape [[buffer(5)]],
     constant const size_m& tail_size [[buffer(6)]],
     constant const size_m& in_tail_stride [[buffer(7)]],
     constant const size_m& out_tail_stride [[buffer(8)]],
@@ -364,10 +364,8 @@ kernel void resample_nearest_tail_nd2(
     size_m out_idx1 = gid.x;
     size_m out_off = out_idx0 * out_strides[0] + out_idx1 * out_strides[1];
 
-    size_m in_idx0 = (size_m) round(float(out_idx0) * scale[0]);
-    if (in_idx0 >= in_shape[0]) in_idx0 = in_shape[0] - 1;
-    size_m in_idx1 = (size_m) round(float(out_idx1) * scale[1]);
-    if (in_idx1 >= in_shape[1]) in_idx1 = in_shape[1] - 1;
+    size_m in_idx0 = resample_nearest_index(out_idx0, in_shape[0], out_shape[0]);
+    size_m in_idx1 = resample_nearest_index(out_idx1, in_shape[1], out_shape[1]);
     size_m in_off = in_idx0 * in_strides[0] + in_idx1 * in_strides[1];
 
     for (size_m c = 0; c < tail_size; c++) {
@@ -383,7 +381,7 @@ kernel void resample_nearest_tail_nd3(
     constant const size_m* out_strides [[buffer(2)]],
     constant const size_m* in_strides [[buffer(3)]],
     constant const size_m* in_shape [[buffer(4)]],
-    constant const float* scale [[buffer(5)]],
+    constant const size_m* out_shape [[buffer(5)]],
     constant const size_m& tail_size [[buffer(6)]],
     constant const size_m& in_tail_stride [[buffer(7)]],
     constant const size_m& out_tail_stride [[buffer(8)]],
@@ -394,12 +392,9 @@ kernel void resample_nearest_tail_nd3(
     size_m out_idx2 = gid.x;
     size_m out_off = out_idx0 * out_strides[0] + out_idx1 * out_strides[1] + out_idx2 * out_strides[2];
 
-    size_m in_idx0 = (size_m) round(float(out_idx0) * scale[0]);
-    if (in_idx0 >= in_shape[0]) in_idx0 = in_shape[0] - 1;
-    size_m in_idx1 = (size_m) round(float(out_idx1) * scale[1]);
-    if (in_idx1 >= in_shape[1]) in_idx1 = in_shape[1] - 1;
-    size_m in_idx2 = (size_m) round(float(out_idx2) * scale[2]);
-    if (in_idx2 >= in_shape[2]) in_idx2 = in_shape[2] - 1;
+    size_m in_idx0 = resample_nearest_index(out_idx0, in_shape[0], out_shape[0]);
+    size_m in_idx1 = resample_nearest_index(out_idx1, in_shape[1], out_shape[1]);
+    size_m in_idx2 = resample_nearest_index(out_idx2, in_shape[2], out_shape[2]);
     size_m in_off = in_idx0 * in_strides[0] + in_idx1 * in_strides[1] + in_idx2 * in_strides[2];
 
     for (size_m c = 0; c < tail_size; c++) {
@@ -415,7 +410,6 @@ kernel void resample_nearest_tail_gg(
     constant const size_m* out_strides [[buffer(2)]],
     constant const size_m* in_strides [[buffer(3)]],
     constant const size_m* in_shape [[buffer(4)]],
-    constant const float* scale [[buffer(5)]],
     constant const size_m* out_shape [[buffer(6)]],
     constant const int& ndim [[buffer(7)]],
     constant const size_m& tail_size [[buffer(8)]],
@@ -437,8 +431,7 @@ kernel void resample_nearest_tail_gg(
     size_m in_off = 0;
     for (int i = 0; i < ndim; i++) {
         out_off += out_idx[i] * out_strides[i];
-        size_m in_idx = (size_m) round(float(out_idx[i]) * scale[i]);
-        if (in_idx >= in_shape[i]) in_idx = in_shape[i] - 1;
+        size_m in_idx = resample_nearest_index(out_idx[i], in_shape[i], out_shape[i]);
         in_off += in_idx * in_strides[i];
     }
 

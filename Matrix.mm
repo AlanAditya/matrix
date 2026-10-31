@@ -12337,25 +12337,30 @@ void matrix::resample_backend_gpu(matrix& output) {
         [commandEncoder setBytes:&out_stride length:sizeof(size_m) atIndex:2];
         [commandEncoder setBytes:&in_stride length:sizeof(size_m) atIndex:3];
         [commandEncoder setBytes:&in_shape0 length:sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:scale length:sizeof(float) atIndex:5];
+        // Nearest takes each axis's output size (it computes exact integer indices); linear the scale.
+        if (linear) [commandEncoder setBytes:scale length:sizeof(float) atIndex:5];
+        else [commandEncoder setBytes:output.shape() length:sizeof(size_m) atIndex:5];
         _dispatchExecutionSize = MTLSizeMake(output.shape()[0], 1, 1);
     } else if (ndims == 2) {
         [commandEncoder setBytes:output.strides() length:2 * sizeof(size_m) atIndex:2];
         [commandEncoder setBytes:strides() length:2 * sizeof(size_m) atIndex:3];
         [commandEncoder setBytes:shape() length:2 * sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:scale length:2 * sizeof(float) atIndex:5];
+        if (linear) [commandEncoder setBytes:scale length:2 * sizeof(float) atIndex:5];
+        else [commandEncoder setBytes:output.shape() length:2 * sizeof(size_m) atIndex:5];
         _dispatchExecutionSize = MTLSizeMake(output.shape()[1], output.shape()[0], 1);
     } else if (ndims == 3) {
         [commandEncoder setBytes:output.strides() length:3 * sizeof(size_m) atIndex:2];
         [commandEncoder setBytes:strides() length:3 * sizeof(size_m) atIndex:3];
         [commandEncoder setBytes:shape() length:3 * sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:scale length:3 * sizeof(float) atIndex:5];
+        if (linear) [commandEncoder setBytes:scale length:3 * sizeof(float) atIndex:5];
+        else [commandEncoder setBytes:output.shape() length:3 * sizeof(size_m) atIndex:5];
         _dispatchExecutionSize = MTLSizeMake(output.shape()[2], output.shape()[1], output.shape()[0]);
     } else {
         [commandEncoder setBytes:output.strides() length:ndims * sizeof(size_m) atIndex:2];
         [commandEncoder setBytes:strides() length:ndims * sizeof(size_m) atIndex:3];
         [commandEncoder setBytes:shape() length:ndims * sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:scale length:ndims * sizeof(float) atIndex:5];
+        if (linear) [commandEncoder setBytes:scale length:ndims * sizeof(float) atIndex:5];
+        else [commandEncoder setBytes:output.shape() length:ndims * sizeof(size_m) atIndex:5];
         [commandEncoder setBytes:output.shape() length:ndims * sizeof(size_m) atIndex:6];
         int ndim_i = (int)ndims;
         [commandEncoder setBytes:&ndim_i length:sizeof(int) atIndex:7];
@@ -12367,6 +12372,16 @@ void matrix::resample_backend_gpu(matrix& output) {
     }
 
     [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
+}
+
+// Nearest source index along one axis, exactly: output i sits at i * (in - 1) / (out - 1) of the
+// input (linspace(0, in - 1, out)), rounded half away from zero. Integer math, so exact .5 ties and
+// large sizes pick the same element as the Metal kernels (resample_nearest_index in Resample.metal).
+static inline size_m resample_nearest_index(size_m i, size_m in_size, size_m out_size) {
+    if (in_size <= 1 || out_size <= 1) return 0;
+    const uint64_t num = (uint64_t)i * (in_size - 1);
+    const uint64_t den = out_size - 1;
+    return (size_m)((2 * num + den) / (2 * den));
 }
 
 // CPU backend for the general (no identity tail) resample path. Rank-specialized like
@@ -12392,24 +12407,19 @@ void matrix::resample_backend_cpu(matrix& output) {
         if (mode == ResampleMode::Nearest) {
             if (ndims == 1) {
                 size_m out_s0 = out_strides_[0], in_s0 = in_strides_[0], in_sh0 = in_shape_[0];
-                float sc0 = scale[0];
                 for (size_m i = 0; i < out_shape_[0]; i++) {
-                    size_m in_i = (size_m) std::lround((double)i * sc0);
-                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    size_m in_i = resample_nearest_index(i, in_sh0, out_shape_[0]);
                     out_data[i * out_s0] = in_data[in_i * in_s0];
                 }
             } else if (ndims == 2) {
                 size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1];
                 size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1];
                 size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1];
-                float sc0 = scale[0], sc1 = scale[1];
                 for (size_m i = 0; i < out_shape_[0]; i++) {
-                    size_m in_i = (size_m) std::lround((double)i * sc0);
-                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    size_m in_i = resample_nearest_index(i, in_sh0, out_shape_[0]);
                     size_m out_row = i * out_s0, in_row = in_i * in_s0;
                     for (size_m j = 0; j < out_shape_[1]; j++) {
-                        size_m in_j = (size_m) std::lround((double)j * sc1);
-                        if (in_j >= in_sh1) in_j = in_sh1 - 1;
+                        size_m in_j = resample_nearest_index(j, in_sh1, out_shape_[1]);
                         out_data[out_row + j * out_s1] = in_data[in_row + in_j * in_s1];
                     }
                 }
@@ -12417,18 +12427,14 @@ void matrix::resample_backend_cpu(matrix& output) {
                 size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1], out_s2 = out_strides_[2];
                 size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1], in_s2 = in_strides_[2];
                 size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1], in_sh2 = in_shape_[2];
-                float sc0 = scale[0], sc1 = scale[1], sc2 = scale[2];
                 for (size_m i = 0; i < out_shape_[0]; i++) {
-                    size_m in_i = (size_m) std::lround((double)i * sc0);
-                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    size_m in_i = resample_nearest_index(i, in_sh0, out_shape_[0]);
                     size_m out_plane = i * out_s0, in_plane = in_i * in_s0;
                     for (size_m j = 0; j < out_shape_[1]; j++) {
-                        size_m in_j = (size_m) std::lround((double)j * sc1);
-                        if (in_j >= in_sh1) in_j = in_sh1 - 1;
+                        size_m in_j = resample_nearest_index(j, in_sh1, out_shape_[1]);
                         size_m out_row = out_plane + j * out_s1, in_row = in_plane + in_j * in_s1;
                         for (size_m k = 0; k < out_shape_[2]; k++) {
-                            size_m in_k = (size_m) std::lround((double)k * sc2);
-                            if (in_k >= in_sh2) in_k = in_sh2 - 1;
+                            size_m in_k = resample_nearest_index(k, in_sh2, out_shape_[2]);
                             out_data[out_row + k * out_s2] = in_data[in_row + in_k * in_s2];
                         }
                     }
@@ -12442,8 +12448,7 @@ void matrix::resample_backend_cpu(matrix& output) {
                         size_m out_idx = rem % out_shape_[i];
                         rem /= out_shape_[i];
                         out_off += out_idx * out_strides_[i];
-                        size_m in_idx = (size_m) std::lround((double)out_idx * scale[i]);
-                        if (in_idx >= in_shape_[i]) in_idx = in_shape_[i] - 1;
+                        size_m in_idx = resample_nearest_index(out_idx, in_shape_[i], out_shape_[i]);
                         in_off += in_idx * in_strides_[i];
                     }
                     out_data[out_off] = in_data[in_off];
@@ -12627,7 +12632,9 @@ void matrix::resample_tail_backend_gpu(matrix& output, uint32_t leading_rank, si
         [commandEncoder setBytes:&out_stride0 length:sizeof(size_m) atIndex:2];
         [commandEncoder setBytes:&in_stride0 length:sizeof(size_m) atIndex:3];
         [commandEncoder setBytes:&in_shape0 length:sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:scale length:sizeof(float) atIndex:5];
+        // Nearest takes each axis's output size (it computes exact integer indices); linear the scale.
+        if (linear) [commandEncoder setBytes:scale length:sizeof(float) atIndex:5];
+        else [commandEncoder setBytes:output.shape() length:sizeof(size_m) atIndex:5];
         [commandEncoder setBytes:&tail_size length:sizeof(size_m) atIndex:6];
         [commandEncoder setBytes:&in_tail_stride length:sizeof(size_m) atIndex:7];
         [commandEncoder setBytes:&out_tail_stride length:sizeof(size_m) atIndex:8];
@@ -12636,7 +12643,8 @@ void matrix::resample_tail_backend_gpu(matrix& output, uint32_t leading_rank, si
         [commandEncoder setBytes:output.strides() length:2 * sizeof(size_m) atIndex:2];
         [commandEncoder setBytes:strides() length:2 * sizeof(size_m) atIndex:3];
         [commandEncoder setBytes:shape() length:2 * sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:scale length:2 * sizeof(float) atIndex:5];
+        if (linear) [commandEncoder setBytes:scale length:2 * sizeof(float) atIndex:5];
+        else [commandEncoder setBytes:output.shape() length:2 * sizeof(size_m) atIndex:5];
         [commandEncoder setBytes:&tail_size length:sizeof(size_m) atIndex:6];
         [commandEncoder setBytes:&in_tail_stride length:sizeof(size_m) atIndex:7];
         [commandEncoder setBytes:&out_tail_stride length:sizeof(size_m) atIndex:8];
@@ -12645,7 +12653,8 @@ void matrix::resample_tail_backend_gpu(matrix& output, uint32_t leading_rank, si
         [commandEncoder setBytes:output.strides() length:3 * sizeof(size_m) atIndex:2];
         [commandEncoder setBytes:strides() length:3 * sizeof(size_m) atIndex:3];
         [commandEncoder setBytes:shape() length:3 * sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:scale length:3 * sizeof(float) atIndex:5];
+        if (linear) [commandEncoder setBytes:scale length:3 * sizeof(float) atIndex:5];
+        else [commandEncoder setBytes:output.shape() length:3 * sizeof(size_m) atIndex:5];
         [commandEncoder setBytes:&tail_size length:sizeof(size_m) atIndex:6];
         [commandEncoder setBytes:&in_tail_stride length:sizeof(size_m) atIndex:7];
         [commandEncoder setBytes:&out_tail_stride length:sizeof(size_m) atIndex:8];
@@ -12654,7 +12663,8 @@ void matrix::resample_tail_backend_gpu(matrix& output, uint32_t leading_rank, si
         [commandEncoder setBytes:output.strides() length:leading_rank * sizeof(size_m) atIndex:2];
         [commandEncoder setBytes:strides() length:leading_rank * sizeof(size_m) atIndex:3];
         [commandEncoder setBytes:shape() length:leading_rank * sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:scale length:leading_rank * sizeof(float) atIndex:5];
+        if (linear) [commandEncoder setBytes:scale length:leading_rank * sizeof(float) atIndex:5];
+        else [commandEncoder setBytes:output.shape() length:leading_rank * sizeof(size_m) atIndex:5];
         [commandEncoder setBytes:output.shape() length:leading_rank * sizeof(size_m) atIndex:6];
         int ndim_i = (int)leading_rank;
         [commandEncoder setBytes:&ndim_i length:sizeof(int) atIndex:7];
@@ -12700,10 +12710,8 @@ void matrix::resample_tail_backend_cpu(matrix& output, uint32_t leading_rank, si
         if (mode == ResampleMode::Nearest) {
             if (leading_rank == 1) {
                 size_m out_s0 = out_strides_[0], in_s0 = in_strides_[0], in_sh0 = in_shape_[0];
-                float sc0 = scale[0];
                 for (size_m i = 0; i < out_shape_[0]; i++) {
-                    size_m in_i = (size_m) std::lround((double)i * sc0);
-                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    size_m in_i = resample_nearest_index(i, in_sh0, out_shape_[0]);
                     size_m out_off = i * out_s0, in_off = in_i * in_s0;
                     for (size_m c = 0; c < tail_size; c++) {
                         out_data[out_off + c * out_tail_stride] = in_data[in_off + c * in_tail_stride];
@@ -12713,14 +12721,11 @@ void matrix::resample_tail_backend_cpu(matrix& output, uint32_t leading_rank, si
                 size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1];
                 size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1];
                 size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1];
-                float sc0 = scale[0], sc1 = scale[1];
                 for (size_m i = 0; i < out_shape_[0]; i++) {
-                    size_m in_i = (size_m) std::lround((double)i * sc0);
-                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    size_m in_i = resample_nearest_index(i, in_sh0, out_shape_[0]);
                     size_m out_row = i * out_s0, in_row = in_i * in_s0;
                     for (size_m j = 0; j < out_shape_[1]; j++) {
-                        size_m in_j = (size_m) std::lround((double)j * sc1);
-                        if (in_j >= in_sh1) in_j = in_sh1 - 1;
+                        size_m in_j = resample_nearest_index(j, in_sh1, out_shape_[1]);
                         size_m out_off = out_row + j * out_s1, in_off = in_row + in_j * in_s1;
                         for (size_m c = 0; c < tail_size; c++) {
                             out_data[out_off + c * out_tail_stride] = in_data[in_off + c * in_tail_stride];
@@ -12731,18 +12736,14 @@ void matrix::resample_tail_backend_cpu(matrix& output, uint32_t leading_rank, si
                 size_m out_s0 = out_strides_[0], out_s1 = out_strides_[1], out_s2 = out_strides_[2];
                 size_m in_s0 = in_strides_[0], in_s1 = in_strides_[1], in_s2 = in_strides_[2];
                 size_m in_sh0 = in_shape_[0], in_sh1 = in_shape_[1], in_sh2 = in_shape_[2];
-                float sc0 = scale[0], sc1 = scale[1], sc2 = scale[2];
                 for (size_m i = 0; i < out_shape_[0]; i++) {
-                    size_m in_i = (size_m) std::lround((double)i * sc0);
-                    if (in_i >= in_sh0) in_i = in_sh0 - 1;
+                    size_m in_i = resample_nearest_index(i, in_sh0, out_shape_[0]);
                     size_m out_plane = i * out_s0, in_plane = in_i * in_s0;
                     for (size_m j = 0; j < out_shape_[1]; j++) {
-                        size_m in_j = (size_m) std::lround((double)j * sc1);
-                        if (in_j >= in_sh1) in_j = in_sh1 - 1;
+                        size_m in_j = resample_nearest_index(j, in_sh1, out_shape_[1]);
                         size_m out_row = out_plane + j * out_s1, in_row = in_plane + in_j * in_s1;
                         for (size_m k = 0; k < out_shape_[2]; k++) {
-                            size_m in_k = (size_m) std::lround((double)k * sc2);
-                            if (in_k >= in_sh2) in_k = in_sh2 - 1;
+                            size_m in_k = resample_nearest_index(k, in_sh2, out_shape_[2]);
                             size_m out_off = out_row + k * out_s2, in_off = in_row + in_k * in_s2;
                             for (size_m c = 0; c < tail_size; c++) {
                                 out_data[out_off + c * out_tail_stride] = in_data[in_off + c * in_tail_stride];
@@ -12760,8 +12761,7 @@ void matrix::resample_tail_backend_cpu(matrix& output, uint32_t leading_rank, si
                         size_m out_idx = rem % out_shape_[i];
                         rem /= out_shape_[i];
                         out_off += out_idx * out_strides_[i];
-                        size_m in_idx = (size_m) std::lround((double)out_idx * scale[i]);
-                        if (in_idx >= in_shape_[i]) in_idx = in_shape_[i] - 1;
+                        size_m in_idx = resample_nearest_index(out_idx, in_shape_[i], out_shape_[i]);
                         in_off += in_idx * in_strides_[i];
                     }
                     for (size_m c = 0; c < tail_size; c++) {
