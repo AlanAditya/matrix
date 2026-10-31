@@ -1666,6 +1666,17 @@ inline void setBufferOrBytes(id<MTLComputeCommandEncoder> commandEncoder,
     }
 }
 
+// A threadgroup for dispatchThreads over `grid`: up to 256 threads, filled along x, then y, then z.
+// A fixed width larger than the grid's x gets clipped by Metal: the old fixed 16 against a [M, 3]
+// output's 3 columns left groups of 3 threads, most of each 32-lane SIMD group idle.
+static MTLSize threadgroup_for_grid(MTLSize grid, NSUInteger max_threads) {
+    const NSUInteger budget = std::min<NSUInteger>(256, max_threads);
+    const NSUInteger x = std::max<NSUInteger>(1, std::min<NSUInteger>(grid.width, budget));
+    const NSUInteger y = std::max<NSUInteger>(1, std::min<NSUInteger>(grid.height, budget / x));
+    const NSUInteger z = std::max<NSUInteger>(1, std::min<NSUInteger>(grid.depth, budget / (x * y)));
+    return MTLSizeMake(x, y, z);
+}
+
 //    static matrix matrix::zeros(std::initializer_list<size_m> shapeI, dtype
 //    type = dtype::Float) {
 //        matrix output((uint32_t)shapeI.size(), type);
@@ -2992,7 +3003,6 @@ void matrix::pad_backend(std::vector<size_m>& padding_range, matrix& padded_mat,
     
     id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
     
-    auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
     auto _dispatchExecutionSize = MTLSizeMake(padded_mat.total_size, 1, 1);
     setBufferOrBytes(commandEncoder, padded_mat, 0);
     setBufferOrBytes(commandEncoder, *this, 1);
@@ -3002,23 +3012,27 @@ void matrix::pad_backend(std::vector<size_m>& padding_range, matrix& padded_mat,
     
     [commandEncoder setBytes:&(prim->offset) length:sizeof(int) atIndex:5];
     [commandEncoder setBytes:value.buffer length:dtype_size(value.type) atIndex:6];
+    id<MTLComputePipelineState> pipeline = nil;
     if (cdims == 1) {
         if (!GlobalGPUManager.PaddingInit[typeCode][0]) {
             GlobalGPUManager.initPadding(typeCode, 0);
         }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][0]];
+        pipeline = GlobalGPUManager.Padding_ComputeState[typeCode][0];
+        [commandEncoder setComputePipelineState:pipeline];
     } else if (cdims == 2) {
         if (!GlobalGPUManager.PaddingInit[typeCode][1]) {
             GlobalGPUManager.initPadding(typeCode, 1);
         }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][1]];
+        pipeline = GlobalGPUManager.Padding_ComputeState[typeCode][1];
+        [commandEncoder setComputePipelineState:pipeline];
         _dispatchExecutionSize = MTLSizeMake(dst_shape[1], dst_shape[0], 1);
 
     } else if (cdims == 3) {
         if (!GlobalGPUManager.PaddingInit[typeCode][2]) {
             GlobalGPUManager.initPadding(typeCode, 2);
         }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][2]];
+        pipeline = GlobalGPUManager.Padding_ComputeState[typeCode][2];
+        [commandEncoder setComputePipelineState:pipeline];
         _dispatchExecutionSize = MTLSizeMake(dst_shape[2], dst_shape[1], dst_shape[0]);
         
     } else {
@@ -3032,11 +3046,12 @@ void matrix::pad_backend(std::vector<size_m>& padding_range, matrix& padded_mat,
         _dispatchExecutionSize = MTLSizeMake(dst_shape[cdims - 1], dst_shape[cdims - 2], acc);
         [commandEncoder setBytes:dst_shape length:cdims * sizeof(size_m) atIndex:7];
         [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:8];
-        [commandEncoder setComputePipelineState:GlobalGPUManager.Padding_ComputeState[typeCode][3]];
+        pipeline = GlobalGPUManager.Padding_ComputeState[typeCode][3];
+        [commandEncoder setComputePipelineState:pipeline];
     }
     
     [commandEncoder dispatchThreads:_dispatchExecutionSize
-              threadsPerThreadgroup:_threadsPerThreadgroup];
+              threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     
 }
 
@@ -5505,11 +5520,12 @@ void matrix::clamp(matrix& output, double min_val, double max_val, ExecutionDevi
         setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
+        id<MTLComputePipelineState> pipeline = nil;
         if (cdims == 0) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.ClampComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.ClampComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             size_m one = 1;
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
@@ -5526,22 +5542,26 @@ void matrix::clamp(matrix& output, double min_val, double max_val, ExecutionDevi
             }
             _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
         } else if (cdims == 1) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.ClampComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.ClampComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
         } else if (cdims == 2) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.ClampComputeState_nd[typeCode][1]];
+            pipeline = GlobalGPUManager.ClampComputeState_nd[typeCode][1];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
         } else if (cdims == 3) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.ClampComputeState_nd[typeCode][2]];
+            pipeline = GlobalGPUManager.ClampComputeState_nd[typeCode][2];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
         } else {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.ClampComputeState_nd[typeCode][3]];
+            pipeline = GlobalGPUManager.ClampComputeState_nd[typeCode][3];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
             [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
@@ -5560,7 +5580,7 @@ void matrix::clamp(matrix& output, double min_val, double max_val, ExecutionDevi
             [commandEncoder setBytes:&max_t length:sizeof(T) atIndex:7];
         });
 
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         dispatch_type(this->type, output.buffer, [&](auto* out_data) {
             using T = std::decay_t<decltype(*out_data)>;
@@ -5671,32 +5691,37 @@ void matrix::log(matrix& output, ExecutionDevice exec_device) {
         setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
+        id<MTLComputePipelineState> pipeline = nil;
         if (cdims == 0) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.LogComputeState[typeCode][0]];
+            pipeline = GlobalGPUManager.LogComputeState[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             size_m one = 1;
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
         } else if (cdims == 1) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.LogComputeState[typeCode][0]];
+            pipeline = GlobalGPUManager.LogComputeState[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
         } else if (cdims == 2) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.LogComputeState[typeCode][1]];
+            pipeline = GlobalGPUManager.LogComputeState[typeCode][1];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
         } else if (cdims == 3) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.LogComputeState[typeCode][2]];
+            pipeline = GlobalGPUManager.LogComputeState[typeCode][2];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
         } else {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.LogComputeState[typeCode][3]];
+            pipeline = GlobalGPUManager.LogComputeState[typeCode][3];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
             [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
@@ -5707,7 +5732,7 @@ void matrix::log(matrix& output, ExecutionDevice exec_device) {
             _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
         }
 
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
         dispatch_type(type, output.buffer, [&](auto *out_data) {
@@ -5784,32 +5809,37 @@ void matrix::abs(matrix& output, ExecutionDevice exec_device) {
         setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
+        id<MTLComputePipelineState> pipeline = nil;
         if (cdims == 0) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.AbsComputeState[typeCode][0]];
+            pipeline = GlobalGPUManager.AbsComputeState[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             size_m one = 1;
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
         } else if (cdims == 1) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.AbsComputeState[typeCode][0]];
+            pipeline = GlobalGPUManager.AbsComputeState[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
         } else if (cdims == 2) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.AbsComputeState[typeCode][1]];
+            pipeline = GlobalGPUManager.AbsComputeState[typeCode][1];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
         } else if (cdims == 3) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.AbsComputeState[typeCode][2]];
+            pipeline = GlobalGPUManager.AbsComputeState[typeCode][2];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
         } else {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.AbsComputeState[typeCode][3]];
+            pipeline = GlobalGPUManager.AbsComputeState[typeCode][3];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
             [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
@@ -5820,7 +5850,7 @@ void matrix::abs(matrix& output, ExecutionDevice exec_device) {
             _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
         }
 
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
         dispatch_type(type, output.buffer, [&](auto *out_data) {
@@ -5919,32 +5949,37 @@ void matrix::sin(matrix& output, ExecutionDevice exec_device) {
         setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
+        id<MTLComputePipelineState> pipeline = nil;
         if (cdims == 0) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.SinComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.SinComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             size_m one = 1;
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
         } else if (cdims == 1) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.SinComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.SinComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
         } else if (cdims == 2) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.SinComputeState_nd[typeCode][1]];
+            pipeline = GlobalGPUManager.SinComputeState_nd[typeCode][1];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
         } else if (cdims == 3) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.SinComputeState_nd[typeCode][2]];
+            pipeline = GlobalGPUManager.SinComputeState_nd[typeCode][2];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
         } else {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.SinComputeState_nd[typeCode][3]];
+            pipeline = GlobalGPUManager.SinComputeState_nd[typeCode][3];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
             [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
@@ -5955,7 +5990,7 @@ void matrix::sin(matrix& output, ExecutionDevice exec_device) {
             _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
         }
 
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
         dispatch_type(type, output.buffer, [&](auto *out_data) {
@@ -6047,32 +6082,37 @@ void matrix::cos(matrix& output, ExecutionDevice exec_device) {
         setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
+        id<MTLComputePipelineState> pipeline = nil;
         if (cdims == 0) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.CosComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.CosComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             size_m one = 1;
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
         } else if (cdims == 1) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.CosComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.CosComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
         } else if (cdims == 2) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.CosComputeState_nd[typeCode][1]];
+            pipeline = GlobalGPUManager.CosComputeState_nd[typeCode][1];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
         } else if (cdims == 3) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.CosComputeState_nd[typeCode][2]];
+            pipeline = GlobalGPUManager.CosComputeState_nd[typeCode][2];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
         } else {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.CosComputeState_nd[typeCode][3]];
+            pipeline = GlobalGPUManager.CosComputeState_nd[typeCode][3];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
             [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
@@ -6083,7 +6123,7 @@ void matrix::cos(matrix& output, ExecutionDevice exec_device) {
             _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
         }
 
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
         dispatch_type(type, output.buffer, [&](auto *out_data) {
@@ -6175,32 +6215,37 @@ void matrix::tan(matrix& output, ExecutionDevice exec_device) {
         setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
+        id<MTLComputePipelineState> pipeline = nil;
         if (cdims == 0) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.TanComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.TanComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             size_m one = 1;
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
         } else if (cdims == 1) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.TanComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.TanComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
         } else if (cdims == 2) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.TanComputeState_nd[typeCode][1]];
+            pipeline = GlobalGPUManager.TanComputeState_nd[typeCode][1];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
         } else if (cdims == 3) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.TanComputeState_nd[typeCode][2]];
+            pipeline = GlobalGPUManager.TanComputeState_nd[typeCode][2];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
         } else {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.TanComputeState_nd[typeCode][3]];
+            pipeline = GlobalGPUManager.TanComputeState_nd[typeCode][3];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
             [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
@@ -6211,7 +6256,7 @@ void matrix::tan(matrix& output, ExecutionDevice exec_device) {
             _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
         }
 
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
         dispatch_type(type, output.buffer, [&](auto *out_data) {
@@ -6303,32 +6348,37 @@ void matrix::tanh(matrix& output, ExecutionDevice exec_device) {
         setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
+        id<MTLComputePipelineState> pipeline = nil;
         if (cdims == 0) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.TanhComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.TanhComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             size_m one = 1;
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
         } else if (cdims == 1) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.TanhComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.TanhComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
         } else if (cdims == 2) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.TanhComputeState_nd[typeCode][1]];
+            pipeline = GlobalGPUManager.TanhComputeState_nd[typeCode][1];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
         } else if (cdims == 3) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.TanhComputeState_nd[typeCode][2]];
+            pipeline = GlobalGPUManager.TanhComputeState_nd[typeCode][2];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
         } else {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.TanhComputeState_nd[typeCode][3]];
+            pipeline = GlobalGPUManager.TanhComputeState_nd[typeCode][3];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
             [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
@@ -6339,7 +6389,7 @@ void matrix::tanh(matrix& output, ExecutionDevice exec_device) {
             _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
         }
 
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
         dispatch_type(type, output.buffer, [&](auto *out_data) {
@@ -6431,32 +6481,37 @@ void matrix::sqrt(matrix& output, ExecutionDevice exec_device) {
         setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
+        id<MTLComputePipelineState> pipeline = nil;
         if (cdims == 0) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.SqrtComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.SqrtComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             size_m one = 1;
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
         } else if (cdims == 1) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.SqrtComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.SqrtComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
         } else if (cdims == 2) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.SqrtComputeState_nd[typeCode][1]];
+            pipeline = GlobalGPUManager.SqrtComputeState_nd[typeCode][1];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
         } else if (cdims == 3) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.SqrtComputeState_nd[typeCode][2]];
+            pipeline = GlobalGPUManager.SqrtComputeState_nd[typeCode][2];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
         } else {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.SqrtComputeState_nd[typeCode][3]];
+            pipeline = GlobalGPUManager.SqrtComputeState_nd[typeCode][3];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
             [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
@@ -6467,7 +6522,7 @@ void matrix::sqrt(matrix& output, ExecutionDevice exec_device) {
             _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
         }
 
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
         dispatch_type(type, output.buffer, [&](auto *out_data) {
@@ -6559,32 +6614,37 @@ void matrix::exp(matrix& output, ExecutionDevice exec_device) {
         setBufferOrBytes(commandEncoder, output, 0); // Output destination
         setBufferOrBytes(commandEncoder, *this, 1); // Input is the normal contiguous/strided source
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
+        id<MTLComputePipelineState> pipeline = nil;
         if (cdims == 0) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.ExpComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.ExpComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             size_m one = 1;
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:&one length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
         } else if (cdims == 1) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.ExpComputeState_nd[typeCode][0]];
+            pipeline = GlobalGPUManager.ExpComputeState_nd[typeCode][0];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
         } else if (cdims == 2) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.ExpComputeState_nd[typeCode][1]];
+            pipeline = GlobalGPUManager.ExpComputeState_nd[typeCode][1];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:2 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:2 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
         } else if (cdims == 3) {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.ExpComputeState_nd[typeCode][2]];
+            pipeline = GlobalGPUManager.ExpComputeState_nd[typeCode][2];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:3 * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:3 * sizeof(size_m) atIndex:3];
             _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
         } else {
-            [commandEncoder setComputePipelineState:GlobalGPUManager.ExpComputeState_nd[typeCode][3]];
+            pipeline = GlobalGPUManager.ExpComputeState_nd[typeCode][3];
+            [commandEncoder setComputePipelineState:pipeline];
             [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
             [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
             [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:4];
@@ -6595,7 +6655,7 @@ void matrix::exp(matrix& output, ExecutionDevice exec_device) {
             _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
         }
 
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
         dispatch_type(type, output.buffer, [&](auto *out_data) {
@@ -12250,22 +12310,24 @@ void matrix::resample_backend_gpu(matrix& output) {
     int kernel_code = ndims > 3 ? 3 : ((int)ndims - 1);
     bool linear = (mode == ResampleMode::Linear);
 
+    id<MTLComputePipelineState> pipeline = nil;
     if (linear) {
         if (!GlobalGPUManager.ResampleLinearInit_nd[typeCode][kernel_code]) {
             GlobalGPUManager.initResampleLinear_nd(typeCode, kernel_code);
         }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.ResampleLinearComputeState_nd[typeCode][kernel_code]];
+        pipeline = GlobalGPUManager.ResampleLinearComputeState_nd[typeCode][kernel_code];
+        [commandEncoder setComputePipelineState:pipeline];
     } else {
         if (!GlobalGPUManager.ResampleNearestInit_nd[typeCode][kernel_code]) {
             GlobalGPUManager.initResampleNearest_nd(typeCode, kernel_code);
         }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.ResampleNearestComputeState_nd[typeCode][kernel_code]];
+        pipeline = GlobalGPUManager.ResampleNearestComputeState_nd[typeCode][kernel_code];
+        [commandEncoder setComputePipelineState:pipeline];
     }
 
     setBufferOrBytes(commandEncoder, output, 0); // dst
     setBufferOrBytes(commandEncoder, *this, 1); // src
 
-    auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
     auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
     if (ndims == 1) {
@@ -12304,7 +12366,7 @@ void matrix::resample_backend_gpu(matrix& output) {
         _dispatchExecutionSize = MTLSizeMake(threads_x, threads_y, threads_z);
     }
 
-    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
 }
 
 // CPU backend for the general (no identity tail) resample path. Rank-specialized like
@@ -12538,22 +12600,24 @@ void matrix::resample_tail_backend_gpu(matrix& output, uint32_t leading_rank, si
     int kernel_code = leading_rank > 3 ? 3 : ((int)leading_rank - 1);
     bool linear = (mode == ResampleMode::Linear);
 
+    id<MTLComputePipelineState> pipeline = nil;
     if (linear) {
         if (!GlobalGPUManager.ResampleLinearTailInit_nd[typeCode][kernel_code]) {
             GlobalGPUManager.initResampleLinearTail_nd(typeCode, kernel_code);
         }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.ResampleLinearTailComputeState_nd[typeCode][kernel_code]];
+        pipeline = GlobalGPUManager.ResampleLinearTailComputeState_nd[typeCode][kernel_code];
+        [commandEncoder setComputePipelineState:pipeline];
     } else {
         if (!GlobalGPUManager.ResampleNearestTailInit_nd[typeCode][kernel_code]) {
             GlobalGPUManager.initResampleNearestTail_nd(typeCode, kernel_code);
         }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.ResampleNearestTailComputeState_nd[typeCode][kernel_code]];
+        pipeline = GlobalGPUManager.ResampleNearestTailComputeState_nd[typeCode][kernel_code];
+        [commandEncoder setComputePipelineState:pipeline];
     }
 
     setBufferOrBytes(commandEncoder, output, 0); // dst
     setBufferOrBytes(commandEncoder, *this, 1); // src
 
-    auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
     auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
     if (leading_rank == 1) {
@@ -12605,7 +12669,7 @@ void matrix::resample_tail_backend_gpu(matrix& output, uint32_t leading_rank, si
         _dispatchExecutionSize = MTLSizeMake(threads_x, threads_y, threads_z);
     }
 
-    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
 }
 
 // CPU backend for the identity-tail fast path. If the caller opted in via
@@ -12940,13 +13004,14 @@ void matrix::max(const matrix& other, matrix& result, ExecutionDevice exec_devic
             GlobalGPUManager.initBrodcastedMaxInit(typeCode, kernelCode);
         }
         id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
-        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedMaxComputeState[typeCode][kernelCode]];
+        id<MTLComputePipelineState> pipeline = nil;
+        pipeline = GlobalGPUManager.BrodcastedMaxComputeState[typeCode][kernelCode];
+        [commandEncoder setComputePipelineState:pipeline];
         
         setBufferOrBytes(commandEncoder, result, 0);
         setBufferOrBytes(commandEncoder, *this, 1);
         setBufferOrBytes(commandEncoder, other, 2);
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
         
         if (cdims == 0) {
@@ -12980,7 +13045,7 @@ void matrix::max(const matrix& other, matrix& result, ExecutionDevice exec_devic
             for (int i = 0; i < cdims-2; i++) { acc *= result_shape[i]; }
             _dispatchExecutionSize = MTLSizeMake(result_shape[cdims-1], result_shape[cdims-2], acc);
         }
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         if (result.dims == 0) {
             dispatch_type(type, result.buffer, [&](auto *out_data) {
@@ -13051,7 +13116,9 @@ void matrix::equal_backend(matrix& output, ExecutionDevice exec_device) {
             GlobalGPUManager.initEqual(typeCode, kernelCode);
         }
         id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
-        [commandEncoder setComputePipelineState:GlobalGPUManager.EqualComputeState[typeCode][kernelCode]];
+        id<MTLComputePipelineState> pipeline = nil;
+        pipeline = GlobalGPUManager.EqualComputeState[typeCode][kernelCode];
+        [commandEncoder setComputePipelineState:pipeline];
 
         setBufferOrBytes(commandEncoder, output, 0);
         setBufferOrBytes(commandEncoder, a, 1);
@@ -13060,7 +13127,6 @@ void matrix::equal_backend(matrix& output, ExecutionDevice exec_device) {
         [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:4];
         [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:5];
 
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         MTLSize _dispatchExecutionSize;
         if (cdims == 1) {
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
@@ -13076,7 +13142,7 @@ void matrix::equal_backend(matrix& output, ExecutionDevice exec_device) {
             for (uint32_t i = 0; i < cdims - 2; i++) { acc *= res.shape[i]; }
             _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
         }
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         dispatch_type(output.type, output.buffer, [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
@@ -13171,7 +13237,9 @@ void matrix::C_backend(matrix& output, ExecutionDevice exec_device) {
             GlobalGPUManager.initCombination(typeCode, kernelCode);
         }
         id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
-        [commandEncoder setComputePipelineState:GlobalGPUManager.CombinationComputeState[typeCode][kernelCode]];
+        id<MTLComputePipelineState> pipeline = nil;
+        pipeline = GlobalGPUManager.CombinationComputeState[typeCode][kernelCode];
+        [commandEncoder setComputePipelineState:pipeline];
 
         setBufferOrBytes(commandEncoder, output, 0);
         setBufferOrBytes(commandEncoder, n, 1);
@@ -13180,7 +13248,6 @@ void matrix::C_backend(matrix& output, ExecutionDevice exec_device) {
         [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:4];
         [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:5];
 
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         MTLSize _dispatchExecutionSize;
         if (cdims == 1) {
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
@@ -13196,7 +13263,7 @@ void matrix::C_backend(matrix& output, ExecutionDevice exec_device) {
             for (uint32_t i = 0; i < cdims - 2; i++) { acc *= res.shape[i]; }
             _dispatchExecutionSize = MTLSizeMake(res.shape[cdims-1], res.shape[cdims-2], acc);
         }
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         dispatch_type(output.type, output.buffer, [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
@@ -13269,13 +13336,14 @@ void matrix::min(const matrix& other, matrix& result, ExecutionDevice exec_devic
             GlobalGPUManager.initBrodcastedMinInit(typeCode, kernelCode);
         }
         id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
-        [commandEncoder setComputePipelineState:GlobalGPUManager.BrodcastedMinComputeState[typeCode][kernelCode]];
+        id<MTLComputePipelineState> pipeline = nil;
+        pipeline = GlobalGPUManager.BrodcastedMinComputeState[typeCode][kernelCode];
+        [commandEncoder setComputePipelineState:pipeline];
         
         setBufferOrBytes(commandEncoder, result, 0);
         setBufferOrBytes(commandEncoder, *this, 1);
         setBufferOrBytes(commandEncoder, other, 2);
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
         
         if (cdims == 0) {
@@ -13309,7 +13377,7 @@ void matrix::min(const matrix& other, matrix& result, ExecutionDevice exec_devic
             for (int i = 0; i < cdims-2; i++) { acc *= result_shape[i]; }
             _dispatchExecutionSize = MTLSizeMake(result_shape[cdims-1], result_shape[cdims-2], acc);
         }
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         if (result.dims == 0) {
             dispatch_type(type, result.buffer, [&](auto *out_data) {
@@ -13895,13 +13963,13 @@ void matrix::take_backend(const matrix& index, matrix& output, int axis, Executi
         if (!GlobalGPUManager.TakeInit_nd[typeCode][kernel_code][idxTypeCode]) {
             GlobalGPUManager.initTake_nd(typeCode, kernel_code, idxTypeCode);
         }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.TakeComputeState_nd[typeCode][kernel_code][idxTypeCode]];
+        id<MTLComputePipelineState> state = GlobalGPUManager.TakeComputeState_nd[typeCode][kernel_code][idxTypeCode];
+        [commandEncoder setComputePipelineState:state];
 
         setBufferOrBytes(commandEncoder, output, 0); // dst
         setBufferOrBytes(commandEncoder, *this, 1); // src
         setBufferOrBytes(commandEncoder, index, 2); // indices
         
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
         if (cdims == 0 || cdims == 1) {
@@ -13955,7 +14023,8 @@ void matrix::take_backend(const matrix& index, matrix& output, int axis, Executi
         
         // We don't need to pass axis to the GPU anymore since we resolved it on CPU!
         
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize
+                  threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, state.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU Execution Fallback
         size_m src_axis_stride = strides()[axis];
@@ -14086,7 +14155,9 @@ void matrix::scatter_backend(matrix& output, ExecutionDevice exec_device) {
         if (!GlobalGPUManager.ScatterInit_nd[typeCode][kernel_code][idxTypeCode]) {
             GlobalGPUManager.initScatter_nd(typeCode, kernel_code, idxTypeCode);
         }
-        [commandEncoder setComputePipelineState:GlobalGPUManager.ScatterComputeState_nd[typeCode][kernel_code][idxTypeCode]];
+        id<MTLComputePipelineState> pipeline = nil;
+        pipeline = GlobalGPUManager.ScatterComputeState_nd[typeCode][kernel_code][idxTypeCode];
+        [commandEncoder setComputePipelineState:pipeline];
 
         setBufferOrBytes(commandEncoder, output, 0);
         setBufferOrBytes(commandEncoder, updates, 1);
@@ -14098,7 +14169,6 @@ void matrix::scatter_backend(matrix& output, ExecutionDevice exec_device) {
         [commandEncoder setBytes:&axis_size length:sizeof(size_m) atIndex:7];
         [commandEncoder setBytes:&mode length:sizeof(int) atIndex:8];
 
-        auto _threadsPerThreadgroup = MTLSizeMake(16, 1, 1);
         MTLSize _dispatchExecutionSize;
         if (cdims == 1) {
             _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
@@ -14114,7 +14184,7 @@ void matrix::scatter_backend(matrix& output, ExecutionDevice exec_device) {
             size_m threads_y = res.shape[cdims-2];
             _dispatchExecutionSize = MTLSizeMake(threads_x, threads_y, primit->update_count / (threads_x * threads_y));
         }
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         dispatch_type(output.type, output.buffer, [&](auto *out_ptr) {
             using T = std::decay_t<decltype(*out_ptr)>;
