@@ -1443,16 +1443,16 @@ public:
                         rem /= res.shape[i];
                     }
                     if (res.stridesA[cdims - 1] == 1 && res.stridesB[cdims - 1] == 1) {
-                        for (uint32_t i = 0; i < res.shape[0]; i++) {
-                            for (uint32_t j = 0; j < res.shape[1]; j++) {
-                                memcpy(out_data + res.stridesA[cdims - 3] * i +
+                        for (uint32_t i = 0; i < res.shape[cdims - 3]; i++) {
+                            for (uint32_t j = 0; j < res.shape[cdims - 2]; j++) {
+                                memcpy(out_data + outMatIndex + res.stridesA[cdims - 3] * i +
                                        res.stridesA[cdims - 2] * j,
-                                       in_data + res.stridesB[cdims - 3] * i +
+                                       in_data + inMatIndex + res.stridesB[cdims - 3] * i +
                                        res.stridesB[cdims - 2] * j,
                                        res.shape[cdims - 1] * elem_size);
                             }
                         }
-                        break;
+                        continue;
                     }
                     for (uint32_t i = 0; i < res.shape[cdims - 3]; i++) {
                         for (uint32_t j = 0; j < res.shape[cdims - 2]; j++) {
