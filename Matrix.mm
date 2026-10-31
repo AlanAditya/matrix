@@ -13937,122 +13937,226 @@ matrix matrix::take(const matrix& index, int axis) const {
     return output;
 }
 
-void matrix::take_backend(const matrix& index, matrix& output, int axis, ExecutionDevice exec_device) const {
-    if (exec_device == ExecutionDevice::AUTO) {
-        exec_device = output.total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
-    }
-    
+// take's output is the source's axes with the index's axes spliced in at `axis`. Per output axis,
+// how far one step moves in the source and in the index (0 where it moves neither); the gathered
+// axis itself is reached through the index value times strides()[axis].
+static void take_effective_strides(const matrix& src, const matrix& index, int axis, uint32_t cdims,
+                                   size_m* eff_src_strides, size_m* eff_idx_strides) {
+    if (cdims > MAX_TENSOR_DIMS) throw std::invalid_argument("take: output has more than MAX_TENSOR_DIMS dimensions");
+    if (cdims == 0) return;
+    memset(eff_src_strides, 0, cdims * sizeof(size_m));
+    memset(eff_idx_strides, 0, cdims * sizeof(size_m));
+    memcpy(eff_src_strides, src.strides(), axis * sizeof(size_m));
+    memcpy(eff_idx_strides + axis, index.strides(), index.dims * sizeof(size_m));
+    memcpy(eff_src_strides + index.dims + axis, src.strides() + axis + 1, (src.dims - axis - 1) * sizeof(size_m));
+}
+
+void matrix::take_backend_gpu(const matrix& index, matrix& output, int axis) const {
     uint32_t cdims = output.dims; // Dimension should be based on output
-    
-    size_m eff_src_strides[cdims];
-    size_m eff_idx_strides[cdims];
-    if (cdims != 0) {
-        memset(eff_src_strides, 0, cdims * sizeof(size_m));
-        memset(eff_idx_strides, 0, cdims * sizeof(size_m));
-        
-        memcpy(eff_src_strides, strides(), axis * sizeof(size_m));
-        memcpy(eff_idx_strides + axis, index.strides(), index.dims * sizeof(size_m));
-        memcpy(eff_src_strides + index.dims + axis, strides() + axis + 1, (dims-axis-1) * sizeof(size_m));
+    size_m eff_src_strides[MAX_TENSOR_DIMS];
+    size_m eff_idx_strides[MAX_TENSOR_DIMS];
+    take_effective_strides(*this, index, axis, cdims, eff_src_strides, eff_idx_strides);
+
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    int typeCode = (int)type;
+    int idxTypeCode = (int)index.type;
+    int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+
+    if (!GlobalGPUManager.TakeInit_nd[typeCode][kernel_code][idxTypeCode]) {
+        GlobalGPUManager.initTake_nd(typeCode, kernel_code, idxTypeCode);
     }
-    if (exec_device == ExecutionDevice::METAL) {
-        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
-        int typeCode = (int)type;
-        int idxTypeCode = (int)index.type;
-        int kernel_code = cdims > 3 ? 3 : (cdims == 0 ? 0 : cdims - 1);
+    id<MTLComputePipelineState> state = GlobalGPUManager.TakeComputeState_nd[typeCode][kernel_code][idxTypeCode];
+    [commandEncoder setComputePipelineState:state];
 
-        if (!GlobalGPUManager.TakeInit_nd[typeCode][kernel_code][idxTypeCode]) {
-            GlobalGPUManager.initTake_nd(typeCode, kernel_code, idxTypeCode);
-        }
-        id<MTLComputePipelineState> state = GlobalGPUManager.TakeComputeState_nd[typeCode][kernel_code][idxTypeCode];
-        [commandEncoder setComputePipelineState:state];
+    setBufferOrBytes(commandEncoder, output, 0); // dst
+    setBufferOrBytes(commandEncoder, *this, 1); // src
+    setBufferOrBytes(commandEncoder, index, 2); // indices
 
-        setBufferOrBytes(commandEncoder, output, 0); // dst
-        setBufferOrBytes(commandEncoder, *this, 1); // src
-        setBufferOrBytes(commandEncoder, index, 2); // indices
-        
-        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+    auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
 
-        if (cdims == 0 || cdims == 1) {
-            size_m out_stride = cdims == 0 ? 1 : output.strides()[0];
-            size_m src_stride = cdims == 0 ? 0 : eff_src_strides[0];
-            size_m idx_stride = cdims == 0 ? 0 : eff_idx_strides[0];
-            [commandEncoder setBytes:&out_stride length:sizeof(size_m) atIndex:3];
-            [commandEncoder setBytes:&src_stride length:sizeof(size_m) atIndex:4];
-            [commandEncoder setBytes:&idx_stride length:sizeof(size_m) atIndex:5];
-            
-            size_m src_axis_stride = strides()[axis];
-            [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
-            
-            _dispatchExecutionSize = MTLSizeMake(cdims == 0 ? 1 : output.shape()[0], 1, 1);
-        } else if (cdims == 2) {
-            [commandEncoder setBytes:output.strides() length:2 * sizeof(size_m) atIndex:3];
-            [commandEncoder setBytes:eff_src_strides length:2 * sizeof(size_m) atIndex:4];
-            [commandEncoder setBytes:eff_idx_strides length:2 * sizeof(size_m) atIndex:5];
-            
-            size_m src_axis_stride = strides()[axis];
-            [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
-            
-            _dispatchExecutionSize = MTLSizeMake(output.shape()[1], output.shape()[0], 1);
-        } else if (cdims == 3) {
-            [commandEncoder setBytes:output.strides() length:3 * sizeof(size_m) atIndex:3];
-            [commandEncoder setBytes:eff_src_strides length:3 * sizeof(size_m) atIndex:4];
-            [commandEncoder setBytes:eff_idx_strides length:3 * sizeof(size_m) atIndex:5];
-            
-            size_m src_axis_stride = strides()[axis];
-            [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
-            
-            _dispatchExecutionSize = MTLSizeMake(output.shape()[2], output.shape()[1], output.shape()[0]);
-        } else {
-            [commandEncoder setBytes:output.strides() length:cdims * sizeof(size_m) atIndex:3];
-            [commandEncoder setBytes:eff_src_strides length:cdims * sizeof(size_m) atIndex:4];
-            [commandEncoder setBytes:eff_idx_strides length:cdims * sizeof(size_m) atIndex:5];
-            
-            size_m src_axis_stride = strides()[axis];
-            [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
-            
-            [commandEncoder setBytes:output.shape() length:cdims * sizeof(size_m) atIndex:7];
-            int ndim = cdims;
-            [commandEncoder setBytes:&ndim length:sizeof(int) atIndex:8];
-            
-            size_m total_threads = output.total_size;
-            size_m threads_y = output.shape()[cdims-2];
-            size_m threads_x = output.shape()[cdims-1];
-            size_m threads_z = total_threads / (threads_x * threads_y);
-            _dispatchExecutionSize = MTLSizeMake(threads_x, threads_y, threads_z);
-        }
+    if (cdims == 0 || cdims == 1) {
+        size_m out_stride = cdims == 0 ? 1 : output.strides()[0];
+        size_m src_stride = cdims == 0 ? 0 : eff_src_strides[0];
+        size_m idx_stride = cdims == 0 ? 0 : eff_idx_strides[0];
+        [commandEncoder setBytes:&out_stride length:sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:&src_stride length:sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:&idx_stride length:sizeof(size_m) atIndex:5];
         
-        // We don't need to pass axis to the GPU anymore since we resolved it on CPU!
-        
-        [commandEncoder dispatchThreads:_dispatchExecutionSize
-                  threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, state.maxTotalThreadsPerThreadgroup)];
-    } else {
-        // CPU Execution Fallback
         size_m src_axis_stride = strides()[axis];
-
-        dispatch_type(type, buffer, [&](auto *src_ptr) {
-            using T = std::decay_t<decltype(*src_ptr)>;
-            T* dst_ptr = (T*)output.buffer;
-
-            dispatch_type(index.type, index.buffer, [&](auto *idx_ptr) {
-                for (size_t i = 0; i < output.total_size; ++i) {
-                    size_m remA = i;
-                    size_m dst_idx = 0;
-                    size_m idx_idx = 0;
-                    size_m src_idx = 0;
-                    for (int d = cdims - 1; d >= 0; --d) {
-                        size_m mod = remA % output.shape()[d];
-                        dst_idx += mod * output.strides()[d];
-                        idx_idx += mod * eff_idx_strides[d];
-                        src_idx += mod * eff_src_strides[d];
-                        remA /= output.shape()[d];
-                    }
-                    auto idx_val = idx_ptr[idx_idx];
-                    src_idx += idx_val * src_axis_stride;
-                    dst_ptr[dst_idx] = src_ptr[src_idx];
-                }
-            });
-        });
+        [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
+        
+        _dispatchExecutionSize = MTLSizeMake(cdims == 0 ? 1 : output.shape()[0], 1, 1);
+    } else if (cdims == 2) {
+        [commandEncoder setBytes:output.strides() length:2 * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:eff_src_strides length:2 * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:eff_idx_strides length:2 * sizeof(size_m) atIndex:5];
+        
+        size_m src_axis_stride = strides()[axis];
+        [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
+        
+        _dispatchExecutionSize = MTLSizeMake(output.shape()[1], output.shape()[0], 1);
+    } else if (cdims == 3) {
+        [commandEncoder setBytes:output.strides() length:3 * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:eff_src_strides length:3 * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:eff_idx_strides length:3 * sizeof(size_m) atIndex:5];
+        
+        size_m src_axis_stride = strides()[axis];
+        [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
+        
+        _dispatchExecutionSize = MTLSizeMake(output.shape()[2], output.shape()[1], output.shape()[0]);
+    } else {
+        [commandEncoder setBytes:output.strides() length:cdims * sizeof(size_m) atIndex:3];
+        [commandEncoder setBytes:eff_src_strides length:cdims * sizeof(size_m) atIndex:4];
+        [commandEncoder setBytes:eff_idx_strides length:cdims * sizeof(size_m) atIndex:5];
+        
+        size_m src_axis_stride = strides()[axis];
+        [commandEncoder setBytes:&src_axis_stride length:sizeof(size_m) atIndex:6];
+        
+        [commandEncoder setBytes:output.shape() length:cdims * sizeof(size_m) atIndex:7];
+        int ndim = cdims;
+        [commandEncoder setBytes:&ndim length:sizeof(int) atIndex:8];
+        
+        size_m total_threads = output.total_size;
+        size_m threads_y = output.shape()[cdims-2];
+        size_m threads_x = output.shape()[cdims-1];
+        size_m threads_z = total_threads / (threads_x * threads_y);
+        _dispatchExecutionSize = MTLSizeMake(threads_x, threads_y, threads_z);
     }
+    
+    // We don't need to pass axis to the GPU anymore since we resolved it on CPU!
+
+    [commandEncoder dispatchThreads:_dispatchExecutionSize
+              threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, state.maxTotalThreadsPerThreadgroup)];
+}
+
+// take on the CPU when the source's block after `axis` (what the gather keeps whole), the index and
+// the output are packed: out[o, i, :] = src[o, idx[i], :] is then one contiguous row copy per outer
+// position o and index position i, written to the output in order. The copy is chosen once per
+// call, not per row: a fixed-size memcpy (plain loads and stores once inlined) for the common small
+// rows, a runtime memcpy for the rest. Returns false, having copied nothing, for any other layout.
+static bool take_rows_cpu(const matrix& src, const matrix& index, matrix& output, int axis) {
+    auto packed_from = [](const matrix& m, int first) {
+        size_m expected = 1;
+        for (int d = (int)m.dims - 1; d >= first; d--) {
+            if (m.shape()[d] != 1 && m.strides()[d] != expected) return false;
+            expected *= m.shape()[d];
+        }
+        return true;
+    };
+    if (!packed_from(src, axis + 1) || !packed_from(index, 0) || !packed_from(output, 0)) return false;
+
+    const size_t elem = dtype_size(src.type);
+    const size_t row_bytes = src.accumul(axis + 1, src.dims) * elem;
+    const size_t axis_bytes = (size_t)src.strides()[axis] * elem;
+    const size_t rows_per_outer = index.total_size;
+    const size_t outer_total = src.accumul(0, axis);
+    const size_m* shape = src.shape();
+    const size_m* strides = src.strides();
+    const uint8_t* s = (const uint8_t*)src.buffer;
+    uint8_t* d = (uint8_t*)output.buffer;
+
+    dispatch_type(index.type, index.buffer, [&](auto* idx) {
+        // The outer axes (before `axis`) are walked with an odometer: a carry when one wraps.
+        // Everything the row loop reads is a local: byte stores may alias anything captured by
+        // reference, which would force a reload of each per row.
+        auto run = [&](auto copy_row) {
+            const auto* ix = idx;
+            const size_t n = rows_per_outer, rb = row_bytes, ab = axis_bytes;
+            uint8_t* out = d;
+            size_m coord[MAX_TENSOR_DIMS] = {};
+            size_t outer_off = 0;
+            for (size_t o = 0; o < outer_total; o++) {
+                const uint8_t* base = s + outer_off;
+                for (size_t i = 0; i < n; i++, out += rb) copy_row(out, base + (size_t)ix[i] * ab);
+                for (int a = axis - 1; a >= 0; a--) {
+                    if (++coord[a] < shape[a]) { outer_off += (size_t)strides[a] * elem; break; }
+                    coord[a] = 0;
+                    outer_off -= (size_t)(shape[a] - 1) * strides[a] * elem;
+                }
+            }
+        };
+        switch (row_bytes) {
+            case 1:  run([](uint8_t* o, const uint8_t* i) { memcpy(o, i, 1); }); break;
+            case 2:  run([](uint8_t* o, const uint8_t* i) { memcpy(o, i, 2); }); break;
+            case 3:  run([](uint8_t* o, const uint8_t* i) { memcpy(o, i, 3); }); break;
+            case 4:  run([](uint8_t* o, const uint8_t* i) { memcpy(o, i, 4); }); break;
+            case 6:  run([](uint8_t* o, const uint8_t* i) { memcpy(o, i, 6); }); break;
+            case 8:  run([](uint8_t* o, const uint8_t* i) { memcpy(o, i, 8); }); break;
+            case 12: run([](uint8_t* o, const uint8_t* i) { memcpy(o, i, 12); }); break;
+            case 16: run([](uint8_t* o, const uint8_t* i) { memcpy(o, i, 16); }); break;
+            case 24: run([](uint8_t* o, const uint8_t* i) { memcpy(o, i, 24); }); break;
+            case 32: run([](uint8_t* o, const uint8_t* i) { memcpy(o, i, 32); }); break;
+            default: run([row_bytes](uint8_t* o, const uint8_t* i) { memcpy(o, i, row_bytes); }); break;
+        }
+    });
+    return true;
+}
+
+// CPU backend for take. Rank-specialized like resample_backend_cpu: plain nested loops up to rank
+// 3, each outer axis's offsets computed once per row instead of per element, so there's no
+// per-element modulo/division chain. Rank 4+ steps through the leading axes with an odometer
+// (a carry when an axis wraps, no modulo) and runs the same two inner loops over the last two.
+void matrix::take_backend_cpu(const matrix& index, matrix& output, int axis) const {
+    const uint32_t cdims = output.dims;
+    if (output.total_size == 0) return;
+    if (take_rows_cpu(*this, index, output, axis)) return;
+    size_m eff_src_strides[MAX_TENSOR_DIMS];
+    size_m eff_idx_strides[MAX_TENSOR_DIMS];
+    take_effective_strides(*this, index, axis, cdims, eff_src_strides, eff_idx_strides);
+    const size_t src_axis_stride = strides()[axis];
+    const size_m* out_shape = output.shape();
+    const size_m* out_strides = output.strides();
+
+    dispatch_type(type, buffer, [&](auto* src) {
+        using T = std::decay_t<decltype(*src)>;
+        T* dst = (T*)output.buffer;
+        dispatch_type(index.type, index.buffer, [&](auto* idx) {
+            // One element: the index value at idx_off picks the source slice; src_off is the
+            // offset along every other axis.
+            auto gather = [&](size_t dst_off, size_t src_off, size_t idx_off) {
+                dst[dst_off] = src[src_off + (size_t)idx[idx_off] * src_axis_stride];
+            };
+            // The last two output axes, from a base offset in dst / src / idx.
+            auto inner_2d = [&](size_t d, size_t s, size_t x, uint32_t a) {
+                const size_t od0 = out_strides[a], os0 = eff_src_strides[a], ox0 = eff_idx_strides[a];
+                const size_t od1 = out_strides[a + 1], os1 = eff_src_strides[a + 1], ox1 = eff_idx_strides[a + 1];
+                for (size_m i = 0; i < out_shape[a]; i++) {
+                    const size_t di = d + i * od0, si = s + i * os0, xi = x + i * ox0;
+                    for (size_m j = 0; j < out_shape[a + 1]; j++) gather(di + j * od1, si + j * os1, xi + j * ox1);
+                }
+            };
+
+            if (cdims == 0) {
+                gather(0, 0, 0);
+            } else if (cdims == 1) {
+                const size_t od0 = out_strides[0], os0 = eff_src_strides[0], ox0 = eff_idx_strides[0];
+                for (size_m i = 0; i < out_shape[0]; i++) gather(i * od0, i * os0, i * ox0);
+            } else if (cdims == 2) {
+                inner_2d(0, 0, 0, 0);
+            } else if (cdims == 3) {
+                const size_t od0 = out_strides[0], os0 = eff_src_strides[0], ox0 = eff_idx_strides[0];
+                for (size_m i = 0; i < out_shape[0]; i++) inner_2d(i * od0, i * os0, i * ox0, 1);
+            } else {
+                const uint32_t lead = cdims - 2;
+                size_m coord[MAX_TENSOR_DIMS] = {};
+                size_t d = 0, s = 0, x = 0;
+                const size_t lead_total = output.accumul(0, lead);
+                for (size_t n = 0; n < lead_total; n++) {
+                    inner_2d(d, s, x, lead);
+                    for (int a = (int)lead - 1; a >= 0; a--) {
+                        if (++coord[a] < out_shape[a]) {
+                            d += out_strides[a]; s += eff_src_strides[a]; x += eff_idx_strides[a];
+                            break;
+                        }
+                        coord[a] = 0;
+                        d -= (size_t)(out_shape[a] - 1) * out_strides[a];
+                        s -= (size_t)(out_shape[a] - 1) * eff_src_strides[a];
+                        x -= (size_t)(out_shape[a] - 1) * eff_idx_strides[a];
+                    }
+                }
+            }
+        });
+    });
 }
 
 matrix matrix::scatter(const matrix& dst, const matrix& indices, const matrix& updates, int axis, ScatterMode mode) {

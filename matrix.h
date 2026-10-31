@@ -905,7 +905,9 @@ public:
     matrix slice_assign(array_descriptor slice_range, std::vector<size_m>& slice_indices, size_t offset, const matrix& rhs);
 
     matrix take(const matrix& index, int axis) const;
-    void take_backend(const matrix& index, matrix& output, int axis, ExecutionDevice exec_device) const;
+    // take's backends, one per device: TakePrimitive::eval_cpu / eval_metal call them directly.
+    void take_backend_cpu(const matrix& index, matrix& output, int axis) const;
+    void take_backend_gpu(const matrix& index, matrix& output, int axis) const;
 
     // Inverse of take: returns a copy of dst where each update is combined (mode) into the
     // slot along `axis` that its index names. updates broadcasts to take(dst, indices, axis)'s

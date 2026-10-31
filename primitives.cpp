@@ -5555,7 +5555,7 @@ public:
         if (eval_type == EvalType::COMPILE_TRACE) return;
         if (evaluated) return; else evaluated = true;
 
-        source.take_backend(indices, out, axis, ExecutionDevice::CPU);
+        source.take_backend_cpu(indices, out, axis);
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
@@ -5597,7 +5597,7 @@ public:
         if (eval_type == EvalType::COMPILE_TRACE) return;
         if (evaluated) return; else evaluated = true;
 
-        source.take_backend(indices, out, axis, ExecutionDevice::METAL);
+        source.take_backend_gpu(indices, out, axis);
     }
 
     // Take is a gather, so its gradient is a scatter-add of grad_out back into source's
