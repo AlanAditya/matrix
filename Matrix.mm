@@ -12494,6 +12494,34 @@ void matrix::conv_cpu(const matrix& kernel, matrix& output) const {
         }
     });
 }
+
+matrix matrix::dft(const matrix& signal, int axis) {
+    axis = axis < 0 ? axis + signal.dims : axis;
+    int N = signal.shape()[axis];
+    
+    matrix n = matrix::linespace(0.0f, float(N - 1), N).astype(dtype::Int32);   // [N]
+
+    // rows = k (frequency), cols = j (sample). k*j is reduced mod N in exact integers before it
+    // becomes an angle: scaled first, k*j*2pi/N reaches ~N*2pi radians, where float32 loses ~1e-4.
+    matrix kj = n.unsqueeze(-1) * n;                                             // [N, N]
+    matrix angle = (kj - (kj / N) * N).astype(dtype::Float) * (-2.0f * float(M_PI) / N);
+    matrix c = matrix::cos(angle), s = matrix::sin(angle);
+    auto rows = [&](const matrix& m) { return m.moveaxis(axis, -1).unsqueeze(-2); };
+
+    matrix re, im;
+    if (is_complex(signal.type)) {
+        // (a + ib)(cos + i sin) = (a cos - b sin) + i (a sin + b cos)
+        matrix a = rows(matrix::real(signal)), b = rows(matrix::imag(signal));
+        re = (a * c).sum(-1) - (b * s).sum(-1);
+        im = (a * s).sum(-1) + (b * c).sum(-1);
+    } else {
+        matrix x = rows(signal);
+        re = (x * c).sum(-1);
+        im = (x * s).sum(-1);
+    }
+    return matrix::complex(re, im).moveaxis(-1, axis);
+}
+
 // MARK: Resample (generic ND nearest / N-linear resize)
 
 // Scans backward from the last axis and returns the smallest index `k` such that every

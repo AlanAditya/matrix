@@ -49,7 +49,7 @@ Open the folder in CLion. Its `CMakeLists.txt`:
 - Release flags `-O3 -DNDEBUG -mcpu=native -fno-math-errno` + LTO, applied to `libmatrix` too. **CLion's default profile is Debug**: add a Release profile for the fast flags;
 - builds `libmatrix`, the renderer and every executable with `-fobjc-arc`, to match the app.
 
-Targets: `main` (demo: graph + Lorenz swarm + heatmap), `easings` (every `Ease` plotted and animated), `bounce` (a ball driven by `Curve`s), `comp` (a `Comp` with lights, shadows, PBR, fog), plus your own experiments (e.g. `random_exp1`). To add one, copy a block:
+Targets: `main` (demo: graph + Lorenz swarm + heatmap), `easings` (every `Ease` plotted and animated), `bounce` (a ball driven by `Curve`s), `comp` (a `Comp` with lights, shadows, PBR, fog), `fourier_playground` (DFT/FFT experiments: a reference `dft()` returning a `Complex64` spectrum, the signal and its magnitude spectrum plotted), plus your own experiments (e.g. `random_exp1`). To add one, copy a block:
 
 ```cmake
 add_executable(my_exp my_exp.cpp)

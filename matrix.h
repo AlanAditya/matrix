@@ -1539,6 +1539,10 @@ public:
     // Padding may be negative (crops the dilated input), which the conv VJP needs.
     static matrix conv(const matrix& input, const matrix& kernel, const std::vector<int>& stride = {}, const std::vector<int>& padding = {}, const std::vector<int>& kernel_dilation = {}, const std::vector<int>& input_dilation = {}, int groups = 1, bool flip = false);
     
+    // Complex64 spectrum of a real or Complex64 signal along `axis` (same shape as the signal), like
+    // np.fft.fft. dft(dft(img, 1), 0) is the 2-D DFT. O(N^2) per axis: it builds [..., N, N] terms.
+    static matrix dft(const matrix& signal, int axis = -1);
+    
     // Asymmetric padding, as MLX's padding=(lows, highs): all low sides, then all high sides.
     // A struct (not std::pair) so a symmetric {1, 1} can't also convert to it: conv(x, w, {1, 1}, {{0, 0}, {1, 1}}).
     // In 1D spell it out, ConvPadding{{0}, {1}}, since {{0}, {1}} is also a valid std::vector<int>.
