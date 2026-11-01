@@ -68,7 +68,10 @@ template <typename T, typename IdxT>
     INSTANTIATE_TAKE_ND_IDX(type_idx, type, 3, int) \
     INSTANTIATE_TAKE_ND_IDX(type_idx, type, 4, int16_t) \
     INSTANTIATE_TAKE_ND_IDX(type_idx, type, 5, uint32_t) \
-    INSTANTIATE_TAKE_ND_IDX(type_idx, type, 6, uint16_t)
+    INSTANTIATE_TAKE_ND_IDX(type_idx, type, 6, uint16_t) \
+    INSTANTIATE_TAKE_ND_IDX(type_idx, type, 8, int8_t) \
+    INSTANTIATE_TAKE_ND_IDX(type_idx, type, 11, int64_t) \
+    INSTANTIATE_TAKE_ND_IDX(type_idx, type, 12, uint64_t)
 
 INSTANTIATE_TAKE_ND(0, float)
 INSTANTIATE_TAKE_ND(1, half)
@@ -77,3 +80,8 @@ INSTANTIATE_TAKE_ND(3, int)
 INSTANTIATE_TAKE_ND(4, int16_t)
 INSTANTIATE_TAKE_ND(5, uint32_t)
 INSTANTIATE_TAKE_ND(6, uint16_t)
+INSTANTIATE_TAKE_ND(7, bool)
+INSTANTIATE_TAKE_ND(8, int8_t)
+INSTANTIATE_TAKE_ND(10, bfloat)
+INSTANTIATE_TAKE_ND(11, int64_t)
+INSTANTIATE_TAKE_ND(12, uint64_t)

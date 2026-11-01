@@ -19,6 +19,10 @@ class MatrixH;
 
 class GPUManager {
 public:
+    // Slots per dtype in the pipeline tables below, which are indexed by (int)dtype. matrix.h checks
+    // it equals kNumDtypes, so no dtype can index past a table.
+    inline static constexpr int kGPUDtypeSlots = 13;
+
     id<MTLDevice> metalDevice = MTLCreateSystemDefaultDevice();
     id<MTLCommandQueue> gCommandQueue = [metalDevice newCommandQueue];
     
@@ -27,6 +31,17 @@ public:
     inline static thread_local void* _thread_gCommandEncoder = nullptr;
     
     id<MTLLibrary> library = [metalDevice newDefaultLibrary];
+
+    // newFunctionWithName returns nil for a kernel the metallib doesn't have (e.g. an op with no
+    // kernel instantiated for that dtype), and building a pipeline from nil crashes. Throw instead.
+    id<MTLFunction> requireFunction(NSString* name) {
+        id<MTLFunction> f = [library newFunctionWithName:name];
+        if (!f) {
+            throw std::runtime_error(std::string("Metal kernel '") + name.UTF8String +
+                                     "' not found: this op has no GPU kernel for that dtype");
+        }
+        return f;
+    }
     
     id<MTLComputePipelineState> blendCompute;
     bool blendInit = false;
@@ -60,162 +75,162 @@ public:
     bool typeCastingInit[6][6];
     id<MTLComputePipelineState> typeCasting[6][6];
     
-    bool TransposeInit[3];
-    id<MTLComputePipelineState> TransposeComputeState[3];
+    bool TransposeInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> TransposeComputeState[kGPUDtypeSlots];
     
-    bool GEMMAInit[4];
-    id<MTLComputePipelineState> GEMMAComputeState[4];
+    bool GEMMAInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> GEMMAComputeState[kGPUDtypeSlots];
     
-    bool BatchedMatMulInit[4][2];
-    id<MTLComputePipelineState> BatchedMatMulComputeState[4][2];
+    bool BatchedMatMulInit[kGPUDtypeSlots][2];
+    id<MTLComputePipelineState> BatchedMatMulComputeState[kGPUDtypeSlots][2];
     
-    bool SumInit[4];
-    id<MTLComputePipelineState> SumComputeState[4];
+    bool SumInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> SumComputeState[kGPUDtypeSlots];
     
-    bool SumInit_nd[10][8];
-    id<MTLComputePipelineState> SumComputeState_nd[10][8];
+    bool SumInit_nd[kGPUDtypeSlots][8];
+    id<MTLComputePipelineState> SumComputeState_nd[kGPUDtypeSlots][8];
     
-    bool MaxInit[10][8];
-    id<MTLComputePipelineState> MaxComputeState_nd[10][8];
+    bool MaxInit[kGPUDtypeSlots][8];
+    id<MTLComputePipelineState> MaxComputeState_nd[kGPUDtypeSlots][8];
     
-    bool MinInit[10][8];
-    id<MTLComputePipelineState> MinComputeState_nd[10][8];
+    bool MinInit[kGPUDtypeSlots][8];
+    id<MTLComputePipelineState> MinComputeState_nd[kGPUDtypeSlots][8];
     
-    bool SinInit[3];
-    id<MTLComputePipelineState> SinComputeState[3];
+    bool SinInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> SinComputeState[kGPUDtypeSlots];
     
-    bool CosInit[3];
-    id<MTLComputePipelineState> CosComputeState[3];
+    bool CosInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> CosComputeState[kGPUDtypeSlots];
     
-    bool TanInit[3];
-    id<MTLComputePipelineState> TanComputeState[3];
+    bool TanInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> TanComputeState[kGPUDtypeSlots];
 
-    bool SqrtInit[3];
-    id<MTLComputePipelineState> SqrtComputeState[3];
+    bool SqrtInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> SqrtComputeState[kGPUDtypeSlots];
     
-    bool ExpInit[3];
-    id<MTLComputePipelineState> ExpComputeState[3];
+    bool ExpInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> ExpComputeState[kGPUDtypeSlots];
     
-    bool AbsInit[4][4];
-    id<MTLComputePipelineState> AbsComputeState[4][4];
+    bool AbsInit[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> AbsComputeState[kGPUDtypeSlots][4];
     
-    bool LogInit[4][4];
-    id<MTLComputePipelineState> LogComputeState[4][4];
+    bool LogInit[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> LogComputeState[kGPUDtypeSlots][4];
     
-    bool ClampInit_nd[4][4];
-    id<MTLComputePipelineState> ClampComputeState_nd[4][4];
+    bool ClampInit_nd[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> ClampComputeState_nd[kGPUDtypeSlots][4];
     
-    bool SinInit_nd[4][4];
-    id<MTLComputePipelineState> SinComputeState_nd[4][4];
-    bool CosInit_nd[4][4];
-    id<MTLComputePipelineState> CosComputeState_nd[4][4];
-    bool TanInit_nd[4][4];
-    id<MTLComputePipelineState> TanComputeState_nd[4][4];
-    bool TanhInit_nd[4][4];
-    id<MTLComputePipelineState> TanhComputeState_nd[4][4];
-    bool SqrtInit_nd[4][4];
-    id<MTLComputePipelineState> SqrtComputeState_nd[4][4];
-    bool ExpInit_nd[4][4];
-    id<MTLComputePipelineState> ExpComputeState_nd[4][4];
+    bool SinInit_nd[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> SinComputeState_nd[kGPUDtypeSlots][4];
+    bool CosInit_nd[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> CosComputeState_nd[kGPUDtypeSlots][4];
+    bool TanInit_nd[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> TanComputeState_nd[kGPUDtypeSlots][4];
+    bool TanhInit_nd[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> TanhComputeState_nd[kGPUDtypeSlots][4];
+    bool SqrtInit_nd[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> SqrtComputeState_nd[kGPUDtypeSlots][4];
+    bool ExpInit_nd[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> ExpComputeState_nd[kGPUDtypeSlots][4];
     
     // Take is templated over both the source/value dtype (axis 0, all 7 dtype codes
     // instantiated) and the index dtype (axis 2, all 7 dtype codes reserved though only
     // the 5 integer ones -- UInt8/Int32/Int16/UInt32/UInt16 -- are actually instantiated).
-    bool TakeInit_nd[7][4][7];
-    id<MTLComputePipelineState> TakeComputeState_nd[7][4][7];
+    bool TakeInit_nd[kGPUDtypeSlots][4][kGPUDtypeSlots];
+    id<MTLComputePipelineState> TakeComputeState_nd[kGPUDtypeSlots][4][kGPUDtypeSlots];
     // Scatter uses the same [value dtype][dim specialization][index dtype] grid as Take.
     // The mode (ScatterMode) is a runtime argument, not part of the kernel name.
-    bool ScatterInit_nd[7][4][7];
-    id<MTLComputePipelineState> ScatterComputeState_nd[7][4][7];
+    bool ScatterInit_nd[kGPUDtypeSlots][4][kGPUDtypeSlots];
+    id<MTLComputePipelineState> ScatterComputeState_nd[kGPUDtypeSlots][4][kGPUDtypeSlots];
     
-    bool ConvolveInit[3];
-    id<MTLComputePipelineState> ConvolveComputeState[3];
+    bool ConvolveInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> ConvolveComputeState[kGPUDtypeSlots];
     
-    bool Conv1dInit[3];
-    id<MTLComputePipelineState> Conv1dComputeState[3];
-    bool Conv2dInit[3];
-    id<MTLComputePipelineState> Conv2dComputeState[3];
-    bool Conv3dInit[3];
-    id<MTLComputePipelineState> Conv3dComputeState[3];
-    bool ConvInit[3];
-    id<MTLComputePipelineState> ConvComputeState[3];
+    bool Conv1dInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> Conv1dComputeState[kGPUDtypeSlots];
+    bool Conv2dInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> Conv2dComputeState[kGPUDtypeSlots];
+    bool Conv3dInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> Conv3dComputeState[kGPUDtypeSlots];
+    bool ConvInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> ConvComputeState[kGPUDtypeSlots];
     
-    bool ConvolveFullInit[3];
-    id<MTLComputePipelineState> ConvolveFullComputeState[3];
+    bool ConvolveFullInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> ConvolveFullComputeState[kGPUDtypeSlots];
 
     // Resample preserves the input dtype exactly (nearest: pure gather; linear: promoted
     // to float internally, cast back on write), so unlike Sin/Cos it's templated over all
     // 7 dtype codes, same axis sizing as Take's source/value axis.
-    bool ResampleNearestInit_nd[7][4];
-    id<MTLComputePipelineState> ResampleNearestComputeState_nd[7][4];
-    bool ResampleLinearInit_nd[7][4];
-    id<MTLComputePipelineState> ResampleLinearComputeState_nd[7][4];
+    bool ResampleNearestInit_nd[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> ResampleNearestComputeState_nd[kGPUDtypeSlots][4];
+    bool ResampleLinearInit_nd[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> ResampleLinearComputeState_nd[kGPUDtypeSlots][4];
 
     // "Tail" variants: used when the trailing axis is untouched by the resample
     // (in_shape == out_shape, e.g. an RGBA channel axis). The grid spans only the
     // leading (resampled) axes, and each thread loops the identity axis internally,
     // reusing the interpolation weights it computed once instead of recomputing them
     // per channel. Bucketed the same way, but by leading-axis rank (dims-1).
-    bool ResampleNearestTailInit_nd[7][4];
-    id<MTLComputePipelineState> ResampleNearestTailComputeState_nd[7][4];
-    bool ResampleLinearTailInit_nd[7][4];
-    id<MTLComputePipelineState> ResampleLinearTailComputeState_nd[7][4];
+    bool ResampleNearestTailInit_nd[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> ResampleNearestTailComputeState_nd[kGPUDtypeSlots][4];
+    bool ResampleLinearTailInit_nd[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> ResampleLinearTailComputeState_nd[kGPUDtypeSlots][4];
 
-    id<MTLComputePipelineState> BrodcastedAddComputeState[7][4];
-    id<MTLComputePipelineState> BrodcastedSubComputeState[7][4];
-    id<MTLComputePipelineState> BrodcastedMulComputeState[7][4];
-    id<MTLComputePipelineState> BrodcastedDivComputeState[7][4];
-    id<MTLComputePipelineState> BrodcastedMaxComputeState[7][4];
-    id<MTLComputePipelineState> BrodcastedMinComputeState[7][4];
-    id<MTLComputePipelineState> BrodcastedCrossComputeState[4][4];
-    bool BrodcastedAddInit[7][4] = {{false}};
-    bool BrodcastedSubInit[7][4] = {{false}};
-    bool BrodcastedMulInit[7][4] = {{false}};
-    bool BrodcastedDivInit[7][4] = {{false}};
-    bool BrodcastedMaxInit[7][4] = {{false}};
-    bool BrodcastedMinInit[7][4] = {{false}};
-    bool BrodcastedCrossInit[4][4] = {{false}};
+    id<MTLComputePipelineState> BrodcastedAddComputeState[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> BrodcastedSubComputeState[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> BrodcastedMulComputeState[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> BrodcastedDivComputeState[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> BrodcastedMaxComputeState[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> BrodcastedMinComputeState[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> BrodcastedCrossComputeState[kGPUDtypeSlots][4];
+    bool BrodcastedAddInit[kGPUDtypeSlots][4] = {{false}};
+    bool BrodcastedSubInit[kGPUDtypeSlots][4] = {{false}};
+    bool BrodcastedMulInit[kGPUDtypeSlots][4] = {{false}};
+    bool BrodcastedDivInit[kGPUDtypeSlots][4] = {{false}};
+    bool BrodcastedMaxInit[kGPUDtypeSlots][4] = {{false}};
+    bool BrodcastedMinInit[kGPUDtypeSlots][4] = {{false}};
+    bool BrodcastedCrossInit[kGPUDtypeSlots][4] = {{false}};
     // Broadcasted elementwise equality (ComputeShaders/Equal.metal), [dtype][dim specialization].
-    id<MTLComputePipelineState> EqualComputeState[7][4];
-    bool EqualInit[7][4] = {{false}};
+    id<MTLComputePipelineState> EqualComputeState[kGPUDtypeSlots][4];
+    bool EqualInit[kGPUDtypeSlots][4] = {{false}};
     // Broadcasted elementwise nCr (ComputeShaders/Combination.metal), [dtype][dim specialization].
-    id<MTLComputePipelineState> CombinationComputeState[7][4];
-    bool CombinationInit[7][4] = {{false}};
+    id<MTLComputePipelineState> CombinationComputeState[kGPUDtypeSlots][4];
+    bool CombinationInit[kGPUDtypeSlots][4] = {{false}};
     
     bool Concat_2M[4];
     id<MTLComputePipelineState> Concat_2M_ComputeState[4];
     
-    bool CopyInplace[7][7][4];   // [dst dtype][src dtype][dim specialisation]
-    id<MTLComputePipelineState> CopyInplace_ComputeState[7][7][4];
+    bool CopyInplace[kGPUDtypeSlots][kGPUDtypeSlots][4];   // [dst dtype][src dtype][dim specialisation]
+    id<MTLComputePipelineState> CopyInplace_ComputeState[kGPUDtypeSlots][kGPUDtypeSlots][4];
     
-    bool PaddingInit[7][4];
-    id<MTLComputePipelineState> Padding_ComputeState[7][4];
+    bool PaddingInit[kGPUDtypeSlots][4];
+    id<MTLComputePipelineState> Padding_ComputeState[kGPUDtypeSlots][4];
     
     // LEGACY: PCG-based RNG (ComputeShaders/Random.metal). Superseded by the
     // Threefry-based kernels below. Kept for this iteration only - phase out next.
-    bool RandintInit_Legacy[7];
-    id<MTLComputePipelineState> RandintComputeState_Legacy[7];
-    bool RandInit_Legacy[7];
-    id<MTLComputePipelineState> RandComputeState_Legacy[7];
-    bool RandnInit_Legacy[7];
-    id<MTLComputePipelineState> RandnComputeState_Legacy[7];
+    bool RandintInit_Legacy[kGPUDtypeSlots];
+    id<MTLComputePipelineState> RandintComputeState_Legacy[kGPUDtypeSlots];
+    bool RandInit_Legacy[kGPUDtypeSlots];
+    id<MTLComputePipelineState> RandComputeState_Legacy[kGPUDtypeSlots];
+    bool RandnInit_Legacy[kGPUDtypeSlots];
+    id<MTLComputePipelineState> RandnComputeState_Legacy[kGPUDtypeSlots];
 
-    bool RandintInit[7];
-    id<MTLComputePipelineState> RandintComputeState[7];
-    bool RandInit[7];
-    id<MTLComputePipelineState> RandComputeState[7];
-    bool RandnInit[7];
-    id<MTLComputePipelineState> RandnComputeState[7];
+    bool RandintInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> RandintComputeState[kGPUDtypeSlots];
+    bool RandInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> RandComputeState[kGPUDtypeSlots];
+    bool RandnInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> RandnComputeState[kGPUDtypeSlots];
 
-    bool FillOnesInit[7];
-    id<MTLComputePipelineState> FillOnesComputeState[7];
+    bool FillOnesInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> FillOnesComputeState[kGPUDtypeSlots];
 
     // gaussian() supports Float and Float16 output (kDTypeTag indices 0/1) - only those two
     // slots are ever populated, but this reuses the same per-dtype array shape as FillOnes.
-    bool GaussianFillInit[7];
-    id<MTLComputePipelineState> GaussianFillComputeState[7];
-    bool GaussianNormalizeInit[7];
-    id<MTLComputePipelineState> GaussianNormalizeComputeState[7];
+    bool GaussianFillInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> GaussianFillComputeState[kGPUDtypeSlots];
+    bool GaussianNormalizeInit[kGPUDtypeSlots];
+    id<MTLComputePipelineState> GaussianNormalizeComputeState[kGPUDtypeSlots];
 
     // perlin() output is always Float too - single slot, no per-dtype array.
     bool PerlinInit = false;
@@ -238,61 +253,61 @@ public:
                 typeCastingInit[i][j] = false;
             }
         }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             TransposeInit[i] = false;
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             GEMMAInit[i] = false;
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             for (int j = 0; j < 2; j++) {
                 BatchedMatMulInit[i][j] = false;
             }
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             SumInit[i] = false;
         }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             ConvolveInit[i] = false;
             Conv1dInit[i] = false;
             Conv2dInit[i] = false;
             Conv3dInit[i] = false;
         }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             ConvolveFullInit[i] = false;
         }
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             for (int j = 0; j < 4; j++) {
                 BrodcastedAddInit[i][j] = false;
             }
         }
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             for (int j = 0; j < 4; j++) {
                 BrodcastedSubInit[i][j] = false;
             }
         }
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             for (int j = 0; j < 4; j++) {
                 BrodcastedMulInit[i][j] = false;
             }
         }
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             for (int j = 0; j < 4; j++) {
                 BrodcastedDivInit[i][j] = false;
             }
         }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             SinInit[i] = false;
         }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             CosInit[i] = false;
         }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             TanInit[i] = false;
             SqrtInit[i] = false;
             ExpInit[i] = false;
         }
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             for (int j = 0; j < 4; j++) {
                 AbsInit[i][j] = false;
                 LogInit[i][j] = false;
@@ -305,21 +320,21 @@ public:
                 ClampInit_nd[i][j] = false;
             }
         }
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             for (int j = 0; j < 4; j++) {
-                for (int k = 0; k < 7; k++) {
+                for (int k = 0; k < kGPUDtypeSlots; k++) {
                     TakeInit_nd[i][j][k] = false;
                     ScatterInit_nd[i][j][k] = false;
                 }
             }
         }
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             ConvolveInit[i] = false;
             Conv1dInit[i] = false;
             Conv2dInit[i] = false;
             Conv3dInit[i] = false;
         }
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             for (int j = 0; j < 4; j++) {
                 ResampleNearestInit_nd[i][j] = false;
                 ResampleLinearInit_nd[i][j] = false;
@@ -330,19 +345,19 @@ public:
         for (int i = 0; i < 4; i++) {
             Concat_2M[i] = false;
         }
-        for (int i = 0; i < 7; i++) {
-            for (int j = 0; j < 7; j++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
+            for (int j = 0; j < kGPUDtypeSlots; j++) {
                 for (int k = 0; k < 4; k++) {
                     CopyInplace[i][j][k] = false;
                 }
             }
         }
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             for (int k = 0; k < 4; k++) {
                 PaddingInit[i][k] = false;
             }
         }
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < kGPUDtypeSlots; i++) {
             RandintInit_Legacy[i] = false;
             RandInit_Legacy[i] = false;
             RandnInit_Legacy[i] = false;
@@ -554,82 +569,82 @@ public:
     
     void initBlend() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"BlendCompute"];
+        id<MTLFunction> func = requireFunction(@"BlendCompute");
         blendCompute = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         blendInit = true;
     }
     
     void initInvert() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"InvertImgCompute"];
+        id<MTLFunction> func = requireFunction(@"InvertImgCompute");
         invertImgCompute = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         invertInitImg = true;
     }
     
     void initchromaKey() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"ChromaKeyCompute"];
+        id<MTLFunction> func = requireFunction(@"ChromaKeyCompute");
         chromaKeyCompute = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         chromaKeyInit = true;
     }
     
     void initAddImg() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"AddGPU_C"];
+        id<MTLFunction> func = requireFunction(@"AddGPU_C");
         AddImgCompute = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         AddImgInit = true;
     }
     
     void initAddInt() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"AddGPU_I"];
+        id<MTLFunction> func = requireFunction(@"AddGPU_I");
         AddIntCompute = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         AddIntInit = true;
     }
     
     void initAddFloat() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"AddGPU_F"];
+        id<MTLFunction> func = requireFunction(@"AddGPU_F");
         AddFloatCompute = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         AddFloatInit = true;
     }
     
     void initSubImg() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"AddGPU_C"];
+        id<MTLFunction> func = requireFunction(@"AddGPU_C");
         AddImgCompute = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         AddImgInit = true;
     }
     
     void initSubInt() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"SubGPU_I"];
+        id<MTLFunction> func = requireFunction(@"SubGPU_I");
         SubIntCompute = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         SubIntInit = true;
     }
     
     void initSubFloat() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"SubGPU_F"];
+        id<MTLFunction> func = requireFunction(@"SubGPU_F");
         SubFloatCompute = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         SubFloatInit = true;
     }
     void initMulAll() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"MulGPU_All"];
+        id<MTLFunction> func = requireFunction(@"MulGPU_All");
         MulAllCompute = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         MulAllInit = true;
     }
     void initConversionAll() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"ConversionGPU_All"];
+        id<MTLFunction> func = requireFunction(@"ConversionGPU_All");
         ConversionAll = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ConversionAllInit = true;
     }
     
     void initTypeCasting(int i, int j) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TypeCastingGPU_%i_%i", i,j]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"TypeCastingGPU_%i_%i", i,j]);
         typeCasting[i][j] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         typeCastingInit[i][j] = true;
         
@@ -637,21 +652,21 @@ public:
     
     void initDerivativeAll() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"DerivativeGPU_All"];
+        id<MTLFunction> func = requireFunction(@"DerivativeGPU_All");
         DerivativeAll = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         DerivativeAllInit = true;
     }
     
     void initTransposeAll(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TransposeGPU_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"TransposeGPU_%i", i]);
         TransposeComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         TransposeInit[i] = true;
     }
     
     void initGEMMA_All(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"MatMulGPU_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"MatMulGPU_%i", i]);
         GEMMAComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         GEMMAInit[i] = true;
     }
@@ -664,63 +679,63 @@ public:
         } else {
             funcName = [NSString stringWithFormat:@"BatchedMatMul_NDgg_%i", type_idx];
         }
-        id<MTLFunction> func = [library newFunctionWithName:funcName];
+        id<MTLFunction> func = requireFunction(funcName);
         BatchedMatMulComputeState[type_idx][spec_idx] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         BatchedMatMulInit[type_idx][spec_idx] = true;
     }
     
     void initSum_All(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"SumGPU_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"SumGPU_%i", i]);
         SumComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         SumInit[i] = true;
     }
     
     void initSum_nd(int type_code, int cdims) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"SumGPU_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"SumGPU_%i_%i", type_code, cdims]);
         SumComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         SumInit_nd[type_code][cdims] = true;
     }
     
     void initMax_nd(int type_code, int cdims) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"MaxGPU_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"MaxGPU_%i_%i", type_code, cdims]);
         MaxComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         MaxInit[type_code][cdims] = true;
     }
 
     void initMin_nd(int type_code, int cdims) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"MinGPU_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"MinGPU_%i_%i", type_code, cdims]);
         MinComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         MinInit[type_code][cdims] = true;
     }
     
     void initSin(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"SinGPU_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"SinGPU_%i", i]);
         SinComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         SinInit[i] = true;
     }
 
     void initCos(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"CosGPU_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"CosGPU_%i", i]);
         CosComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         CosInit[i] = true;
     }
 
     void initTan(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TanGPU_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"TanGPU_%i", i]);
         TanComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         TanInit[i] = true;
     }
 
     void initSqrt_All(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"SqrtGPU_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"SqrtGPU_%i", i]);
         SqrtComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         SqrtInit[i] = true;
     }
@@ -728,136 +743,138 @@ public:
     // LEGACY: see RandintComputeState_Legacy above - phase out next iteration.
     void initRandint_Legacy(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"fill_randint_legacy_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"fill_randint_legacy_%i", i]);
         RandintComputeState_Legacy[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         RandintInit_Legacy[i] = true;
     }
 
     void initRand_Legacy(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"fill_rand_legacy_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"fill_rand_legacy_%i", i]);
         RandComputeState_Legacy[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         RandInit_Legacy[i] = true;
     }
 
     void initRandn_Legacy(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"fill_randn_legacy_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"fill_randn_legacy_%i", i]);
         RandnComputeState_Legacy[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         RandnInit_Legacy[i] = true;
     }
 
-    // dtype -> type tag used by random_kernel.metal and Fill.metal (Float, Float16, UInt8, Int32, Int16, UInt32, UInt16)
-    inline static constexpr const char* kDTypeTag[7] = {"f32", "f16", "u8", "i32", "i16", "u32", "u16"};
+    // dtype -> type tag used by random_kernel.metal and Fill.metal (Float, Float16, UInt8, Int32, Int16, UInt32, UInt16,
+    // Bool, Int8, Complex64, BFloat16, Int64, UInt64)
+    inline static constexpr const char* kDTypeTag[kGPUDtypeSlots] = {"f32", "f16", "u8", "i32", "i16", "u32", "u16",
+                                                                     "b8", "i8", "c64", "bf16", "i64", "u64"};
 
     void initRandint(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"randint_%s", kDTypeTag[i]]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"randint_%s", kDTypeTag[i]]);
         RandintComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         RandintInit[i] = true;
     }
 
     void initRand(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"rand_%s", kDTypeTag[i]]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"rand_%s", kDTypeTag[i]]);
         RandComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         RandInit[i] = true;
     }
 
     void initRandn(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"randn_%s", kDTypeTag[i]]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"randn_%s", kDTypeTag[i]]);
         RandnComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         RandnInit[i] = true;
     }
 
     void initFillOnes(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"fill_ones_%s", kDTypeTag[i]]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"fill_ones_%s", kDTypeTag[i]]);
         FillOnesComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         FillOnesInit[i] = true;
     }
 
     void initGaussianFill(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"fill_gaussian_%s", kDTypeTag[i]]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"fill_gaussian_%s", kDTypeTag[i]]);
         GaussianFillComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         GaussianFillInit[i] = true;
     }
 
     void initGaussianNormalize(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"normalize_by_sum_%s", kDTypeTag[i]]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"normalize_by_sum_%s", kDTypeTag[i]]);
         GaussianNormalizeComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         GaussianNormalizeInit[i] = true;
     }
 
     void initPerlin() {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:@"fill_perlin_f32"];
+        id<MTLFunction> func = requireFunction(@"fill_perlin_f32");
         PerlinComputeState = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         PerlinInit = true;
     }
 
     void initConvolve_All(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ConvolveGPU_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ConvolveGPU_%i", i]);
         ConvolveComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ConvolveInit[i] = true;
     }
 
     void initConv1d(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"conv1d_gpu_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"conv1d_gpu_%i", i]);
         Conv1dComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         Conv1dInit[i] = true;
     }
     
     void initConv2d(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"conv2d_gpu_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"conv2d_gpu_%i", i]);
         Conv2dComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         Conv2dInit[i] = true;
     }
 
     void initConv3d(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"conv3d_gpu_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"conv3d_gpu_%i", i]);
         Conv3dComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         Conv3dInit[i] = true;
     }
 
     void initConv(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"conv_gpu_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"conv_gpu_%i", i]);
         ConvComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ConvInit[i] = true;
     }
     
     void initConvolve_FULL(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ConvolveGPU_FULL_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ConvolveGPU_FULL_%i", i]);
         ConvolveFullComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ConvolveFullInit[i] = true;
     }
     
     void initBrodcastedAddInit(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedAddGPU_%i_%i", typeCode, dimSpecialiation]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"BrodcastedAddGPU_%i_%i", typeCode, dimSpecialiation]);
         BrodcastedAddComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         BrodcastedAddInit[typeCode][dimSpecialiation] = true;
     }
     
     void initBrodcastedCrossInit(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedCrossGPU_%i_%i", typeCode, dimSpecialiation]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"BrodcastedCrossGPU_%i_%i", typeCode, dimSpecialiation]);
         BrodcastedCrossComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         BrodcastedCrossInit[typeCode][dimSpecialiation] = true;
     }
     
     void initBrodcastedSubInit(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedSubGPU_%i_%i", typeCode, dimSpecialiation]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"BrodcastedSubGPU_%i_%i", typeCode, dimSpecialiation]);
         BrodcastedSubComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         BrodcastedSubInit[typeCode][dimSpecialiation] = true;
     }
@@ -865,28 +882,28 @@ public:
 
     void initBrodcastedMulInit(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedMulGPU_%i_%i", typeCode, dimSpecialiation]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"BrodcastedMulGPU_%i_%i", typeCode, dimSpecialiation]);
         BrodcastedMulComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         BrodcastedMulInit[typeCode][dimSpecialiation] = true;
     }
 
     void initBrodcastedDivInit(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedDivGPU_%i_%i", typeCode, dimSpecialiation]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"BrodcastedDivGPU_%i_%i", typeCode, dimSpecialiation]);
         BrodcastedDivComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         BrodcastedDivInit[typeCode][dimSpecialiation] = true;
     }
     
     void initBrodcastedMaxInit(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedMaxGPU_%i_%i", typeCode, dimSpecialiation]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"BrodcastedMaxGPU_%i_%i", typeCode, dimSpecialiation]);
         BrodcastedMaxComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         BrodcastedMaxInit[typeCode][dimSpecialiation] = true;
     }
     
     void initEqual(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"EqualGPU_%i_%i", typeCode, dimSpecialiation]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"EqualGPU_%i_%i", typeCode, dimSpecialiation]);
         EqualComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         EqualInit[typeCode][dimSpecialiation] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -894,7 +911,7 @@ public:
 
     void initCombination(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"CombinationGPU_%i_%i", typeCode, dimSpecialiation]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"CombinationGPU_%i_%i", typeCode, dimSpecialiation]);
         CombinationComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         CombinationInit[typeCode][dimSpecialiation] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -902,20 +919,20 @@ public:
     
     void initBrodcastedMinInit(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"BrodcastedMinGPU_%i_%i", typeCode, dimSpecialiation]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"BrodcastedMinGPU_%i_%i", typeCode, dimSpecialiation]);
         BrodcastedMinComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         BrodcastedMinInit[typeCode][dimSpecialiation] = true;
     }
     void initExp(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ExpGPU_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ExpGPU_%i", i]);
         ExpComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ExpInit[i] = true;
     }
 
     void initAbs(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"AbsGPU_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"AbsGPU_%i_%i", type_code, cdims]);
         AbsComputeState[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         AbsInit[type_code][cdims] = true;
         if (error) {
@@ -926,7 +943,7 @@ public:
     
     void initLog(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"LogGPU_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"LogGPU_%i_%i", type_code, cdims]);
         LogComputeState[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         LogInit[type_code][cdims] = true;
         if (error) {
@@ -937,7 +954,7 @@ public:
 
     void initSin_nd(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"SinGPU_nd_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"SinGPU_nd_%i_%i", type_code, cdims]);
         SinComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         SinInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -945,7 +962,7 @@ public:
     
     void initClamp_nd(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ClampGPU_nd_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ClampGPU_nd_%i_%i", type_code, cdims]);
         ClampComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ClampInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -953,7 +970,7 @@ public:
     
     void initCos_nd(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"CosGPU_nd_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"CosGPU_nd_%i_%i", type_code, cdims]);
         CosComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         CosInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -961,7 +978,7 @@ public:
     
     void initTan_nd(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TanGPU_nd_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"TanGPU_nd_%i_%i", type_code, cdims]);
         TanComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         TanInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -969,7 +986,7 @@ public:
 
     void initTanh_nd(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TanhGPU_nd_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"TanhGPU_nd_%i_%i", type_code, cdims]);
         TanhComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         TanhInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -977,7 +994,7 @@ public:
     
     void initSqrt_nd(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"SqrtGPU_nd_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"SqrtGPU_nd_%i_%i", type_code, cdims]);
         SqrtComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         SqrtInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -985,7 +1002,7 @@ public:
     
     void initExp_nd(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ExpGPU_nd_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ExpGPU_nd_%i_%i", type_code, cdims]);
         ExpComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ExpInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -993,7 +1010,7 @@ public:
 
     void initTake_nd(int type_code, int cdims, int idx_type_code) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"TakeGPU_nd_%i_%i_%i", type_code, cdims, idx_type_code]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"TakeGPU_nd_%i_%i_%i", type_code, cdims, idx_type_code]);
         TakeComputeState_nd[type_code][cdims][idx_type_code] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         TakeInit_nd[type_code][cdims][idx_type_code] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -1001,7 +1018,7 @@ public:
     
     void initScatter_nd(int type_code, int cdims, int idx_type_code) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ScatterGPU_nd_%i_%i_%i", type_code, cdims, idx_type_code]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ScatterGPU_nd_%i_%i_%i", type_code, cdims, idx_type_code]);
         ScatterComputeState_nd[type_code][cdims][idx_type_code] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ScatterInit_nd[type_code][cdims][idx_type_code] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -1009,7 +1026,7 @@ public:
     
     void initResampleNearest_nd(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ResampleNearestGPU_nd_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ResampleNearestGPU_nd_%i_%i", type_code, cdims]);
         ResampleNearestComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ResampleNearestInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -1017,7 +1034,7 @@ public:
 
     void initResampleLinear_nd(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ResampleLinearGPU_nd_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ResampleLinearGPU_nd_%i_%i", type_code, cdims]);
         ResampleLinearComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ResampleLinearInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -1025,7 +1042,7 @@ public:
 
     void initResampleNearestTail_nd(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ResampleNearestTailGPU_nd_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ResampleNearestTailGPU_nd_%i_%i", type_code, cdims]);
         ResampleNearestTailComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ResampleNearestTailInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -1033,7 +1050,7 @@ public:
 
     void initResampleLinearTail_nd(int type_code, int cdims) {
         NSError *error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"ResampleLinearTailGPU_nd_%i_%i", type_code, cdims]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ResampleLinearTailGPU_nd_%i_%i", type_code, cdims]);
         ResampleLinearTailComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         ResampleLinearTailInit_nd[type_code][cdims] = true;
         if (error) std::cout << "Error: " << [[error localizedDescription] UTF8String] << std::endl;
@@ -1041,7 +1058,7 @@ public:
 
     void initConcat_2M_GPU(int i) {
         NSError* error = nil;
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"concatGPU_2M_%i", i]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"concatGPU_2M_%i", i]);
         Concat_2M_ComputeState[i] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         Concat_2M[i] = true;
     }
@@ -1049,7 +1066,7 @@ public:
     void initCopyInplace(int dstTypeCode, int typeCode, int dimSpecialiation) {
         NSError* error = nil;
         NSLog([NSString stringWithFormat:@"CopyInplaceGPU_%i_%i_%i", dstTypeCode, typeCode, dimSpecialiation]);
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"CopyInplaceGPU_%i_%i_%i", dstTypeCode, typeCode, dimSpecialiation]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"CopyInplaceGPU_%i_%i_%i", dstTypeCode, typeCode, dimSpecialiation]);
         CopyInplace_ComputeState[dstTypeCode][typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         CopyInplace[dstTypeCode][typeCode][dimSpecialiation] = true;
         
@@ -1057,7 +1074,7 @@ public:
     void initPadding(int typeCode, int dimSpecialiation) {
         NSError* error = nil;
         NSLog([NSString stringWithFormat:@"PaddingGPU_%i_%i", typeCode, dimSpecialiation]);
-        id<MTLFunction> func = [library newFunctionWithName:[NSString stringWithFormat:@"PaddingGPU_%i_%i", typeCode, dimSpecialiation]];
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"PaddingGPU_%i_%i", typeCode, dimSpecialiation]);
         Padding_ComputeState[typeCode][dimSpecialiation] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         PaddingInit[typeCode][dimSpecialiation] = true;
         

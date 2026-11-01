@@ -67,7 +67,12 @@ template <typename T, typename U, int N = 1, typename IdxT = size_m>
     INSTANTIATE_FROM_TYPE(dst_idx, 3, int,      dst_type) \
     INSTANTIATE_FROM_TYPE(dst_idx, 4, int16_t,  dst_type) \
     INSTANTIATE_FROM_TYPE(dst_idx, 5, uint32_t, dst_type) \
-    INSTANTIATE_FROM_TYPE(dst_idx, 6, uint16_t, dst_type)
+    INSTANTIATE_FROM_TYPE(dst_idx, 6, uint16_t, dst_type) \
+    INSTANTIATE_FROM_TYPE(dst_idx, 7, bool,     dst_type) \
+    INSTANTIATE_FROM_TYPE(dst_idx, 8, int8_t,   dst_type) \
+    INSTANTIATE_FROM_TYPE(dst_idx, 10, bfloat,   dst_type) \
+    INSTANTIATE_FROM_TYPE(dst_idx, 11, int64_t,  dst_type) \
+    INSTANTIATE_FROM_TYPE(dst_idx, 12, uint64_t, dst_type)
 
 // Call once per destination type
 INSTANTIATE_ALL_SRC(0, float)
@@ -77,3 +82,8 @@ INSTANTIATE_ALL_SRC(3, int)
 INSTANTIATE_ALL_SRC(4, int16_t)
 INSTANTIATE_ALL_SRC(5, uint32_t)
 INSTANTIATE_ALL_SRC(6, uint16_t)
+INSTANTIATE_ALL_SRC(7, bool)
+INSTANTIATE_ALL_SRC(8, int8_t)
+INSTANTIATE_ALL_SRC(10, bfloat)
+INSTANTIATE_ALL_SRC(11, int64_t)
+INSTANTIATE_ALL_SRC(12, uint64_t)

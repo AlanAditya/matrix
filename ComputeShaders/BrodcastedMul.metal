@@ -90,6 +90,12 @@ INSTANTIATE_FROM_TYPE(3, int);
 INSTANTIATE_FROM_TYPE(4, int16_t);
 INSTANTIATE_FROM_TYPE(5, uint32_t);
 INSTANTIATE_FROM_TYPE(6, uint16_t);
+INSTANTIATE_FROM_TYPE(7, bool);
+INSTANTIATE_FROM_TYPE(8, int8_t);
+INSTANTIATE_FROM_TYPE(9, complex64);
+INSTANTIATE_FROM_TYPE(10, bfloat);
+INSTANTIATE_FROM_TYPE(11, int64_t);
+INSTANTIATE_FROM_TYPE(12, uint64_t);
 
 // Not functional yet
 // General Brodcasted Mul ND version where gid is based on result buffer directly as result buffer is contiguous in memory

@@ -26,6 +26,11 @@ INST_FILL_ONES(int,     i32)
 INST_FILL_ONES(short,   i16)
 INST_FILL_ONES(uint,    u32)
 INST_FILL_ONES(ushort,  u16)
+INST_FILL_ONES(bool, b8)
+INST_FILL_ONES(int8_t, i8)
+INST_FILL_ONES(bfloat, bf16)
+INST_FILL_ONES(int64_t, i64)
+INST_FILL_ONES(uint64_t, u64)
 
 // Device-side gaussian fill (matrix::gaussian()). Templated over T so Float and Float16
 // output share one body - the sum accumulator stays float regardless of T since summing
@@ -76,6 +81,7 @@ kernel void fill_gaussian_##tag(device T* out                  [[buffer(0)]],   
 
 INST_FILL_GAUSSIAN(float, f32)
 INST_FILL_GAUSSIAN(half,  f16)
+INST_FILL_GAUSSIAN(bfloat, bf16)
 
 template <typename T>
 inline void normalize_by_sum(device T* out, constant uint& n, constant float& sum_val, uint gid) {
@@ -95,6 +101,7 @@ kernel void normalize_by_sum_##tag(device T* out       [[buffer(0)]],          \
 
 INST_NORMALIZE_BY_SUM(float, f32)
 INST_NORMALIZE_BY_SUM(half,  f16)
+INST_NORMALIZE_BY_SUM(bfloat, bf16)
 
 // ============================================================================
 // Perlin noise (matrix::perlin()) - classic improved-Perlin, ported from the

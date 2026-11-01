@@ -13,6 +13,7 @@
 #import <Metal/Metal.h>
 #include <algorithm>
 #include <arm_fp16.h>
+#include <arm_bf16.h>
 #include <arm_neon.h>
 #include <atomic>
 #include <cmath>
@@ -24,6 +25,7 @@
 #include <vector>
 #include <concepts>
 #include <functional>
+#include "complex.h"
 #if TARGET_OS_IPHONE
 #import <UIKit/UIKit.h>
 #endif
@@ -37,9 +39,18 @@ enum class dtype: uint8_t {
     Int32 = 3,
     Int16 = 4,
     UInt32 = 5,
-    UInt16 = 6
-    // Add more as needed
+    UInt16 = 6,
+    // The codes are baked into the Metal kernel names (e.g. "CopyInplaceGPU_<dst>_<src>_<dims>") and
+    // index the GPU pipeline tables: append new types, never renumber.
+    Bool = 7,
+    Int8 = 8,
+    Complex64 = 9,
+    BFloat16 = 10,
+    Int64 = 11,
+    UInt64 = 12
 };
+constexpr int kNumDtypes = 13;
+static_assert(kNumDtypes == GPUManager::kGPUDtypeSlots, "GPU pipeline tables need one slot per dtype");
 
 template <dtype code> struct type_from_dtype;
 
@@ -63,6 +74,24 @@ template <> struct type_from_dtype<dtype::UInt32> {
 };
 template <> struct type_from_dtype<dtype::UInt16> {
     using type = uint16_t;
+};
+template <> struct type_from_dtype<dtype::Bool> {
+    using type = bool;
+};
+template <> struct type_from_dtype<dtype::Int8> {
+    using type = int8_t;
+};
+template <> struct type_from_dtype<dtype::Complex64> {
+    using type = complex64;
+};
+template <> struct type_from_dtype<dtype::BFloat16> {
+    using type = bfloat16_t;
+};
+template <> struct type_from_dtype<dtype::Int64> {
+    using type = int64_t;
+};
+template <> struct type_from_dtype<dtype::UInt64> {
+    using type = uint64_t;
 };
 
 template <typename T> dtype dtype_from_type();
@@ -88,6 +117,24 @@ template <> constexpr inline dtype dtype_from_type<uint32_t>() {
 template <> constexpr inline dtype dtype_from_type<uint16_t>() {
     return dtype::UInt16;
 }
+template <> constexpr inline dtype dtype_from_type<bool>() {
+    return dtype::Bool;
+}
+template <> constexpr inline dtype dtype_from_type<int8_t>() {
+    return dtype::Int8;
+}
+template <> constexpr inline dtype dtype_from_type<complex64>() {
+    return dtype::Complex64;
+}
+template <> constexpr inline dtype dtype_from_type<bfloat16_t>() {
+    return dtype::BFloat16;
+}
+template <> constexpr inline dtype dtype_from_type<int64_t>() {
+    return dtype::Int64;
+}
+template <> constexpr inline dtype dtype_from_type<uint64_t>() {
+    return dtype::UInt64;
+}
 
 constexpr size_t dtype_size(dtype d) {
     static constexpr size_t sizes[] = {
@@ -97,19 +144,39 @@ constexpr size_t dtype_size(dtype d) {
         sizeof(int32_t),   // 3: Int32
         sizeof(int16_t),   // 4: Int16
         sizeof(uint32_t),  // 5: UInt32
-        sizeof(uint16_t)   // 6: UInt16
+        sizeof(uint16_t),  // 6: UInt16
+        sizeof(bool),      // 7: Bool
+        sizeof(int8_t),    // 8: Int8
+        sizeof(complex64), // 9: Complex64
+        sizeof(bfloat16_t),// 10: BFloat16
+        sizeof(int64_t),   // 11: Int64
+        sizeof(uint64_t)   // 12: UInt64
     };
+    static_assert(sizeof(sizes) / sizeof(sizes[0]) == kNumDtypes);
     return sizes[static_cast<size_t>(d)];
 }
-//                    Float  Float16  UInt8  Int32  Int16  UInt32  UInt16
-constexpr dtype type_rules[7][7] = {
-/*Float  */ { dtype::Float,  dtype::Float,   dtype::Float,  dtype::Float,   dtype::Float,  dtype::Float,   dtype::Float  },
-/*Float16*/ { dtype::Float,  dtype::Float16, dtype::Float,  dtype::Float,   dtype::Float,  dtype::Float,   dtype::Float  },
-/*UInt8  */ { dtype::Float,  dtype::Float,   dtype::UInt8,  dtype::Int32,   dtype::Int16,  dtype::UInt32,  dtype::UInt16 },
-/*Int32  */ { dtype::Float,  dtype::Float,   dtype::Int32,  dtype::Int32,   dtype::Int32,  dtype::Int32,   dtype::Int32  },
-/*Int16  */ { dtype::Float,  dtype::Float,   dtype::Int16,  dtype::Int32,   dtype::Int16,  dtype::Int32,   dtype::Int32  },
-/*UInt32 */ { dtype::Float,  dtype::Float,   dtype::UInt32, dtype::Int32,   dtype::Int32,  dtype::UInt32,  dtype::UInt32 },
-/*UInt16 */ { dtype::Float,  dtype::Float,   dtype::UInt16, dtype::Int32,   dtype::Int32,  dtype::UInt32,  dtype::UInt16 },
+
+constexpr bool is_complex(dtype d) { return d == dtype::Complex64; }
+constexpr bool is_floating(dtype d) { return d == dtype::Float || d == dtype::Float16 || d == dtype::BFloat16; }
+constexpr bool is_integral(dtype d) { return !is_floating(d) && !is_complex(d) && d != dtype::Bool; }
+constexpr bool is_unsigned(dtype d) {
+    return d == dtype::UInt8 || d == dtype::UInt16 || d == dtype::UInt32 || d == dtype::UInt64;
+}
+//            Float             Float16           UInt8             Int32             Int16             UInt32            UInt16            Bool              Int8              Complex64         BFloat16          Int64             UInt64
+constexpr dtype type_rules[kNumDtypes][kNumDtypes] = {
+/*Float    */ { dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::Complex64, dtype::Float,     dtype::Float,     dtype::Float },
+/*Float16  */ { dtype::Float,     dtype::Float16,   dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float16,   dtype::Float,     dtype::Complex64, dtype::Float,     dtype::Float,     dtype::Float },
+/*UInt8    */ { dtype::Float,     dtype::Float,     dtype::UInt8,     dtype::Int32,     dtype::Int16,     dtype::UInt32,    dtype::UInt16,    dtype::UInt8,     dtype::Int16,     dtype::Complex64, dtype::Float,     dtype::Int64,     dtype::UInt64 },
+/*Int32    */ { dtype::Float,     dtype::Float,     dtype::Int32,     dtype::Int32,     dtype::Int32,     dtype::Int32,     dtype::Int32,     dtype::Int32,     dtype::Int32,     dtype::Complex64, dtype::Float,     dtype::Int64,     dtype::Float },
+/*Int16    */ { dtype::Float,     dtype::Float,     dtype::Int16,     dtype::Int32,     dtype::Int16,     dtype::Int32,     dtype::Int32,     dtype::Int16,     dtype::Int16,     dtype::Complex64, dtype::Float,     dtype::Int64,     dtype::Float },
+/*UInt32   */ { dtype::Float,     dtype::Float,     dtype::UInt32,    dtype::Int32,     dtype::Int32,     dtype::UInt32,    dtype::UInt32,    dtype::UInt32,    dtype::Int32,     dtype::Complex64, dtype::Float,     dtype::Int64,     dtype::UInt64 },
+/*UInt16   */ { dtype::Float,     dtype::Float,     dtype::UInt16,    dtype::Int32,     dtype::Int32,     dtype::UInt32,    dtype::UInt16,    dtype::UInt16,    dtype::Int32,     dtype::Complex64, dtype::Float,     dtype::Int64,     dtype::UInt64 },
+/*Bool     */ { dtype::Float,     dtype::Float16,   dtype::UInt8,     dtype::Int32,     dtype::Int16,     dtype::UInt32,    dtype::UInt16,    dtype::Bool,      dtype::Int8,      dtype::Complex64, dtype::BFloat16,  dtype::Int64,     dtype::UInt64 },
+/*Int8     */ { dtype::Float,     dtype::Float,     dtype::Int16,     dtype::Int32,     dtype::Int16,     dtype::Int32,     dtype::Int32,     dtype::Int8,      dtype::Int8,      dtype::Complex64, dtype::Float,     dtype::Int64,     dtype::Float },
+/*Complex64*/ { dtype::Complex64, dtype::Complex64, dtype::Complex64, dtype::Complex64, dtype::Complex64, dtype::Complex64, dtype::Complex64, dtype::Complex64, dtype::Complex64, dtype::Complex64, dtype::Complex64, dtype::Complex64, dtype::Complex64 },
+/*BFloat16 */ { dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::Float,     dtype::BFloat16,  dtype::Float,     dtype::Complex64, dtype::BFloat16,  dtype::Float,     dtype::Float },
+/*Int64    */ { dtype::Float,     dtype::Float,     dtype::Int64,     dtype::Int64,     dtype::Int64,     dtype::Int64,     dtype::Int64,     dtype::Int64,     dtype::Int64,     dtype::Complex64, dtype::Float,     dtype::Int64,     dtype::Float },
+/*UInt64   */ { dtype::Float,     dtype::Float,     dtype::UInt64,    dtype::Float,     dtype::Float,     dtype::UInt64,    dtype::UInt64,    dtype::UInt64,    dtype::Float,     dtype::Complex64, dtype::Float,     dtype::Float,     dtype::UInt64 },
 };
 
 dtype promote_types(dtype a, dtype b);
@@ -189,6 +256,16 @@ void broadcast_shapes_matmul(const array_descriptor &arr_desc1,
                              array_descriptor &out_shape,
                              BroadcastDescriptor *new_desc1,
                              BroadcastDescriptor *new_desc2, int dim1, int dim2);
+// static_cast between element types. Clang won't cast __fp16 <-> __bf16 directly, so that pair goes
+// through float; every other pair is a plain static_cast.
+template <typename Dst, typename Src>
+inline Dst dtype_cast(Src v) {
+    constexpr bool half_pair = (std::is_same_v<Src, float16_t> && std::is_same_v<Dst, bfloat16_t>) ||
+                               (std::is_same_v<Src, bfloat16_t> && std::is_same_v<Dst, float16_t>);
+    if constexpr (half_pair) return static_cast<Dst>(static_cast<float>(v));
+    else return static_cast<Dst>(v);
+}
+
 template <typename Func>
 inline void dispatch_type(dtype type, void *buffer, Func &&function_to_run) {
     if (!buffer)
@@ -216,8 +293,64 @@ inline void dispatch_type(dtype type, void *buffer, Func &&function_to_run) {
         case dtype::UInt16:
             function_to_run(static_cast<uint16_t *>(buffer));
             break;
+        case dtype::Bool:
+            function_to_run(static_cast<bool *>(buffer));
+            break;
+        case dtype::Int8:
+            function_to_run(static_cast<int8_t *>(buffer));
+            break;
+        case dtype::BFloat16:
+            function_to_run(static_cast<bfloat16_t *>(buffer));
+            break;
+        case dtype::Int64:
+            function_to_run(static_cast<int64_t *>(buffer));
+            break;
+        case dtype::UInt64:
+            function_to_run(static_cast<uint64_t *>(buffer));
+            break;
+        // Complex64 stays out on purpose: every lambda passed here is compiled for each case, and most
+        // of them (comparisons, casts to float, min/max) have no complex meaning. Complex ops dispatch
+        // through dispatch_complex_type, so any other op gets this error instead of a wrong answer.
+        case dtype::Complex64:
+            throw std::runtime_error("Complex64 is not supported by this op");
         default:
             throw std::runtime_error("Unsupported dtype during dispatch");
+    }
+}
+
+// dispatch_type for ops that only ever see Float or Float16: they promote their input with
+// promote_types(type, Float16) first (sin, cos, tan, tanh, exp, log, sqrt). The lambda is compiled
+// for those two types only, instead of once per dtype.
+template <typename Func>
+inline void dispatch_float_type(dtype type, void *buffer, Func &&function_to_run) {
+    if (!buffer)
+        return;
+
+    switch (type) {
+        case dtype::Float:
+            function_to_run(static_cast<float *>(buffer));
+            break;
+        case dtype::Float16:
+            function_to_run(static_cast<float16_t *>(buffer));
+            break;
+        default:
+            throw std::runtime_error("dispatch_float_type: expected a Float or Float16 matrix");
+    }
+}
+
+// The Complex64 counterpart of dispatch_type, for ops where complex math is meaningful. Those ops
+// branch on is_complex(type) and send the same lambda here instead of to dispatch_type.
+template <typename Func>
+inline void dispatch_complex_type(dtype type, void *buffer, Func &&function_to_run) {
+    if (!buffer)
+        return;
+
+    switch (type) {
+        case dtype::Complex64:
+            function_to_run(static_cast<complex64 *>(buffer));
+            break;
+        default:
+            throw std::runtime_error("dispatch_complex_type: expected a Complex64 matrix");
     }
 }
 
@@ -447,7 +580,7 @@ public:
         
         dispatch_type(type, s.buffer, [&](auto* typed_buffer) {
             using BufT = std::decay_t<decltype(*typed_buffer)>;
-            *typed_buffer = static_cast<BufT>(val);
+            *typed_buffer = dtype_cast<BufT>(val);
         });
         s.begin_refcount();
         return s;
@@ -1257,22 +1390,22 @@ public:
                 // us stands for unsafe and fast subscripting so it doesnt suppor
                 // negative indices and is super fast.
                 if (cdims == 0) {
-                    out_data[0] = static_cast<DstT>(in_data[0]);
+                    out_data[0] = dtype_cast<DstT>(in_data[0]);
                 } else if (cdims == 1) {
                     for (uint32_t i = 0; i < inMat.total_size; i++) {
-                        out_data[i * res.stridesA[0]] = static_cast<DstT>(in_data[i * res.stridesB[0]]);
+                        out_data[i * res.stridesA[0]] = dtype_cast<DstT>(in_data[i * res.stridesB[0]]);
                     }
                 } else if (cdims == 2) {
                     for (uint32_t i = 0; i < res.shape[0]; i++) {
                         for (uint32_t j = 0; j < res.shape[1]; j++) {
-                            out_data[i * res.stridesA[0] + j * res.stridesA[1]] = static_cast<DstT>(in_data[i * res.stridesB[0] + j * res.stridesB[1]]);
+                            out_data[i * res.stridesA[0] + j * res.stridesA[1]] = dtype_cast<DstT>(in_data[i * res.stridesB[0] + j * res.stridesB[1]]);
                         }
                     }
                 } else if (cdims == 3) {
                     for (uint32_t i = 0; i < res.shape[0]; i++) {
                         for (uint32_t j = 0; j < res.shape[1]; j++) {
                             for (uint32_t k = 0; k < res.shape[2]; k++) {
-                                out_data[i * res.stridesA[0] + j * res.stridesA[1] + k * res.stridesA[2]] = static_cast<DstT>(in_data[i * res.stridesB[0] + j * res.stridesB[1] + k * res.stridesB[2]]);
+                                out_data[i * res.stridesA[0] + j * res.stridesA[1] + k * res.stridesA[2]] = dtype_cast<DstT>(in_data[i * res.stridesB[0] + j * res.stridesB[1] + k * res.stridesB[2]]);
                             }
                         }
                     }
@@ -1297,7 +1430,7 @@ public:
                                     out_data[outMatIndex + i * res.stridesA[cdims - 3] +
                                              j * res.stridesA[cdims - 2] +
                                              k * res.stridesA[cdims - 1]] =
-                                    static_cast<DstT>(in_data[inMatIndex + i * res.stridesB[cdims - 3] + j * res.stridesB[cdims - 2] + k * res.stridesB[cdims - 1]]);
+                                    dtype_cast<DstT>(in_data[inMatIndex + i * res.stridesB[cdims - 3] + j * res.stridesB[cdims - 2] + k * res.stridesB[cdims - 1]]);
                                 }
                             }
                         }
@@ -1504,8 +1637,9 @@ public:
     void releaseTape();
     void destroyInstance();
     
+    // bfloat16_t is listed on its own: libc++ doesn't count __bf16 as arithmetic.
     template <typename Type,
-    typename = std::enable_if_t<std::is_arithmetic<Type>::value>>
+    typename = std::enable_if_t<std::is_arithmetic<Type>::value || std::is_same_v<Type, bfloat16_t>>>
     matrix &operator=(Type value);
     
     matrix(const matrix &other);
@@ -1525,9 +1659,12 @@ matrix operator/(const matrix &a, const matrix &b);
 // it never loses the value:
 //   - a float scalar next to an integer matrix is Float (int32 * 0.5f is Float, not * 0), as MLX;
 //   - an int that doesn't fit m (-1 or 300 next to uint8, 70000 next to int16) takes the
-//     narrowest of Int32 / UInt32 that holds it, and promote_types settles the result. MLX
-//     throws here instead; we only throw when nothing fits (there are no 64-bit dtypes);
-//   - a scalar beyond Float16's range (+-65504) next to Float16 is Float, not inf.
+//     narrowest of Int32 / UInt32 / Int64 / UInt64 that holds it, and promote_types settles the
+//     result. MLX throws here instead; we only throw when nothing fits;
+//   - a scalar beyond Float16's range (+-65504) next to Float16 is Float, not inf. BFloat16 has
+//     Float's range, so any scalar stays BFloat16;
+//   - a bool scalar is the weakest type and adopts m as it is; next to a Complex64 matrix any
+//     scalar is Complex64.
 template <typename T>
 inline bool scalar_fits(T v, int64_t lo, int64_t hi) {
     if constexpr (std::is_floating_point_v<T>) return v >= (T)lo && v <= (T)hi;
@@ -1538,7 +1675,8 @@ inline bool scalar_fits(T v, int64_t lo, int64_t hi) {
 template <typename T>
 inline dtype scalar_operand_type(T scalar, dtype m) {
     static_assert(std::is_arithmetic_v<T>, "matrix op with a non-arithmetic scalar");
-    if (m == dtype::Float) return m;
+    if (m == dtype::Float || m == dtype::BFloat16 || m == dtype::Complex64) return m;
+    if constexpr (std::is_same_v<T, bool>) return m;
     if (m == dtype::Float16) return scalar_fits(scalar, -65504, 65504) ? m : dtype::Float;
     if constexpr (std::is_floating_point_v<T>) {
         return dtype::Float;
@@ -1550,14 +1688,22 @@ inline dtype scalar_operand_type(T scalar, dtype m) {
                 case dtype::UInt32: return scalar_fits(scalar, 0, UINT32_MAX);
                 case dtype::Int16:  return scalar_fits(scalar, INT16_MIN, INT16_MAX);
                 case dtype::Int32:  return scalar_fits(scalar, INT32_MIN, INT32_MAX);
+                case dtype::Int8:   return scalar_fits(scalar, INT8_MIN, INT8_MAX);
+                case dtype::Int64:  return scalar_fits(scalar, INT64_MIN, INT64_MAX);
+                case dtype::UInt64:
+                    if constexpr (std::is_signed_v<T>) return scalar >= 0;
+                    else return true;
                 default:            return false;
             }
         };
         if (fits(m)) return m;
         if (fits(dtype::Int32)) return dtype::Int32;
         // Too big for Int32 but not negative: UInt32 keeps it, unless m is signed (Int32 wins the promotion and would wrap it).
-        bool m_unsigned = m == dtype::UInt8 || m == dtype::UInt16 || m == dtype::UInt32;
+        bool m_unsigned = is_unsigned(m);
         if (m_unsigned && fits(dtype::UInt32)) return dtype::UInt32;
+        // Same again one size up: Int64, or UInt64 next to an unsigned matrix when it's past Int64.
+        if (m != dtype::UInt64 && fits(dtype::Int64)) return dtype::Int64;
+        if (m_unsigned && fits(dtype::UInt64)) return dtype::UInt64;
         throw std::overflow_error("matrix op: scalar " + std::to_string(scalar) + " doesn't fit any dtype it could promote to");
     }
 }

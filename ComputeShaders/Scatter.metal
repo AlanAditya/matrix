@@ -179,7 +179,10 @@ template <typename T, typename IdxT>
     INSTANTIATE_SCATTER_ND_IDX(type_idx, type, 3, int) \
     INSTANTIATE_SCATTER_ND_IDX(type_idx, type, 4, int16_t) \
     INSTANTIATE_SCATTER_ND_IDX(type_idx, type, 5, uint32_t) \
-    INSTANTIATE_SCATTER_ND_IDX(type_idx, type, 6, uint16_t)
+    INSTANTIATE_SCATTER_ND_IDX(type_idx, type, 6, uint16_t) \
+    INSTANTIATE_SCATTER_ND_IDX(type_idx, type, 8, int8_t) \
+    INSTANTIATE_SCATTER_ND_IDX(type_idx, type, 11, int64_t) \
+    INSTANTIATE_SCATTER_ND_IDX(type_idx, type, 12, uint64_t)
 
 INSTANTIATE_SCATTER_ND(0, float)
 INSTANTIATE_SCATTER_ND(1, half)
@@ -188,3 +191,6 @@ INSTANTIATE_SCATTER_ND(3, int)
 INSTANTIATE_SCATTER_ND(4, int16_t)
 INSTANTIATE_SCATTER_ND(5, uint32_t)
 INSTANTIATE_SCATTER_ND(6, uint16_t)
+INSTANTIATE_SCATTER_ND(7, bool)
+INSTANTIATE_SCATTER_ND(8, int8_t)
+INSTANTIATE_SCATTER_ND(10, bfloat)

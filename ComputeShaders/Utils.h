@@ -9,6 +9,15 @@
 #define Utils_h
 
 #define MAX_TENSOR_RANK 8
+
+// complex64 for dtype::Complex64 (type code 9): the Metal copy of matrix/complex.h, same layout.
+#include "complex_metal.h"
+
+// The Metal standard library has no min / max / abs for bfloat, so the generic kernels' unqualified
+// calls are ambiguous for it. These are exact matches and go through float, like the float versions.
+inline bfloat max(bfloat a, bfloat b) { return bfloat(metal::max(float(a), float(b))); }
+inline bfloat min(bfloat a, bfloat b) { return bfloat(metal::min(float(a), float(b))); }
+inline bfloat abs(bfloat a) { return bfloat(metal::abs(float(a))); }
 using size_m = uint32_t;
 #define instantiate_kernel(name, func, ...) \
   template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;

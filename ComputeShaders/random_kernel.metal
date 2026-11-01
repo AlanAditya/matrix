@@ -173,12 +173,15 @@ kernel void randint_##tag(device T* out        [[buffer(0)]],                 \
 
 INST_FLOAT(float, f32)
 INST_FLOAT(half,  f16)
+INST_FLOAT(bfloat, bf16)
 
 INST_INT(int,      i32)
 INST_INT(short,    i16)
 INST_INT(uint8_t,  u8)
 INST_INT(uint,     u32)
 INST_INT(ushort,   u16)
+INST_INT(int8_t, i8)
+INST_INT(uint64_t, u64)
 
 // int64 needs the 2-word path and 64-bit bounds
 kernel void randint_i64(device long* out        [[buffer(0)]],

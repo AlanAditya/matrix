@@ -1496,6 +1496,8 @@ void matrix::print() const {
                               std::is_same_v<T, unsigned char> ||
                               std::is_same_v<T, int8_t>) {
                     oss << static_cast<int>(typed_data[i]);
+                } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+                    oss << static_cast<float>(typed_data[i]);
                 } else {
                     oss << typed_data[i];
                 }
@@ -1514,6 +1516,8 @@ void matrix::print() const {
                                   std::is_same_v<T, unsigned char> ||
                                   std::is_same_v<T, int8_t>) {
                         oss << static_cast<int>(typed_data[st[0]*i]);
+                    } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+                        oss << static_cast<float>(typed_data[st[0]*i]);
                     } else {
                         oss << typed_data[st[0]*i];
                     }
@@ -1529,6 +1533,8 @@ void matrix::print() const {
                                   std::is_same_v<T, unsigned char> ||
                                   std::is_same_v<T, int8_t>) {
                         oss << static_cast<int>(typed_data[st[0]*i + st[1]*j]);
+                    } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+                        oss << static_cast<float>(typed_data[st[0]*i + st[1]*j]);
                     } else {
                         oss << typed_data[st[0]*i + st[1]*j];
                     }
@@ -1545,6 +1551,8 @@ void matrix::print() const {
                                   std::is_same_v<T, unsigned char> ||
                                   std::is_same_v<T, int8_t>) {
                         oss << static_cast<int>(typed_data[st[0]*i + st[1]*j + st[2]*k]);
+                    } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+                        oss << static_cast<float>(typed_data[st[0]*i + st[1]*j + st[2]*k]);
                     } else {
                         oss << typed_data[st[0]*i + st[1]*j + st[2]*k];
                     }
@@ -1562,6 +1570,8 @@ void matrix::print() const {
                                   std::is_same_v<T, unsigned char> ||
                                   std::is_same_v<T, int8_t>) {
                         oss << static_cast<int>(typed_data[st[0]*l + st[1]*i + st[2]*j + st[3]*k]);
+                    } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+                        oss << static_cast<float>(typed_data[st[0]*l + st[1]*i + st[2]*j + st[3]*k]);
                     } else {
                         oss << typed_data[st[0]*l + st[1]*i + st[2]*j + st[3]*k];
                     }
@@ -1580,6 +1590,8 @@ void matrix::print() const {
                           std::is_same_v<T, unsigned char> ||
                           std::is_same_v<T, int8_t>) {
                 std::cout << static_cast<int>(typed_data[flat_index]);
+            } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+                std::cout << static_cast<float>(typed_data[flat_index]);
             } else {
                 std::cout << typed_data[flat_index];
             }
@@ -2405,12 +2417,21 @@ matrix matrix::randint(int low, int high, std::initializer_list<size_m> shapeI, 
         [commandEncoder setBytes:&key length:sizeof(simd_uint2) atIndex:1];
         [commandEncoder setBytes:&size length:sizeof(uint) atIndex:2];
 
-        int l = low;
-        uint32_t range = (uint32_t)(high - low);
-        [commandEncoder setBytes:&l length:sizeof(int) atIndex:3];
-        [commandEncoder setBytes:&range length:sizeof(uint32_t) atIndex:4];
-
-        uint threadCount = (size + 1) / 2;   // each thread fills 2 elements
+        uint threadCount;
+        if (out.type == dtype::Int64) {
+            // randint_i64 (random_kernel.metal) takes 64-bit bounds and fills one element per thread
+            int64_t l = low;
+            uint64_t range = (uint64_t)((int64_t)high - low);
+            [commandEncoder setBytes:&l length:sizeof(int64_t) atIndex:3];
+            [commandEncoder setBytes:&range length:sizeof(uint64_t) atIndex:4];
+            threadCount = size;
+        } else {
+            int l = low;
+            uint32_t range = (uint32_t)(high - low);
+            [commandEncoder setBytes:&l length:sizeof(int) atIndex:3];
+            [commandEncoder setBytes:&range length:sizeof(uint32_t) atIndex:4];
+            threadCount = (size + 1) / 2;   // each thread fills 2 elements
+        }
         auto dispatchSize = MTLSizeMake(threadCount, 1, 1);
         auto threadsPerGroup = MTLSizeMake((threadCount < 256 ? threadCount : 256), 1, 1);
         [commandEncoder dispatchThreads:dispatchSize threadsPerThreadgroup:threadsPerGroup];
@@ -3184,7 +3205,7 @@ void matrix::pad_backend(std::vector<size_m>& padding_range, matrix& padded_mat,
             using T = std::decay_t<decltype(*dst)>;
             const T* src = (const T*)this->buffer;
             T fill{};
-            dispatch_type(value.type, value.buffer, [&](auto* v) { fill = static_cast<T>(*v); });
+            dispatch_type(value.type, value.buffer, [&](auto* v) { fill = dtype_cast<T>(*v); });
 
             if (cdims == 1) {
                 for (size_m x = 0; x < dst_shape[0]; ++x) {
@@ -3744,7 +3765,22 @@ static std::string npy_descr_for_dtype(dtype type) {
         case dtype::UInt8:
             desc = "|u1";
             break;
-        default:
+        case dtype::Bool:
+            desc = "|b1";
+            break;
+        case dtype::Int8:
+            desc = "|i1";
+            break;
+        case dtype::Int64:
+            desc = "<i8";
+            break;
+        case dtype::UInt64:
+            desc = "<u8";
+            break;
+        case dtype::Complex64:
+            desc = "<c8";
+            break;
+        default:   // BFloat16: numpy has no bfloat16 dtype
             throw std::runtime_error("npy_descr_for_dtype: not implemented");
             break;
     }
@@ -5877,7 +5913,7 @@ void matrix::clamp(matrix& output, double min_val, double max_val, ExecutionDevi
 }
 
 matrix matrix::abs(const matrix& input) {
-    if (input.type == dtype::UInt8 || input.type == dtype::UInt16 || input.type == dtype::UInt32) {
+    if (is_unsigned(input.type) || input.type == dtype::Bool) {
         return input;
     }
 
@@ -5973,7 +6009,7 @@ void matrix::log(matrix& output, ExecutionDevice exec_device) {
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
-        dispatch_type(type, output.buffer, [&](auto *out_data) {
+        dispatch_float_type(type, output.buffer, [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
                 T* in_data = (T*)buffer;
                 if (cdims == 0) {
@@ -6231,7 +6267,7 @@ void matrix::sin(matrix& output, ExecutionDevice exec_device) {
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
-        dispatch_type(type, output.buffer, [&](auto *out_data) {
+        dispatch_float_type(type, output.buffer, [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
                 T* in_data = (T*)buffer;
                 if (cdims == 0) {
@@ -6364,7 +6400,7 @@ void matrix::cos(matrix& output, ExecutionDevice exec_device) {
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
-        dispatch_type(type, output.buffer, [&](auto *out_data) {
+        dispatch_float_type(type, output.buffer, [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
                 T* in_data = (T*)buffer;
                 if (cdims == 0) {
@@ -6497,7 +6533,7 @@ void matrix::tan(matrix& output, ExecutionDevice exec_device) {
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
-        dispatch_type(type, output.buffer, [&](auto *out_data) {
+        dispatch_float_type(type, output.buffer, [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
                 T* in_data = (T*)buffer;
                 if (cdims == 0) {
@@ -6630,7 +6666,7 @@ void matrix::tanh(matrix& output, ExecutionDevice exec_device) {
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
-        dispatch_type(type, output.buffer, [&](auto *out_data) {
+        dispatch_float_type(type, output.buffer, [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
                 T* in_data = (T*)buffer;
                 if (cdims == 0) {
@@ -6763,7 +6799,7 @@ void matrix::sqrt(matrix& output, ExecutionDevice exec_device) {
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
-        dispatch_type(type, output.buffer, [&](auto *out_data) {
+        dispatch_float_type(type, output.buffer, [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
                 T* in_data = (T*)buffer;
                 if (cdims == 0) {
@@ -6896,7 +6932,7 @@ void matrix::exp(matrix& output, ExecutionDevice exec_device) {
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
         // CPU fallback mapping
-        dispatch_type(type, output.buffer, [&](auto *out_data) {
+        dispatch_float_type(type, output.buffer, [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
                 T* in_data = (T*)buffer;
                 if (cdims == 0) {
@@ -8430,7 +8466,7 @@ matrix &matrix::operator=(Type value) {
         dispatch_type(type, value_mat_view.buffer, [&](auto *typed_buffer) {
             // typed_buffer points to the single element in value_mat_view
             using BufT = std::decay_t<decltype(*typed_buffer)>;
-            *typed_buffer = static_cast<BufT>(value);
+            *typed_buffer = dtype_cast<BufT>(value);
         });
         value_mat_view.total_size = total_size;
         value_mat_view.flags |= NON_CONTIGUOUS_FLAG;
@@ -8445,7 +8481,7 @@ matrix &matrix::operator=(Type value) {
             using BufT = std::decay_t<decltype(*typed_buffer)>;
             
             // Cast the user's value to the buffer's exact type
-            BufT casted_val = static_cast<BufT>(value);
+            BufT casted_val = dtype_cast<BufT>(value);
             
             TypedPatternFill(typed_buffer, casted_val, (size_m)total_size);
         });
@@ -13193,6 +13229,11 @@ template matrix &matrix::operator=<int>(int);
 template matrix &matrix::operator=<int16_t>(int16_t);
 template matrix &matrix::operator=<uint32_t>(uint32_t);
 template matrix &matrix::operator=<uint16_t>(uint16_t);
+template matrix &matrix::operator=<bool>(bool);
+template matrix &matrix::operator=<int8_t>(int8_t);
+template matrix &matrix::operator=<bfloat16_t>(bfloat16_t);
+template matrix &matrix::operator=<int64_t>(int64_t);
+template matrix &matrix::operator=<uint64_t>(uint64_t);
 
 // MARK: Max / Min Boilerplate
 
