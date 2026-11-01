@@ -1677,6 +1677,244 @@ static MTLSize threadgroup_for_grid(MTLSize grid, NSUInteger max_threads) {
     return MTLSizeMake(x, y, z);
 }
 
+void matrix::copyGPUinplace(matrix &outMat, const matrix& inMat, int offset, Execution exec) {
+    if (exec == Execution::EncodeAndExecute) {
+        if (inMat.tape) const_cast<matrix&>(inMat).eval_metal();
+        if (outMat.tape) outMat.eval_metal();
+    }
+#ifdef SAFE_MODE
+    if (inMat.total_size > outMat.total_size) {
+        std::cerr << "MatrixH: CopyInplace operation requires both mats to be of "
+        "same size."
+        << "\n";
+        throw;
+    }
+    if (inMat.type != outMat.type) {
+        throw std::runtime_error("Type mismatch in copy");
+    }
+#endif
+    if (inMat.type != outMat.type) {
+        copyGPUinplaceTypeCasted(outMat, inMat, offset, exec);
+        return;
+    }
+    size_t elem_size = dtype_size(inMat.type);
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    //        Blit fast path for the GPU. A compute shader (even a 1D one)
+    //        requires the GPU's ALU execution units to run the copy loop. A
+    //        Blit command skips the ALUs entirely and uses the GPU's direct
+    //        memory access (DMA) engines to blast the bytes across VRAM. It is
+    //        drastically faster.
+    if (!(inMat.flags & NON_CONTIGUOUS_FLAG) &&
+        !(outMat.flags & NON_CONTIGUOUS_FLAG)) {
+        // Blit needs a real MTLBuffer on both sides - there's no setBytes-style
+        // inline path for a blit encoder (no argument table to splice into, unlike
+        // compute/render encoders). A small or CPU-only-materialized operand can
+        // reach here without one, so build it now rather than losing the DMA fast
+        // path to a setBytes fallback that doesn't exist for blit.
+        if (!inMat.metalBuffer && inMat.buffer) const_cast<matrix&>(inMat).buildMetalBuffer();
+        if (!outMat.metalBuffer && outMat.buffer) outMat.buildMetalBuffer();
+        GlobalGPUManager.endCommandEncoding();
+        id<MTLBlitCommandEncoder> blitEncoder =
+        [commandBuffer blitCommandEncoder];
+        [blitEncoder copyFromBuffer:inMat.metalBuffer
+                       sourceOffset:offset * elem_size
+                           toBuffer:outMat.metalBuffer
+                  destinationOffset:offset * elem_size
+                               size:inMat.total_size * elem_size];
+        [blitEncoder endEncoding];
+        if (exec == Execution::EncodeAndExecute) {
+            [commandBuffer commit];
+            [commandBuffer waitUntilCompleted];
+            GlobalGPUManager.setCommandBuffer(nil);
+            GlobalGPUManager.setCommandEncoder(nil);
+        }
+        return;
+    }
+    uint8_t typeCode = static_cast<int>(inMat.type);
+    
+    auto res = collapse_dims(inMat.shape(), outMat.strides(), inMat.strides(),
+                             inMat.dims, INT32_MAX);
+    uint32_t cdims = res.out_dims;
+    
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    
+    auto _dispatchExecutionSize = MTLSizeMake(inMat.total_size, 1, 1);
+    if (!outMat.metalBuffer && outMat.buffer) outMat.buildMetalBuffer();
+    if (!inMat.metalBuffer && inMat.buffer) const_cast<matrix&>(inMat).buildMetalBuffer();
+    setBufferOrBytes(commandEncoder, outMat, 0);
+    setBufferOrBytes(commandEncoder, inMat, 1);
+    if (cdims == 0) {
+        size_m ones = 1;
+        [commandEncoder setBytes:&ones length: sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:&ones length: sizeof(size_m) atIndex:3];
+    } else {
+        [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
+    }
+    [commandEncoder setBytes:&offset length:sizeof(int) atIndex:4];
+    
+    if (cdims == 1 || cdims == 0) {
+        if (!GlobalGPUManager.CopyInplace[typeCode][typeCode][0]) {
+            GlobalGPUManager.initCopyInplace(typeCode, typeCode, 0);
+        }
+        [commandEncoder
+         setComputePipelineState:GlobalGPUManager
+            .CopyInplace_ComputeState[typeCode]
+         [typeCode][0]];
+    } else if (cdims == 2) {
+        if (!GlobalGPUManager.CopyInplace[typeCode][typeCode][1]) {
+            GlobalGPUManager.initCopyInplace(typeCode, typeCode, 1);
+        }
+        _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        [commandEncoder
+         setComputePipelineState:GlobalGPUManager
+            .CopyInplace_ComputeState[typeCode]
+         [typeCode][1]];
+    } else if (cdims == 3) {
+        if (!GlobalGPUManager.CopyInplace[typeCode][typeCode][2]) {
+            GlobalGPUManager.initCopyInplace(typeCode, typeCode, 2);
+        }
+        _dispatchExecutionSize =
+        MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        [commandEncoder
+         setComputePipelineState:GlobalGPUManager
+            .CopyInplace_ComputeState[typeCode]
+         [typeCode][2]];
+        
+    } else {
+        if (!GlobalGPUManager.CopyInplace[typeCode][typeCode][3]) {
+            GlobalGPUManager.initCopyInplace(typeCode, typeCode, 3);
+        }
+        size_m acc = 1;
+        for (int i = 0; i < cdims - 2; i++) {
+            acc *= res.shape[i];
+        }
+        _dispatchExecutionSize =
+        MTLSizeMake(res.shape[cdims - 1], res.shape[cdims - 2], acc);
+        [commandEncoder setBytes:res.shape
+                          length:cdims * sizeof(size_m)
+                         atIndex:5];
+        [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:6];
+        [commandEncoder
+         setComputePipelineState:GlobalGPUManager
+            .CopyInplace_ComputeState[typeCode]
+         [typeCode][3]];
+    }
+    
+    const int kernel_slot = cdims <= 1 ? 0 : (cdims == 2 ? 1 : (cdims == 3 ? 2 : 3));
+    const NSUInteger max_threads = GlobalGPUManager.CopyInplace_ComputeState[typeCode][typeCode][kernel_slot].maxTotalThreadsPerThreadgroup;
+    [commandEncoder dispatchThreads:_dispatchExecutionSize
+              threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, max_threads)];
+    if (exec == Execution::EncodeAndExecute) {
+        GlobalGPUManager.endCommandEncoding();
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+        GlobalGPUManager.setCommandBuffer(nil);
+    }
+}
+
+void matrix::copyGPUinplaceTypeCasted(matrix &outMat, const matrix &inMat, int offset, Execution exec) {
+    const_cast<matrix&>(inMat).update_from_trace();
+    outMat.update_from_trace();
+    if (exec == Execution::EncodeAndExecute) {
+        if (inMat.tape) const_cast<matrix&>(inMat).eval_metal();
+        if (outMat.tape) outMat.eval_metal();
+    }
+#ifdef SAFE_MODE
+    if (inMat.total_size > outMat.total_size) {
+        std::cerr << "MatrixH: CopyInplace operation requires both mats to be of "
+        "same size."
+        << "\n";
+        throw;
+    }
+    if (inMat.type != outMat.type) {
+        throw std::runtime_error("Type mismatch in copy");
+    }
+#endif
+    uint8_t typeCode = static_cast<int>(inMat.type);
+    uint8_t dstTypeCode = static_cast<int>(outMat.type);
+    
+    auto res = collapse_dims(inMat.shape(), outMat.strides(), inMat.strides(),
+                             inMat.dims, INT32_MAX);
+    uint32_t cdims = res.out_dims;
+    
+    id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    
+    auto _dispatchExecutionSize = MTLSizeMake(inMat.total_size, 1, 1);
+    if (!outMat.metalBuffer && outMat.buffer) outMat.buildMetalBuffer();
+    if (!inMat.metalBuffer && inMat.buffer) const_cast<matrix&>(inMat).buildMetalBuffer();
+    setBufferOrBytes(commandEncoder, outMat, 0);
+    setBufferOrBytes(commandEncoder, inMat, 1);
+    if (cdims == 0) {
+        size_m ones = 1;
+        [commandEncoder setBytes:&ones length: sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:&ones length: sizeof(size_m) atIndex:3];
+    } else {
+        [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:3];
+    }
+    [commandEncoder setBytes:&offset length:sizeof(int) atIndex:4];
+    if (cdims == 1 || cdims == 0) {
+        if (!GlobalGPUManager.CopyInplace[dstTypeCode][typeCode][0]) {
+            GlobalGPUManager.initCopyInplace(dstTypeCode, typeCode, 0);
+        }
+        [commandEncoder
+         setComputePipelineState:GlobalGPUManager
+            .CopyInplace_ComputeState[dstTypeCode]
+         [typeCode][0]];
+    } else if (cdims == 2) {
+        if (!GlobalGPUManager.CopyInplace[dstTypeCode][typeCode][1]) {
+            GlobalGPUManager.initCopyInplace(dstTypeCode, typeCode, 1);
+        }
+        _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+        [commandEncoder
+         setComputePipelineState:GlobalGPUManager
+            .CopyInplace_ComputeState[dstTypeCode]
+         [typeCode][1]];
+    } else if (cdims == 3) {
+        if (!GlobalGPUManager.CopyInplace[dstTypeCode][typeCode][2]) {
+            GlobalGPUManager.initCopyInplace(dstTypeCode, typeCode, 2);
+        }
+        _dispatchExecutionSize =
+        MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
+        [commandEncoder
+         setComputePipelineState:GlobalGPUManager
+            .CopyInplace_ComputeState[dstTypeCode]
+         [typeCode][2]];
+        
+    } else {
+        if (!GlobalGPUManager.CopyInplace[dstTypeCode][typeCode][3]) {
+            GlobalGPUManager.initCopyInplace(dstTypeCode, typeCode, 3);
+        }
+        size_m acc = 1;
+        for (int i = 0; i < cdims - 2; i++) {
+            acc *= res.shape[i];
+        }
+        _dispatchExecutionSize =
+        MTLSizeMake(res.shape[cdims - 1], res.shape[cdims - 2], acc);
+        [commandEncoder setBytes:res.shape
+                          length:cdims * sizeof(size_m)
+                         atIndex:5];
+        [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:6];
+        [commandEncoder
+         setComputePipelineState:GlobalGPUManager
+            .CopyInplace_ComputeState[dstTypeCode]
+         [typeCode][3]];
+    }
+    
+    const int kernel_slot = cdims <= 1 ? 0 : (cdims == 2 ? 1 : (cdims == 3 ? 2 : 3));
+    const NSUInteger max_threads = GlobalGPUManager.CopyInplace_ComputeState[dstTypeCode][typeCode][kernel_slot].maxTotalThreadsPerThreadgroup;
+    [commandEncoder dispatchThreads:_dispatchExecutionSize
+              threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, max_threads)];
+    if (exec == Execution::EncodeAndExecute) {
+        GlobalGPUManager.endCommandEncoding();
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+        GlobalGPUManager.setCommandBuffer(nil);
+    }
+}
+
 //    static matrix matrix::zeros(std::initializer_list<size_m> shapeI, dtype
 //    type = dtype::Float) {
 //        matrix output((uint32_t)shapeI.size(), type);
@@ -7495,7 +7733,7 @@ void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType
         max_threads = [GlobalGPUManager.BrodcastedAddComputeState[typeCode][3] maxTotalThreadsPerThreadgroup];
     }
     
-    auto _threadsPerThreadgroup = MTLSizeMake(max_threads, 1, 1);
+    auto _threadsPerThreadgroup = threadgroup_for_grid(_dispatchExecutionSize, max_threads);
     [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
     
 //    [commandEncoder endEncoding];
@@ -7631,7 +7869,7 @@ void matrix::multiply_gpu_brodcasted( matrix &other, matrix &result, EvalType ev
         max_threads = [GlobalGPUManager.BrodcastedMulComputeState[typeCode][3] maxTotalThreadsPerThreadgroup];
 
     }
-    auto _threadsPerThreadgroup = MTLSizeMake(max_threads, 1, 1);
+    auto _threadsPerThreadgroup = threadgroup_for_grid(_dispatchExecutionSize, max_threads);
     
     [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
     
@@ -7748,7 +7986,7 @@ void matrix::subtract_gpu_brodcasted( matrix &other, matrix &result, EvalType ev
                                              bulk);
         max_threads = [GlobalGPUManager.BrodcastedSubComputeState[typeCode][3] maxTotalThreadsPerThreadgroup];
     }
-    auto _threadsPerThreadgroup = MTLSizeMake(max_threads, 1, 1);
+    auto _threadsPerThreadgroup = threadgroup_for_grid(_dispatchExecutionSize, max_threads);
     [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
 }
 
@@ -7864,7 +8102,7 @@ void matrix::divide_gpu_brodcasted( matrix &other, matrix &result, EvalType eval
                                              bulk);
         max_threads = [GlobalGPUManager.BrodcastedDivComputeState[typeCode][3] maxTotalThreadsPerThreadgroup];
     }
-    auto _threadsPerThreadgroup = MTLSizeMake(max_threads, 1, 1);
+    auto _threadsPerThreadgroup = threadgroup_for_grid(_dispatchExecutionSize, max_threads);
     [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
 }
 
