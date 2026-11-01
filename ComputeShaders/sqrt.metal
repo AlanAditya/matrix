@@ -61,3 +61,4 @@ template <typename T>
 
 INSTANTIATE_SQRT_ND(0, float)
 INSTANTIATE_SQRT_ND(1, half)
+INSTANTIATE_SQRT_ND(9, complex64)

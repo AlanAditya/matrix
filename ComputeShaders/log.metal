@@ -52,3 +52,4 @@ template <typename T>
 
 INSTANTIATE_LOG(0, float)
 INSTANTIATE_LOG(1, half)
+INSTANTIATE_LOG(9, complex64)

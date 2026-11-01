@@ -1196,6 +1196,256 @@ public:
     matrix& input_at(uint32_t i) override { return inputs[i]; }
 };
 
+class ComplexPrimitive : public Primitive {
+public:
+    matrix re;
+    matrix im;
+
+    ComplexPrimitive(const matrix& re, const matrix& im) : re(ensure_graph_ready(re)), im(ensure_graph_ready(im)) {
+    }
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (re.tape && !re.tape->evaluated) { re.tape->eval_cpu(re, eval_type); }
+        if (im.tape && !im.tape->evaluated) { im.tape->eval_cpu(im, eval_type); }
+        re.update_from_trace();
+        im.update_from_trace();
+
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                begin_output_refcount(out);
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) {return;} else {evaluated = true;}
+
+        matrix::complex_backend(out, ExecutionDevice::CPU);
+    }
+
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (re.tape && !re.tape->evaluated) { re.tape->eval_metal(re, eval_type); re.update_from_trace(); } else {
+            re.update_from_trace();
+            ensure_metal_buffer(re);
+        }
+        if (im.tape && !im.tape->evaluated) { im.tape->eval_metal(im, eval_type); im.update_from_trace(); } else {
+            im.update_from_trace();
+            ensure_metal_buffer(im);
+        }
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                begin_output_refcount(out);
+                out.buildMetalBuffer();
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // Owning node: build this output's Metal wrapper here, during COMPILE (before the
+        // COMPILE_TRACE return). eval_cpu() never builds wrappers, so if this graph last ran on
+        // the CPU, `out` already has memory - the allocation branch above is skipped - but no
+        // wrapper, and in the DFS this is the only place left to give it one. On EXECUTE
+        // out_metal_buffer is already set, so this is a no-op.
+        // See .agents/MemoryManagement.md, "CPU -> Metal rerun".
+        if (!out_metal_buffer) {
+            out.buildMetalBuffer();
+            out_metal_buffer = out.metalBuffer;
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) { return; }
+        if (evaluated) {return;} else { evaluated = true; }
+        matrix::complex_backend(out, ExecutionDevice::METAL);
+    }
+
+    // JAX's rule (no conjugate, like Multiplication's grad_out * b): re gets real(g), im gets -imag(g).
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        return {matrix::real(grad_out), -1.0f * matrix::imag(grad_out)};
+    }
+    matrix jvp(std::vector<matrix>& tangents) override {
+        return matrix::complex(tangents[0], tangents[1]);
+    }
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (re.tape) {
+            if (re.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (re.tape->version > this->version) inv = true;
+            new_version = std::max(re.tape->version, new_version);
+        }
+        if (im.tape) {
+            if (im.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (im.tape->version > this->version) inv = true;
+            new_version = std::max(im.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (re.tape) { re.tape->clear_trace_checks(); }
+        if (im.tape) { im.tape->clear_trace_checks(); }
+    }
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {re, im}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override { return i == 0 ? re : im; }
+};
+
+// real(z) / imag(z): a view, written like SlicePrimitive. The Float output has z's shape with every
+// stride doubled and starts `offset` floats into z (0 = real, 1 = imaginary).
+class ComplexPartPrimitive : public Primitive {
+public:
+    matrix* get_borrowed_input() override { return &input; }
+    matrix input;
+    size_t offset;
+    ComplexPartPrimitive(const matrix& input_mat, size_t part) : input(ensure_graph_ready(input_mat)), offset(part) {}
+
+    ~ComplexPartPrimitive() override {
+        if (out_refcount) {
+            out_refcount->fetch_sub(1, std::memory_order_relaxed);
+            out_refcount = nullptr; // Let input.~matrix() do the final safe deletion
+        }
+    }
+
+    void eval_cpu(matrix &out, EvalType eval_type) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); };
+        input.update_from_trace();
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else if (input.buffer) {
+                out.buffer = (uint8_t*)input.buffer + offset * dtype_size(out.type);
+                out.refCount = input.refCount;
+                out.refCount->fetch_add(1);
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // Compare against where the view starts (input + offset), not the parent's base.
+        if (out.buffer != (uint8_t*)input.buffer + offset * dtype_size(out.type)) {
+            out.releaseBuffer();
+            out.buffer = (uint8_t*)input.buffer + offset * dtype_size(out.type);
+            out.metalBuffer = input.metalBuffer;
+            out.refCount = input.refCount;
+            out.refCount->fetch_add(1);
+            out.tape->update_cache((uint8_t*)out.buffer, out.metalBuffer, out.refCount);
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) {
+            return;
+        }
+        if (evaluated) {return;} else {evaluated = true;}
+    }
+
+    void eval_metal(matrix &out, EvalType eval_type) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
+            input.update_from_trace();
+            ensure_metal_buffer(input);
+        }
+        if (!out.buffer) {
+            if (out.tape->out_buffer) {
+                out.buffer = out.tape->out_buffer;
+                out.metalBuffer = out.tape->out_metal_buffer;
+                out.refCount = out.tape->out_refcount;
+                out.refCount->fetch_add(1);
+            } else if (input.buffer) {
+                out.buffer = (uint8_t*)input.buffer + offset * dtype_size(out.type);
+                out.metalBuffer = input.metalBuffer;
+                out.refCount = input.refCount;
+                out.refCount->fetch_add(1);
+
+                out.tape->out_buffer = (uint8_t*)out.buffer;
+                out.tape->out_metal_buffer = out.metalBuffer;
+                out.tape->out_refcount = out.refCount;
+                out.tape->out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // A view never builds a wrapper: it inherits the parent's (see .agents/MemoryManagement.md,
+        // "Transient (view) primitives"). real() has offset 0, so the rebind below never fires for it.
+        if (out.metalBuffer != input.metalBuffer) {
+            out.metalBuffer = input.metalBuffer;
+            out.tape->out_metal_buffer = out.metalBuffer;
+        }
+        if (out.buffer != (uint8_t*)input.buffer + offset * dtype_size(out.type)) {
+            out.releaseBuffer();
+            out.buffer = (uint8_t*)input.buffer + offset * dtype_size(out.type);
+            out.metalBuffer = input.metalBuffer;
+            out.refCount = input.refCount;
+            out.refCount->fetch_add(1);
+            out.tape->update_cache((uint8_t*)out.buffer, out.metalBuffer, out.refCount);
+        }
+        if (eval_type == EvalType::COMPILE_TRACE) {
+            return;
+        }
+        if (evaluated) {return;} else {evaluated = true;}
+    }
+
+    // JAX's rules: real takes g to complex(g, 0), imag takes g to complex(0, -g).
+    std::vector<matrix> vjp(matrix& grad_out) override {
+        matrix zero = matrix::zeros(std::vector<size_m>(grad_out.shape(), grad_out.shape() + grad_out.dims), dtype::Float);
+        if (offset == 0) return {matrix::complex(grad_out, zero)};
+        return {matrix::complex(zero, -1.0f * grad_out)};
+    }
+    matrix jvp(std::vector<matrix>& tangents) override {
+        return offset == 0 ? matrix::real(tangents[0]) : matrix::imag(tangents[0]);
+    }
+    bool invalidate_pass(uint64_t current_pass_id) override {
+        if (this->last_visited_pass_id == current_pass_id) return !this->evaluated;
+        this->last_visited_pass_id = current_pass_id;
+
+        bool inv = false;
+        uint64_t new_version = this->version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (input.tape->version > this->version) inv = true;
+            new_version = std::max(input.tape->version, new_version);
+        }
+
+        if (inv) {
+            this->evaluated = false;
+            this->version = new_version;
+            return true;
+        }
+        return false;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (input.tape) { input.tape->clear_trace_checks(); }
+    }
+    matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {input}; }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t i) override { return input; }
+};
+
 class ConcatPrimitive : public Primitive {
 public:
     std::vector<matrix> inputs;

@@ -858,6 +858,14 @@ public:
     static matrix stack(const std::vector<matrix>& mats, int axis);
 
     static void stack(const std::vector<matrix>& mats, matrix& output, int axis = 0, ExecutionDevice exec_device = ExecutionDevice::AUTO);
+
+    // A Complex64 matrix from real and imaginary parts of the same shape (jax.lax.complex). Any real
+    // dtype is cast to float on the way in.
+    static matrix complex(const matrix& re, const matrix& im);
+    static void complex_backend(matrix& output, ExecutionDevice exec_device);
+    // Float views of a Complex64 matrix's real / imaginary parts (no copy, like a slice).
+    static matrix real(const matrix& z);
+    static matrix imag(const matrix& z);
     matrix pad(std::initializer_list<std::pair<size_m, size_m>> padding_range, const matrix& value) const;
     
     // Backend: encodes the padding into padded_mat (already allocated, its tape is its PaddingPrimitive).

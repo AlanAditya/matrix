@@ -5075,6 +5075,75 @@ void matrix::stack(const std::vector<matrix>& mats, matrix& output, int axis, Ex
     output.flags &= ~NON_CONTIGUOUS_FLAG;
 }
 
+matrix matrix::complex(const matrix& re, const matrix& im) {
+    if (is_complex(re.type) || is_complex(im.type)) {
+        throw std::invalid_argument("matrix::complex: re and im must be real");
+    }
+    if (re.dims != im.dims || !std::equal(re.shape(), re.shape() + re.dims, im.shape())) {
+        throw std::invalid_argument("matrix::complex: re and im must have the same shape");
+    }
+    matrix output(re.dims, dtype::Complex64);
+    memcpy(output.shape(), re.shape(), re.dims * sizeof(size_m));
+    output.total_size = re.total_size;
+    output.calcStrides();
+    output.tape = new ComplexPrimitive(re, im);
+    return output;
+}
+
+// Like stack: the Complex64 output, seen as interleaved floats (every stride doubled), takes re at
+// float offset 0 and im at offset 1. The copies cast any real dtype to float.
+void matrix::complex_backend(matrix& output, ExecutionDevice exec_device) {
+    ComplexPrimitive* primit = static_cast<ComplexPrimitive*>(output.tape);
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = output.total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+
+    matrix parts(output.dims, dtype::Float);
+    memcpy(parts.shape(), output.shape(), output.dims * sizeof(size_m));
+    for (uint32_t d = 0; d < output.dims; d++) parts.strides()[d] = 2 * output.strides()[d];
+    parts.total_size = output.total_size;
+    parts.buffer = output.buffer;
+    parts.metalBuffer = output.metalBuffer;
+    parts.flags |= NON_OWNERSHIP_FLAG | NON_CONTIGUOUS_FLAG;
+
+    matrix View(output.dims, dtype::Float);
+    memcpy(View.shape(), output.shape(), output.dims * sizeof(size_m));
+    View.total_size = output.total_size;
+    View.flags |= NON_OWNERSHIP_FLAG | NON_CONTIGUOUS_FLAG;
+
+    const matrix* halves[2] = {&primit->re, &primit->im};
+    for (int k = 0; k < 2; k++) {
+        const matrix& in = *halves[k];
+        memcpy(View.strides(), in.strides(), in.dims * sizeof(size_m));
+        View.buffer = in.buffer;
+        View.metalBuffer = in.metalBuffer;
+        View.type = in.type;
+        if (exec_device == ExecutionDevice::METAL) {
+            copyGPUinplace(parts, View, k, Execution::Encode);
+        } else {
+            copyCPUinplace(parts, View, k);
+        }
+    }
+}
+
+static matrix complex_part(const matrix& z, size_t part) {
+    if (!is_complex(z.type)) {
+        throw std::invalid_argument(part == 0 ? "matrix::real: input must be Complex64" : "matrix::imag: input must be Complex64");
+    }
+    const_cast<matrix&>(z).update_from_trace();
+    matrix view(z.dims, dtype::Float);
+    memcpy(view.shape(), z.shape(), z.dims * sizeof(size_m));
+    for (uint32_t d = 0; d < z.dims; d++) view.strides()[d] = 2 * z.strides()[d];
+    view.total_size = z.total_size;
+    view.flags |= NON_OWNERSHIP_FLAG;
+    view.flags |= NON_CONTIGUOUS_FLAG;
+    view.tape = new ComplexPartPrimitive(z, part);
+    return view;
+}
+
+matrix matrix::real(const matrix& z) { return complex_part(z, 0); }
+matrix matrix::imag(const matrix& z) { return complex_part(z, 1); }
+
 matrix matrix::concat(const std::vector<matrix>& mats, int axis) {
     if (axis < 0) axis+= mats[0].dims;
     matrix output(mats[0].dims, mats[0].type);
@@ -6008,17 +6077,18 @@ void matrix::log(matrix& output, ExecutionDevice exec_device) {
 
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
-        // CPU fallback mapping
-        dispatch_float_type(type, output.buffer, [&](auto *out_data) {
+        // CPU fallback mapping. Unqualified log: std::log for Float / Float16, log(complex64) for Complex64.
+        auto log_cpu = [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
+            using std::log;
                 T* in_data = (T*)buffer;
                 if (cdims == 0) {
-                    out_data[0] = std::log(in_data[0]);
+                    out_data[0] = log(in_data[0]);
                 } else if (cdims == 1) {
                     size_m out_stride = res.stridesA[0];
                     size_m in_stride = res.stridesB[0];
                     for (size_m i = 0; i < res.shape[0]; i++) {
-                        out_data[i * out_stride] = std::log(in_data[i * in_stride]);
+                        out_data[i * out_stride] = log(in_data[i * in_stride]);
                     }
                 } else if (cdims == 2) {
                     size_m out_stride0 = res.stridesA[0];
@@ -6027,7 +6097,7 @@ void matrix::log(matrix& output, ExecutionDevice exec_device) {
                     size_m in_stride1 = res.stridesB[1];
                     for (size_m i = 0; i < res.shape[0]; i++) {
                         for (size_m j = 0; j < res.shape[1]; j++) {
-                            out_data[i * out_stride0 + j * out_stride1] = std::log(in_data[i * in_stride0 + j * in_stride1]);
+                            out_data[i * out_stride0 + j * out_stride1] = log(in_data[i * in_stride0 + j * in_stride1]);
                         }
                     }
                 } else if (cdims == 3) {
@@ -6040,7 +6110,7 @@ void matrix::log(matrix& output, ExecutionDevice exec_device) {
                     for (size_m i = 0; i < res.shape[0]; i++) {
                         for (size_m j = 0; j < res.shape[1]; j++) {
                             for (size_m k = 0; k < res.shape[2]; k++) {
-                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = std::log(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
+                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = log(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
                             }
                         }
                     }
@@ -6055,10 +6125,12 @@ void matrix::log(matrix& output, ExecutionDevice exec_device) {
                             dst_idx += idx * res.stridesA[i];
                             rem /= res.shape[i];
                         }
-                        out_data[dst_idx] = std::log(in_data[src_idx]);
+                        out_data[dst_idx] = log(in_data[src_idx]);
                     }
                 }
-        });
+        };
+        if (is_complex(type)) dispatch_complex_type(type, output.buffer, log_cpu);
+        else dispatch_float_type(type, output.buffer, log_cpu);
     }
 }
 void matrix::abs(matrix& output, ExecutionDevice exec_device) {
@@ -6798,17 +6870,18 @@ void matrix::sqrt(matrix& output, ExecutionDevice exec_device) {
 
         [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
     } else {
-        // CPU fallback mapping
-        dispatch_float_type(type, output.buffer, [&](auto *out_data) {
+        // CPU fallback mapping. Unqualified sqrt: std::sqrt for Float / Float16, sqrt(complex64) for Complex64.
+        auto sqrt_cpu = [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
+            using std::sqrt;
                 T* in_data = (T*)buffer;
                 if (cdims == 0) {
-                    out_data[0] = std::sqrt(in_data[0]);
+                    out_data[0] = sqrt(in_data[0]);
                 } else if (cdims == 1) {
                     size_m out_stride = res.stridesA[0];
                     size_m in_stride = res.stridesB[0];
                     for (size_m i = 0; i < res.shape[0]; i++) {
-                        out_data[i * out_stride] = std::sqrt(in_data[i * in_stride]);
+                        out_data[i * out_stride] = sqrt(in_data[i * in_stride]);
                     }
                 } else if (cdims == 2) {
                     size_m out_stride0 = res.stridesA[0];
@@ -6817,7 +6890,7 @@ void matrix::sqrt(matrix& output, ExecutionDevice exec_device) {
                     size_m in_stride1 = res.stridesB[1];
                     for (size_m i = 0; i < res.shape[0]; i++) {
                         for (size_m j = 0; j < res.shape[1]; j++) {
-                            out_data[i * out_stride0 + j * out_stride1] = std::sqrt(in_data[i * in_stride0 + j * in_stride1]);
+                            out_data[i * out_stride0 + j * out_stride1] = sqrt(in_data[i * in_stride0 + j * in_stride1]);
                         }
                     }
                 } else if (cdims == 3) {
@@ -6830,7 +6903,7 @@ void matrix::sqrt(matrix& output, ExecutionDevice exec_device) {
                     for (size_m i = 0; i < res.shape[0]; i++) {
                         for (size_m j = 0; j < res.shape[1]; j++) {
                             for (size_m k = 0; k < res.shape[2]; k++) {
-                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = std::sqrt(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
+                                out_data[i * out_stride0 + j * out_stride1 + k * out_stride2] = sqrt(in_data[i * in_stride0 + j * in_stride1 + k * in_stride2]);
                             }
                         }
                     }
@@ -6845,10 +6918,12 @@ void matrix::sqrt(matrix& output, ExecutionDevice exec_device) {
                             dst_idx += idx * res.stridesA[i];
                             rem /= res.shape[i];
                         }
-                        out_data[dst_idx] = std::sqrt(in_data[src_idx]);
+                        out_data[dst_idx] = sqrt(in_data[src_idx]);
                     }
                 }
-        });
+        };
+        if (is_complex(type)) dispatch_complex_type(type, output.buffer, sqrt_cpu);
+        else dispatch_float_type(type, output.buffer, sqrt_cpu);
     }
 }
 
@@ -7375,10 +7450,12 @@ void matrix::add_cpu_brodcasted(matrix& other, matrix &result, EvalType evalType
     
     if (result.dims == 0) {
         // scalar - scalar, no broadcasting needed
-        dispatch_type(type, result.buffer, [&](auto *out_data) {
+        auto scalar_add = [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
             out_data[0] = static_cast<T*>(buffer)[0] + static_cast<T*>(other.buffer)[0];
-        });
+        };
+        if (is_complex(type)) dispatch_complex_type(type, result.buffer, scalar_add);
+        else dispatch_type(type, result.buffer, scalar_add);
         return;
     }
     
@@ -7390,8 +7467,8 @@ void matrix::add_cpu_brodcasted(matrix& other, matrix &result, EvalType evalType
     size_m* strideA = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.stridesA;
     size_m* strideB = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.stridesB;
     size_m* strideR = ((AdditionPrimitive *)result.tape)->collapsed_dims_3.stridesC;
-    
-    dispatch_type(type, result.buffer, [&](auto *out_data) {
+
+    auto broadcasted_add = [&](auto *out_data) {
         using T = std::decay_t<decltype(*out_data)>;
         for (int gid = 0; gid < result.total_size; gid++) {
             // globalIndex for A and B
@@ -7412,7 +7489,9 @@ void matrix::add_cpu_brodcasted(matrix& other, matrix &result, EvalType evalType
             
             out_data[gid] = static_cast<T *>(buffer)[GindexA] + static_cast<T *>(other.buffer)[GindexB];
         }
-    });
+    };
+    if (is_complex(type)) dispatch_complex_type(type, result.buffer, broadcasted_add);
+    else dispatch_type(type, result.buffer, broadcasted_add);
 }
 
 
@@ -7445,11 +7524,13 @@ void matrix::multiply_cpu_brodcasted(matrix &other, matrix &result, EvalType eva
     }
     if (result.dims == 0) {
         // scalar - scalar, no broadcasting needed
-        dispatch_type(type, result.buffer, [&](auto *out_data) {
+        auto scalar_mul = [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
             out_data[0] = static_cast<T*>(buffer)[0]
                         * static_cast<T*>(other.buffer)[0];
-        });
+        };
+        if (is_complex(type)) dispatch_complex_type(type, result.buffer, scalar_mul);
+        else dispatch_type(type, result.buffer, scalar_mul);
         return;
     }
     
@@ -7457,8 +7538,8 @@ void matrix::multiply_cpu_brodcasted(matrix &other, matrix &result, EvalType eva
     size_m* strideA = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.stridesA;
     size_m* strideB = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.stridesB;
     size_m* strideR = ((MultiplicationPrimitive *)result.tape)->collapsed_dims_3.stridesC;
-    
-    dispatch_type(type, result.buffer, [&](auto *out_data) {
+
+    auto broadcasted_mul = [&](auto *out_data) {
         using T = std::decay_t<decltype(*out_data)>;
         for (int gid = 0; gid < result.total_size; gid++) {
             // globalIndex for A and B
@@ -7479,7 +7560,9 @@ void matrix::multiply_cpu_brodcasted(matrix &other, matrix &result, EvalType eva
             
             out_data[gid] = static_cast<T *>(buffer)[GindexA] * static_cast<T *>(other.buffer)[GindexB];
         }
-    });
+    };
+    if (is_complex(type)) dispatch_complex_type(type, result.buffer, broadcasted_mul);
+    else dispatch_type(type, result.buffer, broadcasted_mul);
 }
 void matrix::subtract_cpu_brodcasted( matrix &other, matrix &result, EvalType evalType)  {
     if (evalType == EvalType::EVAL_AUTO) {
@@ -7509,11 +7592,13 @@ void matrix::subtract_cpu_brodcasted( matrix &other, matrix &result, EvalType ev
     // Before the stride extraction and loop:
     if (result.dims == 0) {
         // scalar - scalar, no broadcasting needed
-        dispatch_type(type, result.buffer, [&](auto *out_data) {
+        auto scalar_sub = [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
             out_data[0] = static_cast<T*>(buffer)[0]
                         - static_cast<T*>(other.buffer)[0];
-        });
+        };
+        if (is_complex(type)) dispatch_complex_type(type, result.buffer, scalar_sub);
+        else dispatch_type(type, result.buffer, scalar_sub);
         return;
     }
     
@@ -7521,8 +7606,8 @@ void matrix::subtract_cpu_brodcasted( matrix &other, matrix &result, EvalType ev
     size_m* strideA = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.stridesA;
     size_m* strideB = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.stridesB;
     size_m* strideR = ((SubtractionPrimitive *)result.tape)->collapsed_dims_3.stridesC;
-    
-    dispatch_type(type, result.buffer, [&](auto *out_data) {
+
+    auto broadcasted_sub = [&](auto *out_data) {
         using T = std::decay_t<decltype(*out_data)>;
         for (int gid = 0; gid < result.total_size; gid++) {
             // globalIndex for A and B
@@ -7543,7 +7628,9 @@ void matrix::subtract_cpu_brodcasted( matrix &other, matrix &result, EvalType ev
             
             out_data[gid] = static_cast<T *>(buffer)[GindexA] - static_cast<T *>(other.buffer)[GindexB];
         }
-    });
+    };
+    if (is_complex(type)) dispatch_complex_type(type, result.buffer, broadcasted_sub);
+    else dispatch_type(type, result.buffer, broadcasted_sub);
 }
 void matrix::divide_cpu_brodcasted( matrix &other, matrix &result, EvalType evalType)  {
     if (evalType == EvalType::EVAL_AUTO) {
@@ -7570,10 +7657,12 @@ void matrix::divide_cpu_brodcasted( matrix &other, matrix &result, EvalType eval
     
     if (result.dims == 0) {
         // scalar - scalar, no broadcasting needed
-        dispatch_type(type, result.buffer, [&](auto *out_data) {
+        auto scalar_div = [&](auto *out_data) {
             using T = std::decay_t<decltype(*out_data)>;
             out_data[0] = static_cast<T*>(buffer)[0] / static_cast<T*>(other.buffer)[0];
-        });
+        };
+        if (is_complex(type)) dispatch_complex_type(type, result.buffer, scalar_div);
+        else dispatch_type(type, result.buffer, scalar_div);
         return;
     }
     
@@ -7586,8 +7675,8 @@ void matrix::divide_cpu_brodcasted( matrix &other, matrix &result, EvalType eval
     size_m* strideA = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.stridesA;
     size_m* strideB = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.stridesB;
     size_m* strideR = ((DivisionPrimitive *)result.tape)->collapsed_dims_3.stridesC;
-    
-    dispatch_type(type, result.buffer, [&](auto *out_data) {
+
+    auto broadcasted_div = [&](auto *out_data) {
         using T = std::decay_t<decltype(*out_data)>;
         for (int gid = 0; gid < result.total_size; gid++) {
             // globalIndex for A and B
@@ -7608,7 +7697,9 @@ void matrix::divide_cpu_brodcasted( matrix &other, matrix &result, EvalType eval
             
             out_data[gid] = static_cast<T *>(buffer)[GindexA] / static_cast<T *>(other.buffer)[GindexB];
         }
-    });
+    };
+    if (is_complex(type)) dispatch_complex_type(type, result.buffer, broadcasted_div);
+    else dispatch_type(type, result.buffer, broadcasted_div);
 }
 
 void matrix::add_gpu_brodcasted(matrix &other, matrix &result, EvalType evalType)  {
