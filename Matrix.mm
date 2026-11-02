@@ -13834,7 +13834,7 @@ void matrix::max(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
         exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
     }
     
-    size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
+    size_m reduce_axis_stride = strides()[axis];
     size_m noOfOpp = shape()[axis];
     
     MaxReductionPrimitive* primit = static_cast<MaxReductionPrimitive*>(output.tape);
@@ -13978,7 +13978,7 @@ void matrix::min(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
         exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
     }
     
-    size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
+    size_m reduce_axis_stride = strides()[axis];
     size_m noOfOpp = shape()[axis];
     
     MinReductionPrimitive* primit = static_cast<MinReductionPrimitive*>(output.tape);
@@ -15200,7 +15200,7 @@ matrix matrix::argmax(int axis, bool keepdims) const {
 }
 
 void matrix::argmax(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device) const {
-    size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
+    size_m reduce_axis_stride = strides()[axis];
     size_m noOfOpp = shape()[axis];
     
     ArgMaxPrimitive* primit = static_cast<ArgMaxPrimitive*>(output.tape);
@@ -15283,7 +15283,7 @@ matrix matrix::argmin(int axis, bool keepdims) const {
 }
 
 void matrix::argmin(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device) const {
-    size_m reduce_axis_stride = (size_m)accumul(axis+1, dims);
+    size_m reduce_axis_stride = strides()[axis];
     size_m noOfOpp = shape()[axis];
     
     ArgMinPrimitive* primit = static_cast<ArgMinPrimitive*>(output.tape);
