@@ -3195,58 +3195,53 @@ void matrix::pad_backend(std::vector<size_m>& padding_range, matrix& padded_mat,
         exec_device = padded_mat.total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
     }
     if (exec_device == ExecutionDevice::CPU) {
-        // Same as the Padding.metal kernels (1D / 2D / 3D / ND): an output coordinate outside
-        // [limits[2d], limits[2d+1]) on any axis d gets `value`, otherwise the source element at
-        // sum(coord[d] * src_strides[d]) - offset.
+        // Same as the Padding.metal kernels: an output coordinate outside [limits[2d], limits[2d+1])
+        // on any axis d gets `value` (already this dtype: PaddingPrimitive converts it), otherwise the
+        // source element at sum(coord[d] * src_strides[d]) - offset. Padding only moves elements, so
+        // it runs on their size, a row (the last axis) at a time: a row padded on an outer axis is all
+        // fill, any other row is fill, the source run (one memcpy when it's contiguous), fill.
         const size_m* limits = prim->padding_range.data();
-        const size_m offset = (size_m)prim->offset;
-        uint32_t cdims = padded_mat.dims;
-        dispatch_type(padded_mat.type, padded_mat.buffer, [&](auto* dst) {
-            using T = std::decay_t<decltype(*dst)>;
+        const size_t offset = prim->offset;
+        const uint32_t cdims = padded_mat.dims;
+        dispatch_size(padded_mat.type, padded_mat.buffer, [&](auto* dst) {
+            using T = std::remove_pointer_t<decltype(dst)>;
             const T* src = (const T*)this->buffer;
-            T fill{};
-            dispatch_type(value.type, value.buffer, [&](auto* v) { fill = dtype_cast<T>(*v); });
+            const T fill = *(const T*)value.buffer;
+            if (cdims == 0) { dst[0] = src[0]; return; }
 
-            if (cdims == 1) {
-                for (size_m x = 0; x < dst_shape[0]; ++x) {
-                    bool pad = limits[0] > x || limits[1] <= x;
-                    dst[x * dst_strides[0]] = pad ? fill : src[x * src_strides[0] - offset];
+            const uint32_t last = cdims - 1;
+            const size_m n = dst_shape[last];
+            if (n == 0) return;
+            const size_m lo = std::min(limits[2 * last], n), hi = std::max(lo, std::min(limits[2 * last + 1], n));
+            const size_t sx = src_strides[last], dx = dst_strides[last];
+            const bool run_contiguous = sx == 1 && dx == 1;
+            const size_t rows = padded_mat.total_size / n;
+
+            size_m coord[MAX_TENSOR_DIMS] = {};
+            size_t src_row = 0, dst_row = 0;
+            for (size_t r = 0; r < rows; r++) {
+                bool padded_row = false;
+                for (uint32_t d = 0; d < last; d++) {
+                    if (coord[d] < limits[2 * d] || coord[d] >= limits[2 * d + 1]) { padded_row = true; break; }
                 }
-            } else if (cdims == 2) {
-                for (size_m y = 0; y < dst_shape[0]; ++y) {
-                    for (size_m x = 0; x < dst_shape[1]; ++x) {
-                        bool pad = limits[0] > y || limits[1] <= y || limits[2] > x || limits[3] <= x;
-                        dst[y * dst_strides[0] + x * dst_strides[1]] =
-                            pad ? fill : src[y * src_strides[0] + x * src_strides[1] - offset];
+                T* out = dst + dst_row;
+                if (padded_row) {
+                    for (size_m x = 0; x < n; x++) out[x * dx] = fill;
+                } else {
+                    for (size_m x = 0; x < lo; x++) out[x * dx] = fill;
+                    const T* in = src + (src_row + lo * sx - offset);
+                    if (run_contiguous) {
+                        memcpy(out + lo, in, (hi - lo) * sizeof(T));
+                    } else {
+                        for (size_m x = lo; x < hi; x++) out[x * dx] = in[(x - lo) * sx];
                     }
+                    for (size_m x = hi; x < n; x++) out[x * dx] = fill;
                 }
-            } else if (cdims == 3) {
-                for (size_m z = 0; z < dst_shape[0]; ++z) {
-                    for (size_m y = 0; y < dst_shape[1]; ++y) {
-                        for (size_m x = 0; x < dst_shape[2]; ++x) {
-                            bool pad = limits[0] > z || limits[1] <= z ||
-                                       limits[2] > y || limits[3] <= y ||
-                                       limits[4] > x || limits[5] <= x;
-                            dst[z * dst_strides[0] + y * dst_strides[1] + x * dst_strides[2]] =
-                                pad ? fill : src[z * src_strides[0] + y * src_strides[1] + x * src_strides[2] - offset];
-                        }
-                    }
-                }
-            } else {
-                std::vector<size_m> coords(cdims, 0);
-                for (size_m i = 0; i < padded_mat.total_size; ++i) {
-                    size_m src_idx = 0, dst_idx = 0;
-                    bool pad = false;
-                    for (uint32_t d = 0; d < cdims; ++d) {
-                        if (limits[2 * d] > coords[d] || limits[2 * d + 1] <= coords[d]) pad = true;
-                        src_idx += coords[d] * src_strides[d];
-                        dst_idx += coords[d] * dst_strides[d];
-                    }
-                    dst[dst_idx] = pad ? fill : src[src_idx - offset];
-                    for (int d = cdims - 1; d >= 0; --d) {
-                        if (++coords[d] < dst_shape[d]) break;
-                        coords[d] = 0;
-                    }
+                for (int d = (int)last - 1; d >= 0; d--) {
+                    if (++coord[d] < dst_shape[d]) { src_row += src_strides[d]; dst_row += dst_strides[d]; break; }
+                    coord[d] = 0;
+                    src_row -= (size_t)(dst_shape[d] - 1) * src_strides[d];
+                    dst_row -= (size_t)(dst_shape[d] - 1) * dst_strides[d];
                 }
             }
         });
@@ -3270,7 +3265,9 @@ void matrix::pad_backend(std::vector<size_m>& padding_range, matrix& padded_mat,
     [commandEncoder setBytes:prim->padding_range.data() length: 2 * cdims * sizeof(size_m) atIndex:4];
     
     [commandEncoder setBytes:&(prim->offset) length:sizeof(int) atIndex:5];
-    [commandEncoder setBytes:value.buffer length:dtype_size(value.type) atIndex:6];
+    // A buffer, not setBytes: the fill can be this pass's own GPU output (PaddingPrimitive's astype),
+    // which setBytes would read from host memory before the GPU has written it.
+    setBufferOrBytes(commandEncoder, value, 6);
     id<MTLComputePipelineState> pipeline = nil;
     if (cdims == 1) {
         if (!GlobalGPUManager.PaddingInit[typeCode][0]) {
@@ -14320,6 +14317,7 @@ matrix matrix::norm() const {
 //}
 
 matrix matrix::take(const matrix& index, int axis) const {
+    if (!is_integral(index.type)) throw std::runtime_error("take: indices must have an integer dtype");
     matrix output(dims - 1 + index.dims, type);
     // replaces the input axis shape with index shape =>
     // inp shape [s0, s1, ... axis ..., s_n]
@@ -14432,15 +14430,18 @@ void matrix::take_backend_gpu(const matrix& index, matrix& output, int axis) con
 // position o and index position i, written to the output in order. The copy is chosen once per
 // call, not per row: a fixed-size memcpy (plain loads and stores once inlined) for the common small
 // rows, a runtime memcpy for the rest. Returns false, having copied nothing, for any other layout.
+// m's axes from `first` on are packed: back to back, the last one fastest (an axis of size 1 can have
+// any stride). Used by take and scatter to move a whole block per index with one memcpy.
+static bool packed_from(const matrix& m, int first) {
+    size_m expected = 1;
+    for (int d = (int)m.dims - 1; d >= first; d--) {
+        if (m.shape()[d] != 1 && m.strides()[d] != expected) return false;
+        expected *= m.shape()[d];
+    }
+    return true;
+}
+
 static bool take_rows_cpu(const matrix& src, const matrix& index, matrix& output, int axis) {
-    auto packed_from = [](const matrix& m, int first) {
-        size_m expected = 1;
-        for (int d = (int)m.dims - 1; d >= first; d--) {
-            if (m.shape()[d] != 1 && m.strides()[d] != expected) return false;
-            expected *= m.shape()[d];
-        }
-        return true;
-    };
     if (!packed_from(src, axis + 1) || !packed_from(index, 0) || !packed_from(output, 0)) return false;
 
     const size_t elem = dtype_size(src.type);
@@ -14453,7 +14454,7 @@ static bool take_rows_cpu(const matrix& src, const matrix& index, matrix& output
     const uint8_t* s = (const uint8_t*)src.buffer;
     uint8_t* d = (uint8_t*)output.buffer;
 
-    dispatch_type(index.type, index.buffer, [&](auto* idx) {
+    dispatch_int_type(index.type, index.buffer, [&](auto* idx) {
         // The outer axes (before `axis`) are walked with an odometer: a carry when one wraps.
         // Everything the row loop reads is a local: byte stores may alias anything captured by
         // reference, which would force a reload of each per row.
@@ -14505,22 +14506,26 @@ void matrix::take_backend_cpu(const matrix& index, matrix& output, int axis) con
     const size_m* out_shape = output.shape();
     const size_m* out_strides = output.strides();
 
-    dispatch_type(type, buffer, [&](auto* src) {
-        using T = std::decay_t<decltype(*src)>;
+    // take only moves elements: it runs on their size. The indices are read as their own integer type.
+    dispatch_size(type, buffer, [&](auto* src) {
+        using T = std::remove_pointer_t<decltype(src)>;
         T* dst = (T*)output.buffer;
-        dispatch_type(index.type, index.buffer, [&](auto* idx) {
+        dispatch_int_type(index.type, index.buffer, [&](auto* idx) {
             // One element: the index value at idx_off picks the source slice; src_off is the
             // offset along every other axis.
-            auto gather = [&](size_t dst_off, size_t src_off, size_t idx_off) {
+            // By value: the element stores may alias anything (dispatch_size's carriers), so anything
+            // read through a reference would be reloaded after every store.
+            auto gather = [dst, src, idx, src_axis_stride](size_t dst_off, size_t src_off, size_t idx_off) {
                 dst[dst_off] = src[src_off + (size_t)idx[idx_off] * src_axis_stride];
             };
             // The last two output axes, from a base offset in dst / src / idx.
             auto inner_2d = [&](size_t d, size_t s, size_t x, uint32_t a) {
                 const size_t od0 = out_strides[a], os0 = eff_src_strides[a], ox0 = eff_idx_strides[a];
                 const size_t od1 = out_strides[a + 1], os1 = eff_src_strides[a + 1], ox1 = eff_idx_strides[a + 1];
-                for (size_m i = 0; i < out_shape[a]; i++) {
+                const size_m n0 = out_shape[a], n1 = out_shape[a + 1];
+                for (size_m i = 0; i < n0; i++) {
                     const size_t di = d + i * od0, si = s + i * os0, xi = x + i * ox0;
-                    for (size_m j = 0; j < out_shape[a + 1]; j++) gather(di + j * od1, si + j * os1, xi + j * ox1);
+                    for (size_m j = 0; j < n1; j++) gather(di + j * od1, si + j * os1, xi + j * ox1);
                 }
             };
 
@@ -14566,7 +14571,7 @@ matrix matrix::scatter(const matrix& dst, const matrix& indices, const matrix& u
     if (dst.dims == 0) throw std::runtime_error("scatter: dst must have at least one dimension");
     if (axis < 0) axis += dst.dims;
     if (axis < 0 || axis >= (int)dst.dims) throw std::runtime_error("scatter: axis out of range");
-    if (indices.type == dtype::Float || indices.type == dtype::Float16) {
+    if (!is_integral(indices.type)) {
         throw std::runtime_error("scatter: indices must have an integer dtype");
     }
     uint32_t m = indices.dims;
@@ -14621,121 +14626,373 @@ matrix matrix::scatter(const matrix& dst, const matrix& indices, const matrix& u
     return output;
 }
 
-void matrix::scatter_backend(matrix& output, ExecutionDevice exec_device) {
-    ScatterPrimitive* primit = static_cast<ScatterPrimitive*>(output.tape);
-    const matrix& dst = primit->dst;
-    const matrix& indices = primit->indices;
-    const matrix& updates = primit->updates;
-    if (exec_device == ExecutionDevice::AUTO) {
-        exec_device = output.total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
-    }
-
-    // A rank-0 update space (1-D dst, scalar index) runs as a single-element 1D iteration.
+// The update space scatter() collapsed, with a rank-0 one (1-D dst, scalar index) as a single-element
+// 1-D iteration.
+static CollapsedDims_3 scatter_update_space(const ScatterPrimitive* primit) {
     CollapsedDims_3 res = primit->collapsed_dims;
     if (res.out_dims == 0) {
         res.out_dims = 1;
         res.shape[0] = 1;
         res.stridesA[0] = res.stridesB[0] = res.stridesC[0] = 0;
     }
+    return res;
+}
+
+void matrix::scatter_backend_gpu(matrix& output) {
+    ScatterPrimitive* primit = static_cast<ScatterPrimitive*>(output.tape);
+    const matrix& dst = primit->dst;
+    const matrix& indices = primit->indices;
+    const matrix& updates = primit->updates;
+    CollapsedDims_3 res = scatter_update_space(primit);
     uint32_t cdims = res.out_dims;
     size_m out_axis_stride = primit->out_axis_stride;
     size_m axis_size = primit->axis_size;
     int mode = (int)primit->mode;
 
-    if (exec_device == ExecutionDevice::METAL) {
-        // out starts as a copy of dst (blit when both are contiguous), then the scatter
-        // kernel runs after it on the same command buffer.
-        if (dst.total_size == 0) return;
-        matrix::copyGPUinplace(output, dst, 0, Execution::Encode);
-        if (primit->update_count == 0) return;
+    // out starts as a copy of dst (blit when both are contiguous), then the scatter
+    // kernel runs after it on the same command buffer.
+    if (dst.total_size == 0) return;
+    matrix::copyGPUinplace(output, dst, 0, Execution::Encode);
+    if (primit->update_count == 0) return;
 
-        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
-        int typeCode = (int)output.type;
-        int idxTypeCode = (int)indices.type;
-        int kernel_code = cdims > 3 ? 3 : cdims - 1;
+    id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+    int typeCode = (int)output.type;
+    int idxTypeCode = (int)indices.type;
+    int kernel_code = cdims > 3 ? 3 : cdims - 1;
 
-        if (!GlobalGPUManager.ScatterInit_nd[typeCode][kernel_code][idxTypeCode]) {
-            GlobalGPUManager.initScatter_nd(typeCode, kernel_code, idxTypeCode);
-        }
-        id<MTLComputePipelineState> pipeline = nil;
-        pipeline = GlobalGPUManager.ScatterComputeState_nd[typeCode][kernel_code][idxTypeCode];
-        [commandEncoder setComputePipelineState:pipeline];
+    if (!GlobalGPUManager.ScatterInit_nd[typeCode][kernel_code][idxTypeCode]) {
+        GlobalGPUManager.initScatter_nd(typeCode, kernel_code, idxTypeCode);
+    }
+    id<MTLComputePipelineState> pipeline = nil;
+    pipeline = GlobalGPUManager.ScatterComputeState_nd[typeCode][kernel_code][idxTypeCode];
+    [commandEncoder setComputePipelineState:pipeline];
 
-        setBufferOrBytes(commandEncoder, output, 0);
-        setBufferOrBytes(commandEncoder, updates, 1);
-        setBufferOrBytes(commandEncoder, indices, 2);
-        [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:3];
-        [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:4];
-        [commandEncoder setBytes:res.stridesC length:cdims * sizeof(size_m) atIndex:5];
-        [commandEncoder setBytes:&out_axis_stride length:sizeof(size_m) atIndex:6];
-        [commandEncoder setBytes:&axis_size length:sizeof(size_m) atIndex:7];
-        [commandEncoder setBytes:&mode length:sizeof(int) atIndex:8];
+    setBufferOrBytes(commandEncoder, output, 0);
+    setBufferOrBytes(commandEncoder, updates, 1);
+    setBufferOrBytes(commandEncoder, indices, 2);
+    [commandEncoder setBytes:res.stridesA length:cdims * sizeof(size_m) atIndex:3];
+    [commandEncoder setBytes:res.stridesB length:cdims * sizeof(size_m) atIndex:4];
+    [commandEncoder setBytes:res.stridesC length:cdims * sizeof(size_m) atIndex:5];
+    [commandEncoder setBytes:&out_axis_stride length:sizeof(size_m) atIndex:6];
+    [commandEncoder setBytes:&axis_size length:sizeof(size_m) atIndex:7];
+    [commandEncoder setBytes:&mode length:sizeof(int) atIndex:8];
 
-        MTLSize _dispatchExecutionSize;
-        if (cdims == 1) {
-            _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
-        } else if (cdims == 2) {
-            _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
-        } else if (cdims == 3) {
-            _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
-        } else {
-            [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:9];
-            int ndim = cdims;
-            [commandEncoder setBytes:&ndim length:sizeof(int) atIndex:10];
-            size_m threads_x = res.shape[cdims-1];
-            size_m threads_y = res.shape[cdims-2];
-            _dispatchExecutionSize = MTLSizeMake(threads_x, threads_y, primit->update_count / (threads_x * threads_y));
-        }
-        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
+    MTLSize _dispatchExecutionSize;
+    if (cdims == 1) {
+        _dispatchExecutionSize = MTLSizeMake(res.shape[0], 1, 1);
+    } else if (cdims == 2) {
+        _dispatchExecutionSize = MTLSizeMake(res.shape[1], res.shape[0], 1);
+    } else if (cdims == 3) {
+        _dispatchExecutionSize = MTLSizeMake(res.shape[2], res.shape[1], res.shape[0]);
     } else {
-        dispatch_type(output.type, output.buffer, [&](auto *out_ptr) {
-            using T = std::decay_t<decltype(*out_ptr)>;
-            const T* dst_ptr = (const T*)dst.buffer;
-            const T* upd_ptr = (const T*)updates.buffer;
+        [commandEncoder setBytes:res.shape length:cdims * sizeof(size_m) atIndex:9];
+        int ndim = cdims;
+        [commandEncoder setBytes:&ndim length:sizeof(int) atIndex:10];
+        size_m threads_x = res.shape[cdims-1];
+        size_m threads_y = res.shape[cdims-2];
+        _dispatchExecutionSize = MTLSizeMake(threads_x, threads_y, primit->update_count / (threads_x * threads_y));
+    }
+    [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup)];
+}
 
-            // out = dst
-            if (!(dst.flags & NON_CONTIGUOUS_FLAG)) {
-                memcpy(out_ptr, dst_ptr, dst.total_size * sizeof(T));
-            } else {
-                for (size_t i = 0; i < dst.total_size; ++i) {
-                    size_m rem = i;
-                    size_m src = 0;
-                    for (int d = dst.dims - 1; d >= 0; --d) {
-                        src += (rem % dst.shape()[d]) * dst.strides()[d];
-                        rem /= dst.shape()[d];
+// The index at position i of an integer buffer, for a path that reads one index per row (a block of 16+
+// after the axis): a switch on the dtype each time costs nothing there, and keeps that path out of
+// dispatch_int_type.
+static inline long long scatter_index_at(dtype type, const void* buffer, size_m i) {
+    switch (type) {
+        case dtype::UInt8:  return ((const uint8_t*)buffer)[i];
+        case dtype::UInt16: return ((const uint16_t*)buffer)[i];
+        case dtype::UInt32: return ((const uint32_t*)buffer)[i];
+        case dtype::UInt64: return (long long)((const uint64_t*)buffer)[i];
+        case dtype::Int8:   return ((const int8_t*)buffer)[i];
+        case dtype::Int16:  return ((const int16_t*)buffer)[i];
+        case dtype::Int32:  return ((const int32_t*)buffer)[i];
+        case dtype::Int64:  return ((const int64_t*)buffer)[i];
+        default: throw std::runtime_error("scatter: indices must have an integer dtype");
+    }
+}
+
+void matrix::scatter_set_cpu(matrix& output) {
+    ScatterPrimitive* primit = static_cast<ScatterPrimitive*>(output.tape);
+    if (primit->update_count == 0) return;
+    const matrix& indices = primit->indices;
+    const matrix& updates = primit->updates;
+    CollapsedDims_3 res = scatter_update_space(primit);
+    uint32_t cdims = res.out_dims;
+    const long long axis_n = (long long)primit->axis_size;
+    const size_m out_axis = primit->out_axis_stride;
+
+    // Under 16 elements a memcpy call costs more than the copy, so short blocks go element by element.
+    // The block: the last axis of the collapsed update space, when it's contiguous in out and in updates
+    // and has one index (its index stride is 0). The collapse never merges across the scattered axis
+    // (out's stride is 0 on the index's axes, the index's is 0 after them), so this is the contiguous
+    // part of what comes after the axis. The block loops run over the collapsed axes before it.
+    const uint32_t last = cdims - 1;
+    const bool block_packed = res.stridesA[last] == 1 && res.stridesB[last] == 1 && res.stridesC[last] == 0
+                              && res.shape[last] >= 16;
+    const size_m block_n = res.shape[last];
+    const int outer = (int)last;
+    const size_m *o_shape = res.shape, *o_out = res.stridesA, *o_upd = res.stridesB, *o_idx = res.stridesC;
+
+    if (block_packed) {
+        // The whole block after the axis, one memcpy per index. memcpy only needs the byte count and the
+        // index is read once per row, so this path needs neither dispatch: it's compiled once.
+        const size_t es = dtype_size(output.type);
+        const size_t bytes = block_n * es;
+        uint8_t* out = (uint8_t*)output.buffer;
+        const uint8_t* upd = (const uint8_t*)updates.buffer;
+        if (outer == 1) {
+            for (size_m i = 0; i < o_shape[0]; i++) {
+                size_m out_gid = i * o_out[0];
+                size_m upd_gid = i * o_upd[0];
+                long long row = scatter_index_at(indices.type, indices.buffer, i * o_idx[0]);
+                if (row < 0) row += axis_n;
+                memcpy(out + (out_gid + row * out_axis) * es, upd + upd_gid * es, bytes);
+            }
+        } else if (outer == 2) {
+            for (size_m i = 0; i < o_shape[0]; i++)
+                for (size_m j = 0; j < o_shape[1]; j++) {
+                    size_m out_gid = i * o_out[0] + j * o_out[1];
+                    size_m upd_gid = i * o_upd[0] + j * o_upd[1];
+                    long long row = scatter_index_at(indices.type, indices.buffer, i * o_idx[0] + j * o_idx[1]);
+                    if (row < 0) row += axis_n;
+                    memcpy(out + (out_gid + row * out_axis) * es, upd + upd_gid * es, bytes);
+                }
+        } else if (outer == 3) {
+            for (size_m i = 0; i < o_shape[0]; i++)
+                for (size_m j = 0; j < o_shape[1]; j++)
+                    for (size_m k = 0; k < o_shape[2]; k++) {
+                        size_m out_gid = i * o_out[0] + j * o_out[1] + k * o_out[2];
+                        size_m upd_gid = i * o_upd[0] + j * o_upd[1] + k * o_upd[2];
+                        long long row = scatter_index_at(indices.type, indices.buffer, i * o_idx[0] + j * o_idx[1] + k * o_idx[2]);
+                        if (row < 0) row += axis_n;
+                        memcpy(out + (out_gid + row * out_axis) * es, upd + upd_gid * es, bytes);
                     }
-                    out_ptr[i] = dst_ptr[src];
+        } else {
+            // no axes before the block (a scalar index on axis 0), or 4+: from a flat counter
+            size_t count = 1;
+            for (int d = 0; d < outer; d++) count *= o_shape[d];
+            for (size_t n = 0; n < count; n++) {
+                size_m rem = n, out_gid = 0, upd_gid = 0, idx_gid = 0;
+                for (int d = outer - 1; d >= 0; d--) {
+                    size_m c = rem % o_shape[d];
+                    rem /= o_shape[d];
+                    out_gid += c * o_out[d];
+                    upd_gid += c * o_upd[d];
+                    idx_gid += c * o_idx[d];
+                }
+                long long row = scatter_index_at(indices.type, indices.buffer, idx_gid);
+                if (row < 0) row += axis_n;
+                memcpy(out + (out_gid + row * out_axis) * es, upd + upd_gid * es, bytes);
+            }
+        }
+        return;
+    }
+
+    // Element by element over the update space (take(dst, indices, axis)'s shape): A = out, B = updates,
+    // C = indices. SET only moves elements, so their size is enough; indices in their own dtype.
+    dispatch_size(output.type, output.buffer, [&](auto* out) {
+        using T = std::remove_pointer_t<decltype(out)>;
+        const T* upd = (const T*)updates.buffer;
+        dispatch_int_type(indices.type, indices.buffer, [&](auto* idx) {
+            if (cdims == 1) {
+                for (size_m i = 0; i < res.shape[0]; i++) {
+                    size_m out_gid = i * res.stridesA[0];
+                    size_m upd_gid = i * res.stridesB[0];
+                    long long row = (long long)idx[i * res.stridesC[0]];
+                    if (row < 0) row += axis_n;
+                    out[out_gid + row * out_axis] = upd[upd_gid];
+                }
+            } else if (cdims == 2) {
+                for (size_m i = 0; i < res.shape[0]; i++)
+                    for (size_m j = 0; j < res.shape[1]; j++) {
+                        size_m out_gid = i * res.stridesA[0] + j * res.stridesA[1];
+                        size_m upd_gid = i * res.stridesB[0] + j * res.stridesB[1];
+                        long long row = (long long)idx[i * res.stridesC[0] + j * res.stridesC[1]];
+                        if (row < 0) row += axis_n;
+                        out[out_gid + row * out_axis] = upd[upd_gid];
+                    }
+            } else if (cdims == 3) {
+                for (size_m i = 0; i < res.shape[0]; i++)
+                    for (size_m j = 0; j < res.shape[1]; j++)
+                        for (size_m k = 0; k < res.shape[2]; k++) {
+                            size_m out_gid = i * res.stridesA[0] + j * res.stridesA[1] + k * res.stridesA[2];
+                            size_m upd_gid = i * res.stridesB[0] + j * res.stridesB[1] + k * res.stridesB[2];
+                            long long row = (long long)idx[i * res.stridesC[0] + j * res.stridesC[1] + k * res.stridesC[2]];
+                            if (row < 0) row += axis_n;
+                            out[out_gid + row * out_axis] = upd[upd_gid];
+                        }
+            } else {
+                // rank 4+: the position from the flat counter, as the Metal kernel does
+                for (size_t n = 0; n < primit->update_count; n++) {
+                    size_m rem = n, out_gid = 0, upd_gid = 0, idx_gid = 0;
+                    for (int d = (int)cdims - 1; d >= 0; d--) {
+                        size_m c = rem % res.shape[d];
+                        rem /= res.shape[d];
+                        out_gid += c * res.stridesA[d];
+                        upd_gid += c * res.stridesB[d];
+                        idx_gid += c * res.stridesC[d];
+                    }
+                    long long row = (long long)idx[idx_gid];
+                    if (row < 0) row += axis_n;
+                    out[out_gid + row * out_axis] = upd[upd_gid];
                 }
             }
-
-            dispatch_type(indices.type, indices.buffer, [&](auto *idx_ptr) {
-                for (size_t i = 0; i < primit->update_count; ++i) {
-                    size_m rem = i;
-                    size_m out_off = 0, upd_off = 0, idx_off = 0;
-                    for (int d = cdims - 1; d >= 0; --d) {
-                        size_m mod = rem % res.shape[d];
-                        out_off += mod * res.stridesA[d];
-                        upd_off += mod * res.stridesB[d];
-                        idx_off += mod * res.stridesC[d];
-                        rem /= res.shape[d];
-                    }
-                    // Negative indices wrap (like MLX); out-of-range ones are skipped.
-                    long long iv = (long long)idx_ptr[idx_off];
-                    if (iv < 0) iv += axis_size;
-                    if (iv < 0 || iv >= (long long)axis_size) continue;
-                    T& o = out_ptr[out_off + (size_m)iv * out_axis_stride];
-                    T v = upd_ptr[upd_off];
-                    switch (primit->mode) {
-                        case ScatterMode::SET:  o = v; break;
-                        case ScatterMode::ADD:  o = T(o + v); break;
-                        case ScatterMode::PROD: o = T(o * v); break;
-                        case ScatterMode::MAX:  o = v > o ? v : o; break;
-                        case ScatterMode::MIN:  o = v < o ? v : o; break;
-                    }
-                }
-            });
         });
-    }
+    });
+}
+
+// ADD / PROD / MAX / MIN on the CPU: op(out slot, update) for every update. They do arithmetic, so they
+// need the value's real dtype. A negative index wraps once, as in MLX; also as in MLX, indices must be in
+// range (no bounds check), so an unsigned one converts unchanged.
+// Same layout as scatter_set_cpu: a packed block of 16+ after the axis is combined in one plain loop per
+// index (which the compiler vectorizes), anything else element by element over the update space.
+template <typename Op>
+static void scatter_combine_cpu(matrix& output, Op op) {
+    ScatterPrimitive* primit = static_cast<ScatterPrimitive*>(output.tape);
+    if (primit->update_count == 0) return;
+    const matrix& indices = primit->indices;
+    const matrix& updates = primit->updates;
+    CollapsedDims_3 res = scatter_update_space(primit);
+    uint32_t cdims = res.out_dims;
+    const long long axis_n = (long long)primit->axis_size;
+    const size_m out_axis = primit->out_axis_stride;
+
+    // The block: the last axis of the collapsed update space, when it's contiguous in out and in updates
+    // and has one index (its index stride is 0). The collapse never merges across the scattered axis
+    // (out's stride is 0 on the index's axes, the index's is 0 after them), so this is the contiguous
+    // part of what comes after the axis. The block loops run over the collapsed axes before it.
+    const uint32_t last = cdims - 1;
+    const bool block_packed = res.stridesA[last] == 1 && res.stridesB[last] == 1 && res.stridesC[last] == 0
+                              && res.shape[last] >= 16;
+    const size_m block_n = res.shape[last];
+    const int outer = (int)last;
+    const size_m *o_shape = res.shape, *o_out = res.stridesA, *o_upd = res.stridesB, *o_idx = res.stridesC;
+
+    dispatch_type(output.type, output.buffer, [&](auto* out) {
+        using T = std::decay_t<decltype(*out)>;
+        const T* upd = (const T*)updates.buffer;
+        if (block_packed) {
+            // The whole block after the axis, one loop per index. The index is read once per row, so this
+            // path stays out of dispatch_int_type: the vectorized loop is compiled once per dtype.
+            if (outer == 1) {
+                for (size_m i = 0; i < o_shape[0]; i++) {
+                    size_m out_gid = i * o_out[0];
+                    size_m upd_gid = i * o_upd[0];
+                    long long row = scatter_index_at(indices.type, indices.buffer, i * o_idx[0]);
+                    if (row < 0) row += axis_n;
+                    T* o = out + out_gid + row * out_axis;
+                    const T* u = upd + upd_gid;
+                    for (size_m x = 0; x < block_n; x++) op(o[x], u[x]);
+                }
+            } else if (outer == 2) {
+                for (size_m i = 0; i < o_shape[0]; i++)
+                    for (size_m j = 0; j < o_shape[1]; j++) {
+                        size_m out_gid = i * o_out[0] + j * o_out[1];
+                        size_m upd_gid = i * o_upd[0] + j * o_upd[1];
+                        long long row = scatter_index_at(indices.type, indices.buffer, i * o_idx[0] + j * o_idx[1]);
+                        if (row < 0) row += axis_n;
+                        T* o = out + out_gid + row * out_axis;
+                        const T* u = upd + upd_gid;
+                        for (size_m x = 0; x < block_n; x++) op(o[x], u[x]);
+                    }
+            } else if (outer == 3) {
+                for (size_m i = 0; i < o_shape[0]; i++)
+                    for (size_m j = 0; j < o_shape[1]; j++)
+                        for (size_m k = 0; k < o_shape[2]; k++) {
+                            size_m out_gid = i * o_out[0] + j * o_out[1] + k * o_out[2];
+                            size_m upd_gid = i * o_upd[0] + j * o_upd[1] + k * o_upd[2];
+                            long long row = scatter_index_at(indices.type, indices.buffer, i * o_idx[0] + j * o_idx[1] + k * o_idx[2]);
+                            if (row < 0) row += axis_n;
+                            T* o = out + out_gid + row * out_axis;
+                            const T* u = upd + upd_gid;
+                            for (size_m x = 0; x < block_n; x++) op(o[x], u[x]);
+                        }
+            } else {
+                // no axes before the block (a scalar index on axis 0), or 4+: from a flat counter
+                size_t count = 1;
+                for (int d = 0; d < outer; d++) count *= o_shape[d];
+                for (size_t n = 0; n < count; n++) {
+                    size_m rem = n, out_gid = 0, upd_gid = 0, idx_gid = 0;
+                    for (int d = outer - 1; d >= 0; d--) {
+                        size_m c = rem % o_shape[d];
+                        rem /= o_shape[d];
+                        out_gid += c * o_out[d];
+                        upd_gid += c * o_upd[d];
+                        idx_gid += c * o_idx[d];
+                    }
+                    long long row = scatter_index_at(indices.type, indices.buffer, idx_gid);
+                    if (row < 0) row += axis_n;
+                    T* o = out + out_gid + row * out_axis;
+                    const T* u = upd + upd_gid;
+                    for (size_m x = 0; x < block_n; x++) op(o[x], u[x]);
+                }
+            }
+            return;
+        }
+        // element by element over the update space, indices in their own dtype
+        dispatch_int_type(indices.type, indices.buffer, [&](auto* idx) {
+            if (cdims == 1) {
+                for (size_m i = 0; i < res.shape[0]; i++) {
+                    size_m out_gid = i * res.stridesA[0];
+                    size_m upd_gid = i * res.stridesB[0];
+                    long long row = (long long)idx[i * res.stridesC[0]];
+                    if (row < 0) row += axis_n;
+                    op(out[out_gid + row * out_axis], upd[upd_gid]);
+                }
+            } else if (cdims == 2) {
+                for (size_m i = 0; i < res.shape[0]; i++)
+                    for (size_m j = 0; j < res.shape[1]; j++) {
+                        size_m out_gid = i * res.stridesA[0] + j * res.stridesA[1];
+                        size_m upd_gid = i * res.stridesB[0] + j * res.stridesB[1];
+                        long long row = (long long)idx[i * res.stridesC[0] + j * res.stridesC[1]];
+                        if (row < 0) row += axis_n;
+                        op(out[out_gid + row * out_axis], upd[upd_gid]);
+                    }
+            } else if (cdims == 3) {
+                for (size_m i = 0; i < res.shape[0]; i++)
+                    for (size_m j = 0; j < res.shape[1]; j++)
+                        for (size_m k = 0; k < res.shape[2]; k++) {
+                            size_m out_gid = i * res.stridesA[0] + j * res.stridesA[1] + k * res.stridesA[2];
+                            size_m upd_gid = i * res.stridesB[0] + j * res.stridesB[1] + k * res.stridesB[2];
+                            long long row = (long long)idx[i * res.stridesC[0] + j * res.stridesC[1] + k * res.stridesC[2]];
+                            if (row < 0) row += axis_n;
+                            op(out[out_gid + row * out_axis], upd[upd_gid]);
+                        }
+            } else {
+                // rank 4+: the position from the flat counter, as the Metal kernel does
+                for (size_t n = 0; n < primit->update_count; n++) {
+                    size_m rem = n, out_gid = 0, upd_gid = 0, idx_gid = 0;
+                    for (int d = (int)cdims - 1; d >= 0; d--) {
+                        size_m c = rem % res.shape[d];
+                        rem /= res.shape[d];
+                        out_gid += c * res.stridesA[d];
+                        upd_gid += c * res.stridesB[d];
+                        idx_gid += c * res.stridesC[d];
+                    }
+                    long long row = (long long)idx[idx_gid];
+                    if (row < 0) row += axis_n;
+                    op(out[out_gid + row * out_axis], upd[upd_gid]);
+                }
+            }
+        });
+    });
+}
+
+void matrix::scatter_add_cpu(matrix& output) {
+    scatter_combine_cpu(output, [](auto& o, auto v) { o = decltype(v)(o + v); });
+}
+
+void matrix::scatter_prod_cpu(matrix& output) {
+    scatter_combine_cpu(output, [](auto& o, auto v) { o = decltype(v)(o * v); });
+}
+
+void matrix::scatter_max_cpu(matrix& output) {
+    scatter_combine_cpu(output, [](auto& o, auto v) { o = v > o ? v : o; });
+}
+
+void matrix::scatter_min_cpu(matrix& output) {
+    scatter_combine_cpu(output, [](auto& o, auto v) { o = v < o ? v : o; });
 }
 
 matrix matrix::cross(const matrix& a, const matrix& b, int axis) {

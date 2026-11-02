@@ -99,15 +99,14 @@ template <> struct ScatterReduce<ScatterMinOp, uint> {
     static void apply(device uint* out, size_m i, uint v) { atomic_fetch_min_explicit((device atomic_uint*)(out + i), v, memory_order_relaxed); }
 };
 
-// Resolves one index and combines one update. Negative indices wrap (like MLX); indices
-// still out of range after wrapping are skipped instead of writing out of bounds.
+// Resolves one index and combines one update. Negative indices wrap once (like MLX). As in MLX,
+// indices must be in range after that: there's no bounds check, so one that isn't writes out of bounds.
 template <typename T, typename IdxT>
 inline void scatter_one(device T* out, device const T* updates, device const IdxT* indices,
                         size_m out_off, size_m upd_off, size_m idx_off,
                         size_m out_axis_stride, size_m axis_size, int mode) {
     long iv = long(indices[idx_off]);
     if (iv < 0) iv += long(axis_size);
-    if (iv < 0 || iv >= long(axis_size)) return;
     size_m o = out_off + size_m(iv) * out_axis_stride;
     T v = updates[upd_off];
     switch (mode) {

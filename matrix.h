@@ -354,6 +354,62 @@ inline void dispatch_complex_type(dtype type, void *buffer, Func &&function_to_r
     }
 }
 
+// dispatch_type for ops that only move elements and never look at their value (pad, take, scatter
+// SET): the lambda gets an unsigned integer pointer of the element's size, so it's compiled 4 times
+// instead of once per dtype, and every dtype (Complex64 too) moves bit for bit. These pointers read
+// and write buffers that hold floats, bools, complex64, ..., so the 2/4/8-byte carriers are may_alias
+// structs (uint8_t already may alias anything): on a typedef the attribute is lost as soon as a
+// template deduces the type, and the accesses go back to plain integer type-based aliasing.
+using dtype_bits8 = uint8_t;
+struct __attribute__((may_alias)) dtype_bits16 { uint16_t v; };
+struct __attribute__((may_alias)) dtype_bits32 { uint32_t v; };
+struct __attribute__((may_alias)) dtype_bits64 { uint64_t v; };
+
+template <typename Func>
+inline void dispatch_size(dtype type, void *buffer, Func &&function_to_run) {
+    if (!buffer)
+        return;
+
+    switch (dtype_size(type)) {
+        case 1:
+            function_to_run(static_cast<dtype_bits8 *>(buffer));
+            break;
+        case 2:
+            function_to_run(static_cast<dtype_bits16 *>(buffer));
+            break;
+        case 4:
+            function_to_run(static_cast<dtype_bits32 *>(buffer));
+            break;
+        case 8:
+            function_to_run(static_cast<dtype_bits64 *>(buffer));
+            break;
+        default:
+            throw std::runtime_error("dispatch_size: unsupported element size");
+    }
+}
+
+// dispatch_type for index arrays (take, scatter): the 8 integer dtypes, read as their own type (as
+// MLX does). Not by size: the same bits are a different index signed or unsigned (0xC8 is 200 as
+// UInt8, -56 as Int8).
+template <typename Func>
+inline void dispatch_int_type(dtype type, void *buffer, Func &&function_to_run) {
+    if (!buffer)
+        return;
+
+    switch (type) {
+        case dtype::UInt8:  function_to_run(static_cast<uint8_t *>(buffer)); break;
+        case dtype::UInt16: function_to_run(static_cast<uint16_t *>(buffer)); break;
+        case dtype::UInt32: function_to_run(static_cast<uint32_t *>(buffer)); break;
+        case dtype::UInt64: function_to_run(static_cast<uint64_t *>(buffer)); break;
+        case dtype::Int8:   function_to_run(static_cast<int8_t *>(buffer)); break;
+        case dtype::Int16:  function_to_run(static_cast<int16_t *>(buffer)); break;
+        case dtype::Int32:  function_to_run(static_cast<int32_t *>(buffer)); break;
+        case dtype::Int64:  function_to_run(static_cast<int64_t *>(buffer)); break;
+        default:
+            throw std::runtime_error("dispatch_int_type: expected an integer dtype");
+    }
+}
+
 // Detect if a type is an initializer_list
 template <typename T> struct is_init_list : std::false_type {};
 template <typename T>
@@ -1054,7 +1110,14 @@ public:
     // slot along `axis` that its index names. updates broadcasts to take(dst, indices, axis)'s
     // shape and is cast to dst's dtype. See .agents/MatrixAPI.md.
     static matrix scatter(const matrix& dst, const matrix& indices, const matrix& updates, int axis, ScatterMode mode = ScatterMode::SET);
-    static void scatter_backend(matrix& output, ExecutionDevice exec_device);
+    // scatter's backends: ScatterPrimitive::eval_metal calls scatter_backend_gpu; eval_cpu copies dst into
+    // out (copyCPUinplace), then calls its mode's CPU backend.
+    static void scatter_backend_gpu(matrix& output);
+    static void scatter_set_cpu(matrix& output);
+    static void scatter_add_cpu(matrix& output);
+    static void scatter_prod_cpu(matrix& output);
+    static void scatter_max_cpu(matrix& output);
+    static void scatter_min_cpu(matrix& output);
 
     
     inline void set_array_desc(const array_descriptor& new_array_desc);

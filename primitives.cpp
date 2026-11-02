@@ -2977,11 +2977,16 @@ public:
     size_t offset;
     std::vector<size_m> padding_range;
     std::vector<size_m> out_shape;
-    PaddingPrimitive(const matrix& input_mat, const matrix& input_value, size_t input_offset, const std::vector<size_m>& input_padding_range, const const std::vector<size_m>& output_shape): input(input_mat), value(input_value), offset(input_offset), padding_range(input_padding_range), out_shape(output_shape) {
+    PaddingPrimitive(const matrix& input_mat, const matrix& input_value, size_t input_offset, const std::vector<size_m>& input_padding_range, const const std::vector<size_m>& output_shape): input(input_mat),
+        // The fill takes the padded matrix's dtype here, so pad_backend only ever copies elements.
+        value(input_value.type == input_mat.type ? input_value : input_value.astype(input_mat.type)),
+        offset(input_offset), padding_range(input_padding_range), out_shape(output_shape) {
     }
     void eval_cpu(matrix &out, EvalType eval_type) override {
         if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, eval_type); };
         input.update_from_trace();
+        if (value.tape && !value.tape->evaluated) { value.tape->eval_cpu(value, eval_type); };
+        value.update_from_trace();
         if (!out.buffer) {
             if (out.tape->out_buffer) {
                 out.buffer = out.tape->out_buffer;
@@ -3010,6 +3015,10 @@ public:
         if (input.tape && !input.tape->evaluated) { input.tape->eval_metal(input, eval_type); input.update_from_trace(); } else {
             input.update_from_trace();
             ensure_metal_buffer(input);
+        }
+        if (value.tape && !value.tape->evaluated) { value.tape->eval_metal(value, eval_type); value.update_from_trace(); } else {
+            value.update_from_trace();
+            ensure_metal_buffer(value);
         }
         if (!out.buffer) {
             if (out.tape->out_buffer) {
@@ -3096,6 +3105,11 @@ public:
             if (input.tape->version > this->version) inv = true;
             new_version = std::max(input.tape->version, new_version);
         }
+        if (value.tape) {
+            if (value.tape->invalidate_pass(current_pass_id)) { inv = true; }
+            if (value.tape->version > this->version) inv = true;
+            new_version = std::max(value.tape->version, new_version);
+        }
 
         if (inv) {
             this->evaluated = false;
@@ -3108,6 +3122,7 @@ public:
         evaluated = false;
 
         if (input.tape) {input.tape->clear_trace_checks(); }
+        if (value.tape) {value.tape->clear_trace_checks(); }
 
     };
     matrix vmap(std::function<matrix(const matrix &)> func, std::vector<int> in_axis) override { return matrix(0, dtype::UInt8); }
@@ -5930,7 +5945,7 @@ public:
 // Scatter: out = copy of dst, then every update is combined (mode) into the slot along
 // `axis` that its index names. The inverse of TakePrimitive: updates lives in
 // take(dst, indices, axis)'s shape. Owning node: out is a fresh buffer, dst is never
-// written. See matrix::scatter (Phase 1) and matrix::scatter_backend (Phase 3).
+// written. See matrix::scatter (Phase 1) and the scatter_*_cpu / scatter_backend_gpu backends (Phase 3).
 class ScatterPrimitive : public Primitive {
 public:
     matrix dst;
@@ -5985,7 +6000,12 @@ public:
         if (eval_type == EvalType::COMPILE_TRACE) return;
         if (evaluated) return; else evaluated = true;
 
-        matrix::scatter_backend(out, ExecutionDevice::CPU);
+        matrix::copyCPUinplace(out, dst, 0);   // out = dst; the mode's backend then writes the updates into it
+        if (mode == ScatterMode::SET) matrix::scatter_set_cpu(out);
+        else if (mode == ScatterMode::ADD) matrix::scatter_add_cpu(out);
+        else if (mode == ScatterMode::PROD) matrix::scatter_prod_cpu(out);
+        else if (mode == ScatterMode::MAX) matrix::scatter_max_cpu(out);
+        else if (mode == ScatterMode::MIN) matrix::scatter_min_cpu(out);
     }
 
     void eval_metal(matrix &out, EvalType eval_type) override {
@@ -6036,7 +6056,7 @@ public:
         if (eval_type == EvalType::COMPILE_TRACE) return;
         if (evaluated) return; else evaluated = true;
 
-        matrix::scatter_backend(out, ExecutionDevice::METAL);
+        matrix::scatter_backend_gpu(out);
     }
 
     // SET: overwritten slots get no gradient from dst; ADD: dst passes straight through.
