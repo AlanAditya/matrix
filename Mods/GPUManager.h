@@ -18,6 +18,32 @@
 template <int dims, typename Type>
 class MatrixH;
 
+// The compute kernels: the app bundle's default.metallib, which Xcode builds from
+// ComputeShaders/*.metal. A plain executable (a CMake build) has no app bundle, so then the first
+// of these that loads: $MATRIX_METALLIB, default.metallib next to the executable, and the one
+// matrix's CMakeLists.txt builds (MATRIX_METALLIB_PATH). Without any, GPU ops throw when they look
+// up their kernel. (Added by matrix-sync's patch-gpumanager.py; WorldOf3D, an app, doesn't need it.)
+inline id<MTLLibrary> matrix_load_library(id<MTLDevice> device) {
+    id<MTLLibrary> lib = [device newDefaultLibrary];
+    if (lib) return lib;
+    NSMutableArray<NSString*>* paths = [NSMutableArray array];
+    if (const char* env = getenv("MATRIX_METALLIB")) [paths addObject:@(env)];
+    if (NSString* exe = NSBundle.mainBundle.executablePath)
+        [paths addObject:[exe.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"default.metallib"]];
+#ifdef MATRIX_METALLIB_PATH
+    [paths addObject:@MATRIX_METALLIB_PATH];
+#endif
+    for (NSString* path in paths) {
+        if (![NSFileManager.defaultManager fileExistsAtPath:path]) continue;
+        NSError* error = nil;
+        lib = [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+        if (lib) return lib;
+        NSLog(@"matrix: couldn't load %@: %@", path, error);
+    }
+    NSLog(@"matrix: no default.metallib (app bundle, $MATRIX_METALLIB, next to the executable): GPU ops will fail");
+    return nil;
+}
+
 class GPUManager {
 public:
     // Slots per dtype in the pipeline tables below, which are indexed by (int)dtype. matrix.h checks
@@ -31,7 +57,7 @@ public:
     inline static thread_local void* _thread_gCommandBuffer = nullptr;
     inline static thread_local void* _thread_gCommandEncoder = nullptr;
     
-    id<MTLLibrary> library = [metalDevice newDefaultLibrary];
+    id<MTLLibrary> library = matrix_load_library(metalDevice);
 
     // newFunctionWithName returns nil for a kernel the metallib doesn't have (e.g. an op with no
     // kernel instantiated for that dtype), and building a pipeline from nil crashes. Throw instead.
