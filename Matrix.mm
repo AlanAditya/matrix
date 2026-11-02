@@ -13924,7 +13924,7 @@ void matrix::max(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
                     AxisOffset += (remaining / collapsed.stridesA[i]) * collapsed.stridesB[i];
                     remaining %= collapsed.stridesA[i];
                 }
-                T current_max = std::numeric_limits<T>::lowest();
+                T current_max = dtype_lowest<T>();
                 for (size_t i = 0; i < noOfOpp; i++) {
                     current_max = std::max(current_max, in_data[AxisOffset + i * reduce_axis_stride]);
                 }
@@ -14068,7 +14068,7 @@ void matrix::min(matrix& output, int axis, bool keepdims, ExecutionDevice exec_d
                     AxisOffset += (remaining / collapsed.stridesA[i]) * collapsed.stridesB[i];
                     remaining %= collapsed.stridesA[i];
                 }
-                T current_min = std::numeric_limits<T>::max();
+                T current_min = dtype_max<T>();
                 for (size_t i = 0; i < noOfOpp; i++) {
                     current_min = std::min(current_min, in_data[AxisOffset + i * reduce_axis_stride]);
                 }
@@ -15236,7 +15236,7 @@ void matrix::argmax(matrix& output, int axis, bool keepdims, ExecutionDevice exe
                 AxisOffset += (remaining / collapsed.stridesA[i]) * collapsed.stridesB[i];
                 remaining %= collapsed.stridesA[i];
             }
-            T current_max = std::numeric_limits<T>::lowest();
+            T current_max = dtype_lowest<T>();
             int32_t current_argmax = 0;
             for (size_t i = 0; i < noOfOpp; i++) {
                 T val = in_data[AxisOffset + i * reduce_axis_stride];
@@ -15319,7 +15319,7 @@ void matrix::argmin(matrix& output, int axis, bool keepdims, ExecutionDevice exe
                 AxisOffset += (remaining / collapsed.stridesA[i]) * collapsed.stridesB[i];
                 remaining %= collapsed.stridesA[i];
             }
-            T current_min = std::numeric_limits<T>::max();
+            T current_min = dtype_max<T>();
             int32_t current_argmin = 0;
             for (size_t i = 0; i < noOfOpp; i++) {
                 T val = in_data[AxisOffset + i * reduce_axis_stride];

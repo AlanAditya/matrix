@@ -266,6 +266,21 @@ inline Dst dtype_cast(Src v) {
     else return static_cast<Dst>(v);
 }
 
+// std::numeric_limits<T>::lowest() / max(). Clang doesn't specialize numeric_limits for __fp16 and
+// __bf16, so for those two both return 0; these give their real finite extremes (±65504, ±0x1.fep127).
+template <typename T>
+inline T dtype_lowest() {
+    if constexpr (std::is_same_v<T, float16_t>) return static_cast<T>(-65504.0f);
+    else if constexpr (std::is_same_v<T, bfloat16_t>) return static_cast<T>(-0x1.fep127f);
+    else return std::numeric_limits<T>::lowest();
+}
+template <typename T>
+inline T dtype_max() {
+    if constexpr (std::is_same_v<T, float16_t>) return static_cast<T>(65504.0f);
+    else if constexpr (std::is_same_v<T, bfloat16_t>) return static_cast<T>(0x1.fep127f);
+    else return std::numeric_limits<T>::max();
+}
+
 template <typename Func>
 inline void dispatch_type(dtype type, void *buffer, Func &&function_to_run) {
     if (!buffer)
