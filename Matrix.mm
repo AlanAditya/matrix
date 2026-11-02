@@ -464,6 +464,13 @@ matrix matrix::reshape(array_descriptor reshape_desc, size_t reshape_dims) {
     return output;
 }
 
+matrix matrix::reshape(const std::vector<size_m>& new_shape) const {
+    matrix desc((uint32_t)new_shape.size(), type);   // only lends its shape descriptor; reshape retains its own hold
+    std::copy(new_shape.begin(), new_shape.end(), desc.shape());
+    desc.calcStrides();
+    return const_cast<matrix*>(this)->reshape(desc.array_desc, desc.dims);
+}
+
 
 matrix matrix::unsqueeze(int axis) const {
     if (axis < 0) axis += dims+1;
@@ -13466,6 +13473,979 @@ void matrix::max(const matrix& other, matrix& result, ExecutionDevice exec_devic
             }
         });
     }
+}
+
+
+// Pointwise graph construction. Shape inference and collapse happen exactly once here;
+// primitives own storage and the backend below only executes the cached maps.
+namespace {
+void require_pointwise_real(dtype t) {
+    if (t == dtype::Complex64 || static_cast<unsigned>(t) >= kNumDtypes)
+        throw std::invalid_argument("pointwise operation requires a real dtype");
+}
+
+matrix pointwise_cast(const matrix& in, dtype type) {
+    // astype always creates a materializing node, even for the same dtype.
+    return in.type == type ? ensure_graph_ready(in) : in.astype(type);
+}
+
+dtype pointwise_promote(const matrix& a, const matrix& b) {
+    require_pointwise_real(a.type);
+    require_pointwise_real(b.type);
+    return promote_types(a.type, b.type);
+}
+
+std::vector<size_m> pointwise_shape(const std::vector<matrix>& inputs) {
+    uint32_t rank = 0;
+    for (const auto& in : inputs) rank = std::max(rank, in.dims);
+    if (rank > MAX_TENSOR_DIMS) throw std::invalid_argument("pointwise rank exceeds MAX_TENSOR_DIMS");
+    std::vector<size_m> shape(rank, 1);
+    for (const auto& in : inputs) {
+        for (uint32_t d = 0; d < in.dims; ++d) {
+            auto& n = shape[rank - in.dims + d];
+            size_m m = in.shape()[d];
+            if (n == 1) n = m; // In particular, broadcasting 0 with 1 gives 0.
+            else if (m != 1 && n != m) throw std::invalid_argument("incompatible pointwise broadcast shapes");
+        }
+    }
+    return shape;
+}
+
+template <class Node>
+matrix make_pointwise(const std::vector<matrix>& inputs,
+                      const std::vector<size_m>& shape, dtype type) {
+    if (shape.size() > MAX_TENSOR_DIMS) throw std::invalid_argument("pointwise rank exceeds MAX_TENSOR_DIMS");
+    size_t count = 1;
+    for (size_m n : shape) {
+        if (n && count > UINT32_MAX / n) throw std::overflow_error("pointwise tensor exceeds 32-bit indexing");
+        count *= n;
+    }
+    // Validate all operands before creating the primitive, including fixed-shape full().
+    for (const auto& in : inputs) {
+        if (in.dims > shape.size()) throw std::invalid_argument("input rank exceeds pointwise output rank");
+        for (uint32_t d = 0; d < in.dims; ++d)
+            if (in.shape()[d] != 1 && in.shape()[d] != shape[shape.size() - in.dims + d])
+                throw std::invalid_argument("input cannot broadcast to pointwise output shape");
+    }
+    matrix out(static_cast<uint32_t>(shape.size()), type);
+    std::copy(shape.begin(), shape.end(), out.shape());
+    out.calcStrides(); out.total_size = count;
+    auto* prim = new Node(inputs, shape);
+    out.tape = prim;
+    size_m all_strides[3][MAX_TENSOR_DIMS]{};
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const auto& in = inputs[i];
+        for (uint32_t d = 0; d < in.dims; ++d)
+            all_strides[i][out.dims - in.dims + d] = in.shape()[d] == 1 ? 0 : in.strides()[d];
+    }
+    // Collapse once across all operands for the CPU and Metal kernels.
+    // Ignore size-one axes; merge adjacent axes only when every input is
+    // contiguous across them (zero-stride broadcasts merge naturally).
+    if (count) {
+        auto& cd = prim->collapsed_dims;
+        for (uint32_t d = 0; d < out.dims; ++d) {
+            if (out.shape()[d] == 1) continue;
+            bool merge = cd.dims > 0 && uint64_t(cd.shape[cd.dims - 1]) * out.shape()[d] <= INT32_MAX;
+            if (merge) {
+                for (size_t i = 0; i < inputs.size(); ++i)
+                    if (uint64_t(cd.strides[i][cd.dims - 1]) != uint64_t(all_strides[i][d]) * out.shape()[d]) {
+                        merge = false;
+                        break;
+                    }
+            }
+            uint32_t target = merge ? cd.dims - 1 : cd.dims++;
+            if (merge) cd.shape[target] *= out.shape()[d];
+            else cd.shape[target] = out.shape()[d];
+            for (size_t i = 0; i < inputs.size(); ++i) cd.strides[i][target] = all_strides[i][d];
+        }
+    }
+    return out;
+}
+
+template <class Node>
+matrix binary_pointwise(const matrix& a, const matrix& b, dtype type, dtype output_type) {
+    require_pointwise_real(a.type); require_pointwise_real(b.type);
+    std::vector<matrix> inputs{pointwise_cast(a, type), pointwise_cast(b, type)};
+    return make_pointwise<Node>(inputs, pointwise_shape(inputs), output_type);
+}
+}
+
+matrix matrix::arctan2(const matrix& a, const matrix& b) { return binary_pointwise<Arctan2Primitive>(a, b, dtype::Float, dtype::Float); }
+matrix matrix::greater(const matrix& a, const matrix& b) { return binary_pointwise<GreaterPrimitive>(a, b, pointwise_promote(a, b), dtype::Bool); }
+matrix matrix::less(const matrix& a, const matrix& b) { return binary_pointwise<LessPrimitive>(a, b, pointwise_promote(a, b), dtype::Bool); }
+matrix matrix::logical_and(const matrix& a, const matrix& b) { return binary_pointwise<LogicalAndPrimitive>(a, b, dtype::Bool, dtype::Bool); }
+matrix matrix::arcsin(const matrix& x) {
+    require_pointwise_real(x.type);
+    return make_pointwise<ArcsinPrimitive>({pointwise_cast(x, dtype::Float)}, {x.shape(), x.shape() + x.dims}, dtype::Float);
+}
+matrix matrix::floor(const matrix& x) {
+    require_pointwise_real(x.type);
+    return make_pointwise<FloorPrimitive>({ensure_graph_ready(x)}, {x.shape(), x.shape() + x.dims}, x.type);
+}
+matrix matrix::where(const matrix& cond, const matrix& a, const matrix& b) {
+    require_pointwise_real(cond.type); require_pointwise_real(a.type); require_pointwise_real(b.type);
+    dtype type = promote_types(a.type, b.type);
+    std::vector<matrix> inputs{pointwise_cast(cond, dtype::Bool), pointwise_cast(a, type), pointwise_cast(b, type)};
+    return make_pointwise<WherePrimitive>(inputs, pointwise_shape(inputs), type);
+}
+matrix matrix::full(const std::vector<size_m>& shape, const matrix& value, dtype type) {
+    require_pointwise_real(value.type); require_pointwise_real(type);
+    return make_pointwise<FullPrimitive>({pointwise_cast(value, type)}, shape, type);
+}
+matrix matrix::arange(double start, double stop, double step, dtype type) {
+    require_pointwise_real(type);
+    if (type == dtype::Bool) throw std::invalid_argument("arange does not support Bool");
+    if (!std::isfinite(start) || !std::isfinite(stop) || !std::isfinite(step) || step == 0)
+        throw std::invalid_argument("arange requires finite bounds and a finite nonzero step");
+    double length = std::max(0.0, std::ceil((stop - start) / step));
+    if (!std::isfinite(length) || length > UINT32_MAX)
+        throw std::overflow_error("arange exceeds 32-bit indexing");
+    return make_pointwise<ArangePrimitive>({matrix::scalar(start, type), matrix::scalar(step, type)},
+                                           {static_cast<size_m>(length)}, type);
+}
+
+// arctan2: CPU dimensional specializations; operation is inside each loop.
+void matrix::arctan2_backend_cpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<Arctan2Primitive*>(output.tape);
+    const auto& cd = prim->collapsed_dims;
+    const size_m* sa = cd.strides[0];
+    const size_m* sb = cd.strides[1];
+    const matrix& a = prim->a;
+    const matrix& b = prim->b;
+    dispatch_type(a.type, a.buffer, [&](auto* av) {
+        using T = std::decay_t<decltype(*av)>;
+        const T* bv = static_cast<const T*>(b.buffer);
+        size_t i = 0;
+        if (cd.dims == 0) {
+            const size_t ia = 0;
+            const size_t ib = 0;
+            ((float*)output.buffer)[i] = std::atan2(float(av[ia]), float(bv[ib]));
+            ++i;
+        } else if (cd.dims == 1) {
+            for (size_t x = 0; x < cd.shape[0]; ++x) {
+                const size_t ia = x * sa[0];
+                const size_t ib = x * sb[0];
+                ((float*)output.buffer)[i] = std::atan2(float(av[ia]), float(bv[ib]));
+                ++i;
+            }
+        } else if (cd.dims == 2) {
+            for (size_t y = 0; y < cd.shape[0]; ++y) {
+                const size_t a0 = y * sa[0];
+                const size_t b0 = y * sb[0];
+                for (size_t x = 0; x < cd.shape[1]; ++x) {
+                    const size_t ia = a0 + x * sa[1];
+                    const size_t ib = b0 + x * sb[1];
+                    ((float*)output.buffer)[i] = std::atan2(float(av[ia]), float(bv[ib]));
+                    ++i;
+                }
+            }
+        } else if (cd.dims == 3) {
+            for (size_t z = 0; z < cd.shape[0]; ++z)
+                for (size_t y = 0; y < cd.shape[1]; ++y) {
+                    const size_t a0 = z * sa[0] + y * sa[1];
+                    const size_t b0 = z * sb[0] + y * sb[1];
+                    for (size_t x = 0; x < cd.shape[2]; ++x) {
+                        const size_t ia = a0 + x * sa[2];
+                        const size_t ib = b0 + x * sb[2];
+                        ((float*)output.buffer)[i] = std::atan2(float(av[ia]), float(bv[ib]));
+                        ++i;
+                    }
+                }
+        } else {
+            const uint32_t yd = cd.dims - 2, xd = cd.dims - 1;
+            const size_t planes = output.total_size / (size_t(cd.shape[yd]) * cd.shape[xd]);
+            for (size_t plane = 0; plane < planes; ++plane) {
+                size_t rem = plane, a0 = 0, b0 = 0;
+                for (int d = int(yd) - 1; d >= 0; --d) {
+                    const size_t idx = rem % cd.shape[d]; rem /= cd.shape[d];
+                    a0 += idx * sa[d]; b0 += idx * sb[d];
+                }
+                for (size_t y = 0; y < cd.shape[yd]; ++y) {
+                    const size_t ay = a0 + y * sa[yd];
+                    const size_t by = b0 + y * sb[yd];
+                    for (size_t x = 0; x < cd.shape[xd]; ++x) {
+                        const size_t ia = ay + x * sa[xd];
+                        const size_t ib = by + x * sb[xd];
+                        ((float*)output.buffer)[i] = std::atan2(float(av[ia]), float(bv[ib]));
+                        ++i;
+                    }
+                }
+            }
+        }
+    });
+}
+
+// arcsin: CPU dimensional specializations; operation is inside each loop.
+void matrix::arcsin_backend_cpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<ArcsinPrimitive*>(output.tape);
+    const auto& cd = prim->collapsed_dims;
+    const size_m* sa = cd.strides[0];
+    const matrix& a = prim->input;
+    dispatch_type(a.type, a.buffer, [&](auto* av) {
+        using T = std::decay_t<decltype(*av)>;
+        size_t i = 0;
+        if (cd.dims == 0) {
+            const size_t ia = 0;
+            ((float*)output.buffer)[i] = std::asin(float(av[ia]));
+            ++i;
+        } else if (cd.dims == 1) {
+            for (size_t x = 0; x < cd.shape[0]; ++x) {
+                const size_t ia = x * sa[0];
+                ((float*)output.buffer)[i] = std::asin(float(av[ia]));
+                ++i;
+            }
+        } else if (cd.dims == 2) {
+            for (size_t y = 0; y < cd.shape[0]; ++y) {
+                const size_t a0 = y * sa[0];
+                for (size_t x = 0; x < cd.shape[1]; ++x) {
+                    const size_t ia = a0 + x * sa[1];
+                    ((float*)output.buffer)[i] = std::asin(float(av[ia]));
+                    ++i;
+                }
+            }
+        } else if (cd.dims == 3) {
+            for (size_t z = 0; z < cd.shape[0]; ++z)
+                for (size_t y = 0; y < cd.shape[1]; ++y) {
+                    const size_t a0 = z * sa[0] + y * sa[1];
+                    for (size_t x = 0; x < cd.shape[2]; ++x) {
+                        const size_t ia = a0 + x * sa[2];
+                        ((float*)output.buffer)[i] = std::asin(float(av[ia]));
+                        ++i;
+                    }
+                }
+        } else {
+            const uint32_t yd = cd.dims - 2, xd = cd.dims - 1;
+            const size_t planes = output.total_size / (size_t(cd.shape[yd]) * cd.shape[xd]);
+            for (size_t plane = 0; plane < planes; ++plane) {
+                size_t rem = plane, a0 = 0;
+                for (int d = int(yd) - 1; d >= 0; --d) {
+                    const size_t idx = rem % cd.shape[d]; rem /= cd.shape[d];
+                    a0 += idx * sa[d];
+                }
+                for (size_t y = 0; y < cd.shape[yd]; ++y) {
+                    const size_t ay = a0 + y * sa[yd];
+                    for (size_t x = 0; x < cd.shape[xd]; ++x) {
+                        const size_t ia = ay + x * sa[xd];
+                        ((float*)output.buffer)[i] = std::asin(float(av[ia]));
+                        ++i;
+                    }
+                }
+            }
+        }
+    });
+}
+
+// floor: CPU dimensional specializations; operation is inside each loop.
+void matrix::floor_backend_cpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<FloorPrimitive*>(output.tape);
+    const auto& cd = prim->collapsed_dims;
+    const size_m* sa = cd.strides[0];
+    const matrix& a = prim->input;
+    dispatch_type(a.type, a.buffer, [&](auto* av) {
+        using T = std::decay_t<decltype(*av)>;
+        T* dst = static_cast<T*>(output.buffer);
+        size_t i = 0;
+        if (cd.dims == 0) {
+            const size_t ia = 0;
+            if constexpr (std::is_integral_v<T>) dst[i] = av[ia]; else dst[i] = dtype_cast<T>(std::floor(float(av[ia])));
+            ++i;
+        } else if (cd.dims == 1) {
+            for (size_t x = 0; x < cd.shape[0]; ++x) {
+                const size_t ia = x * sa[0];
+                if constexpr (std::is_integral_v<T>) dst[i] = av[ia]; else dst[i] = dtype_cast<T>(std::floor(float(av[ia])));
+                ++i;
+            }
+        } else if (cd.dims == 2) {
+            for (size_t y = 0; y < cd.shape[0]; ++y) {
+                const size_t a0 = y * sa[0];
+                for (size_t x = 0; x < cd.shape[1]; ++x) {
+                    const size_t ia = a0 + x * sa[1];
+                    if constexpr (std::is_integral_v<T>) dst[i] = av[ia]; else dst[i] = dtype_cast<T>(std::floor(float(av[ia])));
+                    ++i;
+                }
+            }
+        } else if (cd.dims == 3) {
+            for (size_t z = 0; z < cd.shape[0]; ++z)
+                for (size_t y = 0; y < cd.shape[1]; ++y) {
+                    const size_t a0 = z * sa[0] + y * sa[1];
+                    for (size_t x = 0; x < cd.shape[2]; ++x) {
+                        const size_t ia = a0 + x * sa[2];
+                        if constexpr (std::is_integral_v<T>) dst[i] = av[ia]; else dst[i] = dtype_cast<T>(std::floor(float(av[ia])));
+                        ++i;
+                    }
+                }
+        } else {
+            const uint32_t yd = cd.dims - 2, xd = cd.dims - 1;
+            const size_t planes = output.total_size / (size_t(cd.shape[yd]) * cd.shape[xd]);
+            for (size_t plane = 0; plane < planes; ++plane) {
+                size_t rem = plane, a0 = 0;
+                for (int d = int(yd) - 1; d >= 0; --d) {
+                    const size_t idx = rem % cd.shape[d]; rem /= cd.shape[d];
+                    a0 += idx * sa[d];
+                }
+                for (size_t y = 0; y < cd.shape[yd]; ++y) {
+                    const size_t ay = a0 + y * sa[yd];
+                    for (size_t x = 0; x < cd.shape[xd]; ++x) {
+                        const size_t ia = ay + x * sa[xd];
+                        if constexpr (std::is_integral_v<T>) dst[i] = av[ia]; else dst[i] = dtype_cast<T>(std::floor(float(av[ia])));
+                        ++i;
+                    }
+                }
+            }
+        }
+    });
+}
+
+// greater: CPU dimensional specializations; operation is inside each loop.
+void matrix::greater_backend_cpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<GreaterPrimitive*>(output.tape);
+    const auto& cd = prim->collapsed_dims;
+    const size_m* sa = cd.strides[0];
+    const size_m* sb = cd.strides[1];
+    const matrix& a = prim->a;
+    const matrix& b = prim->b;
+    dispatch_type(a.type, a.buffer, [&](auto* av) {
+        using T = std::decay_t<decltype(*av)>;
+        const T* bv = static_cast<const T*>(b.buffer);
+        bool* mask = static_cast<bool*>(output.buffer);
+        size_t i = 0;
+        if (cd.dims == 0) {
+            const size_t ia = 0;
+            const size_t ib = 0;
+            mask[i] = av[ia] > bv[ib];
+            ++i;
+        } else if (cd.dims == 1) {
+            for (size_t x = 0; x < cd.shape[0]; ++x) {
+                const size_t ia = x * sa[0];
+                const size_t ib = x * sb[0];
+                mask[i] = av[ia] > bv[ib];
+                ++i;
+            }
+        } else if (cd.dims == 2) {
+            for (size_t y = 0; y < cd.shape[0]; ++y) {
+                const size_t a0 = y * sa[0];
+                const size_t b0 = y * sb[0];
+                for (size_t x = 0; x < cd.shape[1]; ++x) {
+                    const size_t ia = a0 + x * sa[1];
+                    const size_t ib = b0 + x * sb[1];
+                    mask[i] = av[ia] > bv[ib];
+                    ++i;
+                }
+            }
+        } else if (cd.dims == 3) {
+            for (size_t z = 0; z < cd.shape[0]; ++z)
+                for (size_t y = 0; y < cd.shape[1]; ++y) {
+                    const size_t a0 = z * sa[0] + y * sa[1];
+                    const size_t b0 = z * sb[0] + y * sb[1];
+                    for (size_t x = 0; x < cd.shape[2]; ++x) {
+                        const size_t ia = a0 + x * sa[2];
+                        const size_t ib = b0 + x * sb[2];
+                        mask[i] = av[ia] > bv[ib];
+                        ++i;
+                    }
+                }
+        } else {
+            const uint32_t yd = cd.dims - 2, xd = cd.dims - 1;
+            const size_t planes = output.total_size / (size_t(cd.shape[yd]) * cd.shape[xd]);
+            for (size_t plane = 0; plane < planes; ++plane) {
+                size_t rem = plane, a0 = 0, b0 = 0;
+                for (int d = int(yd) - 1; d >= 0; --d) {
+                    const size_t idx = rem % cd.shape[d]; rem /= cd.shape[d];
+                    a0 += idx * sa[d]; b0 += idx * sb[d];
+                }
+                for (size_t y = 0; y < cd.shape[yd]; ++y) {
+                    const size_t ay = a0 + y * sa[yd];
+                    const size_t by = b0 + y * sb[yd];
+                    for (size_t x = 0; x < cd.shape[xd]; ++x) {
+                        const size_t ia = ay + x * sa[xd];
+                        const size_t ib = by + x * sb[xd];
+                        mask[i] = av[ia] > bv[ib];
+                        ++i;
+                    }
+                }
+            }
+        }
+    });
+}
+
+// less: CPU dimensional specializations; operation is inside each loop.
+void matrix::less_backend_cpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<LessPrimitive*>(output.tape);
+    const auto& cd = prim->collapsed_dims;
+    const size_m* sa = cd.strides[0];
+    const size_m* sb = cd.strides[1];
+    const matrix& a = prim->a;
+    const matrix& b = prim->b;
+    dispatch_type(a.type, a.buffer, [&](auto* av) {
+        using T = std::decay_t<decltype(*av)>;
+        const T* bv = static_cast<const T*>(b.buffer);
+        bool* mask = static_cast<bool*>(output.buffer);
+        size_t i = 0;
+        if (cd.dims == 0) {
+            const size_t ia = 0;
+            const size_t ib = 0;
+            mask[i] = av[ia] < bv[ib];
+            ++i;
+        } else if (cd.dims == 1) {
+            for (size_t x = 0; x < cd.shape[0]; ++x) {
+                const size_t ia = x * sa[0];
+                const size_t ib = x * sb[0];
+                mask[i] = av[ia] < bv[ib];
+                ++i;
+            }
+        } else if (cd.dims == 2) {
+            for (size_t y = 0; y < cd.shape[0]; ++y) {
+                const size_t a0 = y * sa[0];
+                const size_t b0 = y * sb[0];
+                for (size_t x = 0; x < cd.shape[1]; ++x) {
+                    const size_t ia = a0 + x * sa[1];
+                    const size_t ib = b0 + x * sb[1];
+                    mask[i] = av[ia] < bv[ib];
+                    ++i;
+                }
+            }
+        } else if (cd.dims == 3) {
+            for (size_t z = 0; z < cd.shape[0]; ++z)
+                for (size_t y = 0; y < cd.shape[1]; ++y) {
+                    const size_t a0 = z * sa[0] + y * sa[1];
+                    const size_t b0 = z * sb[0] + y * sb[1];
+                    for (size_t x = 0; x < cd.shape[2]; ++x) {
+                        const size_t ia = a0 + x * sa[2];
+                        const size_t ib = b0 + x * sb[2];
+                        mask[i] = av[ia] < bv[ib];
+                        ++i;
+                    }
+                }
+        } else {
+            const uint32_t yd = cd.dims - 2, xd = cd.dims - 1;
+            const size_t planes = output.total_size / (size_t(cd.shape[yd]) * cd.shape[xd]);
+            for (size_t plane = 0; plane < planes; ++plane) {
+                size_t rem = plane, a0 = 0, b0 = 0;
+                for (int d = int(yd) - 1; d >= 0; --d) {
+                    const size_t idx = rem % cd.shape[d]; rem /= cd.shape[d];
+                    a0 += idx * sa[d]; b0 += idx * sb[d];
+                }
+                for (size_t y = 0; y < cd.shape[yd]; ++y) {
+                    const size_t ay = a0 + y * sa[yd];
+                    const size_t by = b0 + y * sb[yd];
+                    for (size_t x = 0; x < cd.shape[xd]; ++x) {
+                        const size_t ia = ay + x * sa[xd];
+                        const size_t ib = by + x * sb[xd];
+                        mask[i] = av[ia] < bv[ib];
+                        ++i;
+                    }
+                }
+            }
+        }
+    });
+}
+
+// logical_and: CPU dimensional specializations; operation is inside each loop.
+void matrix::logical_and_backend_cpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<LogicalAndPrimitive*>(output.tape);
+    const auto& cd = prim->collapsed_dims;
+    const size_m* sa = cd.strides[0];
+    const size_m* sb = cd.strides[1];
+    const matrix& a = prim->a;
+    const matrix& b = prim->b;
+    dispatch_type(a.type, a.buffer, [&](auto* av) {
+        using T = std::decay_t<decltype(*av)>;
+        const T* bv = static_cast<const T*>(b.buffer);
+        bool* mask = static_cast<bool*>(output.buffer);
+        size_t i = 0;
+        if (cd.dims == 0) {
+            const size_t ia = 0;
+            const size_t ib = 0;
+            mask[i] = bool(av[ia]) && bool(bv[ib]);
+            ++i;
+        } else if (cd.dims == 1) {
+            for (size_t x = 0; x < cd.shape[0]; ++x) {
+                const size_t ia = x * sa[0];
+                const size_t ib = x * sb[0];
+                mask[i] = bool(av[ia]) && bool(bv[ib]);
+                ++i;
+            }
+        } else if (cd.dims == 2) {
+            for (size_t y = 0; y < cd.shape[0]; ++y) {
+                const size_t a0 = y * sa[0];
+                const size_t b0 = y * sb[0];
+                for (size_t x = 0; x < cd.shape[1]; ++x) {
+                    const size_t ia = a0 + x * sa[1];
+                    const size_t ib = b0 + x * sb[1];
+                    mask[i] = bool(av[ia]) && bool(bv[ib]);
+                    ++i;
+                }
+            }
+        } else if (cd.dims == 3) {
+            for (size_t z = 0; z < cd.shape[0]; ++z)
+                for (size_t y = 0; y < cd.shape[1]; ++y) {
+                    const size_t a0 = z * sa[0] + y * sa[1];
+                    const size_t b0 = z * sb[0] + y * sb[1];
+                    for (size_t x = 0; x < cd.shape[2]; ++x) {
+                        const size_t ia = a0 + x * sa[2];
+                        const size_t ib = b0 + x * sb[2];
+                        mask[i] = bool(av[ia]) && bool(bv[ib]);
+                        ++i;
+                    }
+                }
+        } else {
+            const uint32_t yd = cd.dims - 2, xd = cd.dims - 1;
+            const size_t planes = output.total_size / (size_t(cd.shape[yd]) * cd.shape[xd]);
+            for (size_t plane = 0; plane < planes; ++plane) {
+                size_t rem = plane, a0 = 0, b0 = 0;
+                for (int d = int(yd) - 1; d >= 0; --d) {
+                    const size_t idx = rem % cd.shape[d]; rem /= cd.shape[d];
+                    a0 += idx * sa[d]; b0 += idx * sb[d];
+                }
+                for (size_t y = 0; y < cd.shape[yd]; ++y) {
+                    const size_t ay = a0 + y * sa[yd];
+                    const size_t by = b0 + y * sb[yd];
+                    for (size_t x = 0; x < cd.shape[xd]; ++x) {
+                        const size_t ia = ay + x * sa[xd];
+                        const size_t ib = by + x * sb[xd];
+                        mask[i] = bool(av[ia]) && bool(bv[ib]);
+                        ++i;
+                    }
+                }
+            }
+        }
+    });
+}
+
+// where: CPU dimensional specializations; operation is inside each loop.
+void matrix::where_backend_cpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<WherePrimitive*>(output.tape);
+    const auto& cd = prim->collapsed_dims;
+    const size_m* sa = cd.strides[1];
+    const size_m* sb = cd.strides[2];
+    const size_m* sc = cd.strides[0];
+    const matrix& a = prim->a;
+    const matrix& b = prim->b;
+    dispatch_type(a.type, a.buffer, [&](auto* av) {
+        using T = std::decay_t<decltype(*av)>;
+        const T* bv = static_cast<const T*>(b.buffer);
+        T* dst = static_cast<T*>(output.buffer);
+        const bool* cond = static_cast<const bool*>(prim->cond.buffer);
+        size_t i = 0;
+        if (cd.dims == 0) {
+            const size_t ia = 0;
+            const size_t ib = 0;
+            const size_t ic = 0;
+            dst[i] = cond[ic] ? av[ia] : bv[ib];
+            ++i;
+        } else if (cd.dims == 1) {
+            for (size_t x = 0; x < cd.shape[0]; ++x) {
+                const size_t ia = x * sa[0];
+                const size_t ib = x * sb[0];
+                const size_t ic = x * sc[0];
+                dst[i] = cond[ic] ? av[ia] : bv[ib];
+                ++i;
+            }
+        } else if (cd.dims == 2) {
+            for (size_t y = 0; y < cd.shape[0]; ++y) {
+                const size_t a0 = y * sa[0];
+                const size_t b0 = y * sb[0];
+                const size_t c0 = y * sc[0];
+                for (size_t x = 0; x < cd.shape[1]; ++x) {
+                    const size_t ia = a0 + x * sa[1];
+                    const size_t ib = b0 + x * sb[1];
+                    const size_t ic = c0 + x * sc[1];
+                    dst[i] = cond[ic] ? av[ia] : bv[ib];
+                    ++i;
+                }
+            }
+        } else if (cd.dims == 3) {
+            for (size_t z = 0; z < cd.shape[0]; ++z)
+                for (size_t y = 0; y < cd.shape[1]; ++y) {
+                    const size_t a0 = z * sa[0] + y * sa[1];
+                    const size_t b0 = z * sb[0] + y * sb[1];
+                    const size_t c0 = z * sc[0] + y * sc[1];
+                    for (size_t x = 0; x < cd.shape[2]; ++x) {
+                        const size_t ia = a0 + x * sa[2];
+                        const size_t ib = b0 + x * sb[2];
+                        const size_t ic = c0 + x * sc[2];
+                        dst[i] = cond[ic] ? av[ia] : bv[ib];
+                        ++i;
+                    }
+                }
+        } else {
+            const uint32_t yd = cd.dims - 2, xd = cd.dims - 1;
+            const size_t planes = output.total_size / (size_t(cd.shape[yd]) * cd.shape[xd]);
+            for (size_t plane = 0; plane < planes; ++plane) {
+                size_t rem = plane, a0 = 0, b0 = 0, c0 = 0;
+                for (int d = int(yd) - 1; d >= 0; --d) {
+                    const size_t idx = rem % cd.shape[d]; rem /= cd.shape[d];
+                    a0 += idx * sa[d]; b0 += idx * sb[d]; c0 += idx * sc[d];
+                }
+                for (size_t y = 0; y < cd.shape[yd]; ++y) {
+                    const size_t ay = a0 + y * sa[yd];
+                    const size_t by = b0 + y * sb[yd];
+                    const size_t cy = c0 + y * sc[yd];
+                    for (size_t x = 0; x < cd.shape[xd]; ++x) {
+                        const size_t ia = ay + x * sa[xd];
+                        const size_t ib = by + x * sb[xd];
+                        const size_t ic = cy + x * sc[xd];
+                        dst[i] = cond[ic] ? av[ia] : bv[ib];
+                        ++i;
+                    }
+                }
+            }
+        }
+    });
+}
+
+// full: CPU dimensional specializations; operation is inside each loop.
+void matrix::full_backend_cpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<FullPrimitive*>(output.tape);
+    const auto& cd = prim->collapsed_dims;
+    const size_m* sa = cd.strides[0];
+    const matrix& a = prim->value;
+    dispatch_type(a.type, a.buffer, [&](auto* av) {
+        using T = std::decay_t<decltype(*av)>;
+        T* dst = static_cast<T*>(output.buffer);
+        size_t i = 0;
+        if (cd.dims == 0) {
+            const size_t ia = 0;
+            dst[i] = av[ia];
+            ++i;
+        } else if (cd.dims == 1) {
+            for (size_t x = 0; x < cd.shape[0]; ++x) {
+                const size_t ia = x * sa[0];
+                dst[i] = av[ia];
+                ++i;
+            }
+        } else if (cd.dims == 2) {
+            for (size_t y = 0; y < cd.shape[0]; ++y) {
+                const size_t a0 = y * sa[0];
+                for (size_t x = 0; x < cd.shape[1]; ++x) {
+                    const size_t ia = a0 + x * sa[1];
+                    dst[i] = av[ia];
+                    ++i;
+                }
+            }
+        } else if (cd.dims == 3) {
+            for (size_t z = 0; z < cd.shape[0]; ++z)
+                for (size_t y = 0; y < cd.shape[1]; ++y) {
+                    const size_t a0 = z * sa[0] + y * sa[1];
+                    for (size_t x = 0; x < cd.shape[2]; ++x) {
+                        const size_t ia = a0 + x * sa[2];
+                        dst[i] = av[ia];
+                        ++i;
+                    }
+                }
+        } else {
+            const uint32_t yd = cd.dims - 2, xd = cd.dims - 1;
+            const size_t planes = output.total_size / (size_t(cd.shape[yd]) * cd.shape[xd]);
+            for (size_t plane = 0; plane < planes; ++plane) {
+                size_t rem = plane, a0 = 0;
+                for (int d = int(yd) - 1; d >= 0; --d) {
+                    const size_t idx = rem % cd.shape[d]; rem /= cd.shape[d];
+                    a0 += idx * sa[d];
+                }
+                for (size_t y = 0; y < cd.shape[yd]; ++y) {
+                    const size_t ay = a0 + y * sa[yd];
+                    for (size_t x = 0; x < cd.shape[xd]; ++x) {
+                        const size_t ia = ay + x * sa[xd];
+                        dst[i] = av[ia];
+                        ++i;
+                    }
+                }
+            }
+        }
+    });
+}
+
+// arange is a generator with a single, contiguous output axis.
+void matrix::arange_backend_cpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<ArangePrimitive*>(output.tape);
+    const matrix& start = prim->start;
+    const matrix& step = prim->step;
+    dispatch_type(output.type, output.buffer, [&](auto* dst) {
+        using T = std::decay_t<decltype(*dst)>;
+        const T a = *static_cast<const T*>(start.buffer), b = *static_cast<const T*>(step.buffer);
+        for (size_t i = 0; i < output.total_size; ++i) {
+            if constexpr (std::is_integral_v<T>) dst[i] = static_cast<T>(uint64_t(a) + uint64_t(i) * uint64_t(b));
+            else dst[i] = dtype_cast<T>(float(a) + float(i) * float(b));
+        }
+    });
+}
+
+void matrix::arctan2_backend_gpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<Arctan2Primitive*>(output.tape);
+    auto dims = prim->collapsed_dims;
+    if (!dims.dims) { dims.dims = 1; dims.shape[0] = 1; }
+    size_m dst_strides[MAX_TENSOR_DIMS];
+    dst_strides[dims.dims - 1] = 1;
+    for (int d = int(dims.dims) - 2; d >= 0; --d)
+        dst_strides[d] = dst_strides[d + 1] * dims.shape[d + 1];
+    const int type = static_cast<int>(prim->a.type);
+    const int specialization = dims.dims > 3 ? 3 : int(dims.dims) - 1;
+    if (!GlobalGPUManager.Arctan2Init[type][specialization].load(std::memory_order_acquire))
+        GlobalGPUManager.initArctan2(type, specialization);
+    auto pipeline = GlobalGPUManager.Arctan2ComputeState[type][specialization];
+    auto encoder = GlobalGPUManager.getCommandEncoder();
+    [encoder setComputePipelineState:pipeline];
+    setBufferOrBytes(encoder, output, 0);
+    setBufferOrBytes(encoder, prim->a, 1);
+    setBufferOrBytes(encoder, prim->b, 2);
+    [encoder setBytes:dst_strides length:dims.dims * sizeof(size_m) atIndex:3];
+    [encoder setBytes:dims.strides[0] length:dims.dims * sizeof(size_m) atIndex:4];
+    [encoder setBytes:dims.strides[1] length:dims.dims * sizeof(size_m) atIndex:5];
+    [encoder setBytes:&dims.dims length:sizeof(dims.dims) atIndex:6];
+    if (dims.dims > 3) [encoder setBytes:dims.shape length:dims.dims * sizeof(size_m) atIndex:7];
+    MTLSize grid;
+    if (dims.dims == 1) grid = MTLSizeMake(dims.shape[0], 1, 1);
+    else if (dims.dims == 2) grid = MTLSizeMake(dims.shape[1], dims.shape[0], 1);
+    else if (dims.dims == 3) grid = MTLSizeMake(dims.shape[2], dims.shape[1], dims.shape[0]);
+    else {
+        size_t outer = 1;
+        for (uint32_t d = 0; d < dims.dims - 2; ++d) outer *= dims.shape[d];
+        grid = MTLSizeMake(dims.shape[dims.dims - 1], dims.shape[dims.dims - 2], outer);
+    }
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup_for_grid(grid, pipeline.maxTotalThreadsPerThreadgroup)];
+}
+
+void matrix::arcsin_backend_gpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<ArcsinPrimitive*>(output.tape);
+    auto dims = prim->collapsed_dims;
+    if (!dims.dims) { dims.dims = 1; dims.shape[0] = 1; }
+    size_m dst_strides[MAX_TENSOR_DIMS];
+    dst_strides[dims.dims - 1] = 1;
+    for (int d = int(dims.dims) - 2; d >= 0; --d)
+        dst_strides[d] = dst_strides[d + 1] * dims.shape[d + 1];
+    const int type = static_cast<int>(prim->input.type);
+    const int specialization = dims.dims > 3 ? 3 : int(dims.dims) - 1;
+    if (!GlobalGPUManager.ArcsinInit[type][specialization].load(std::memory_order_acquire))
+        GlobalGPUManager.initArcsin(type, specialization);
+    auto pipeline = GlobalGPUManager.ArcsinComputeState[type][specialization];
+    auto encoder = GlobalGPUManager.getCommandEncoder();
+    [encoder setComputePipelineState:pipeline];
+    setBufferOrBytes(encoder, output, 0);
+    setBufferOrBytes(encoder, prim->input, 1);
+    [encoder setBytes:dst_strides length:dims.dims * sizeof(size_m) atIndex:2];
+    [encoder setBytes:dims.strides[0] length:dims.dims * sizeof(size_m) atIndex:3];
+    [encoder setBytes:&dims.dims length:sizeof(dims.dims) atIndex:4];
+    if (dims.dims > 3) [encoder setBytes:dims.shape length:dims.dims * sizeof(size_m) atIndex:5];
+    MTLSize grid;
+    if (dims.dims == 1) grid = MTLSizeMake(dims.shape[0], 1, 1);
+    else if (dims.dims == 2) grid = MTLSizeMake(dims.shape[1], dims.shape[0], 1);
+    else if (dims.dims == 3) grid = MTLSizeMake(dims.shape[2], dims.shape[1], dims.shape[0]);
+    else {
+        size_t outer = 1;
+        for (uint32_t d = 0; d < dims.dims - 2; ++d) outer *= dims.shape[d];
+        grid = MTLSizeMake(dims.shape[dims.dims - 1], dims.shape[dims.dims - 2], outer);
+    }
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup_for_grid(grid, pipeline.maxTotalThreadsPerThreadgroup)];
+}
+
+void matrix::floor_backend_gpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<FloorPrimitive*>(output.tape);
+    auto dims = prim->collapsed_dims;
+    if (!dims.dims) { dims.dims = 1; dims.shape[0] = 1; }
+    const int type = static_cast<int>(prim->input.type);
+    const int specialization = dims.dims > 3 ? 3 : int(dims.dims) - 1;
+    if (!GlobalGPUManager.FloorInit[type][specialization].load(std::memory_order_acquire))
+        GlobalGPUManager.initFloor(type, specialization);
+    auto pipeline = GlobalGPUManager.FloorComputeState[type][specialization];
+    auto encoder = GlobalGPUManager.getCommandEncoder();
+    [encoder setComputePipelineState:pipeline];
+    setBufferOrBytes(encoder, output, 0);
+    setBufferOrBytes(encoder, prim->input, 1);
+    [encoder setBytes:dims.shape length:dims.dims * sizeof(size_m) atIndex:2];
+    [encoder setBytes:dims.strides[0] length:dims.dims * sizeof(size_m) atIndex:3];
+    [encoder setBytes:&dims.dims length:sizeof(dims.dims) atIndex:4];
+    MTLSize grid;
+    if (dims.dims == 1) grid = MTLSizeMake(dims.shape[0], 1, 1);
+    else if (dims.dims == 2) grid = MTLSizeMake(dims.shape[1], dims.shape[0], 1);
+    else if (dims.dims == 3) grid = MTLSizeMake(dims.shape[2], dims.shape[1], dims.shape[0]);
+    else {
+        size_t outer = 1;
+        for (uint32_t d = 0; d < dims.dims - 2; ++d) outer *= dims.shape[d];
+        grid = MTLSizeMake(dims.shape[dims.dims - 1], dims.shape[dims.dims - 2], outer);
+    }
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup_for_grid(grid, pipeline.maxTotalThreadsPerThreadgroup)];
+}
+
+void matrix::greater_backend_gpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<GreaterPrimitive*>(output.tape);
+    auto dims = prim->collapsed_dims;
+    if (!dims.dims) { dims.dims = 1; dims.shape[0] = 1; }
+    const int type = static_cast<int>(prim->a.type);
+    const int specialization = dims.dims > 3 ? 3 : int(dims.dims) - 1;
+    if (!GlobalGPUManager.GreaterInit[type][specialization].load(std::memory_order_acquire))
+        GlobalGPUManager.initGreater(type, specialization);
+    auto pipeline = GlobalGPUManager.GreaterComputeState[type][specialization];
+    auto encoder = GlobalGPUManager.getCommandEncoder();
+    [encoder setComputePipelineState:pipeline];
+    setBufferOrBytes(encoder, output, 0);
+    setBufferOrBytes(encoder, prim->a, 1);
+    setBufferOrBytes(encoder, prim->b, 2);
+    [encoder setBytes:dims.shape length:dims.dims * sizeof(size_m) atIndex:3];
+    [encoder setBytes:dims.strides[0] length:dims.dims * sizeof(size_m) atIndex:4];
+    [encoder setBytes:dims.strides[1] length:dims.dims * sizeof(size_m) atIndex:5];
+    [encoder setBytes:&dims.dims length:sizeof(dims.dims) atIndex:6];
+    MTLSize grid;
+    if (dims.dims == 1) grid = MTLSizeMake(dims.shape[0], 1, 1);
+    else if (dims.dims == 2) grid = MTLSizeMake(dims.shape[1], dims.shape[0], 1);
+    else if (dims.dims == 3) grid = MTLSizeMake(dims.shape[2], dims.shape[1], dims.shape[0]);
+    else {
+        size_t outer = 1;
+        for (uint32_t d = 0; d < dims.dims - 2; ++d) outer *= dims.shape[d];
+        grid = MTLSizeMake(dims.shape[dims.dims - 1], dims.shape[dims.dims - 2], outer);
+    }
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup_for_grid(grid, pipeline.maxTotalThreadsPerThreadgroup)];
+}
+
+void matrix::less_backend_gpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<LessPrimitive*>(output.tape);
+    auto dims = prim->collapsed_dims;
+    if (!dims.dims) { dims.dims = 1; dims.shape[0] = 1; }
+    const int type = static_cast<int>(prim->a.type);
+    const int specialization = dims.dims > 3 ? 3 : int(dims.dims) - 1;
+    if (!GlobalGPUManager.LessInit[type][specialization].load(std::memory_order_acquire))
+        GlobalGPUManager.initLess(type, specialization);
+    auto pipeline = GlobalGPUManager.LessComputeState[type][specialization];
+    auto encoder = GlobalGPUManager.getCommandEncoder();
+    [encoder setComputePipelineState:pipeline];
+    setBufferOrBytes(encoder, output, 0);
+    setBufferOrBytes(encoder, prim->a, 1);
+    setBufferOrBytes(encoder, prim->b, 2);
+    [encoder setBytes:dims.shape length:dims.dims * sizeof(size_m) atIndex:3];
+    [encoder setBytes:dims.strides[0] length:dims.dims * sizeof(size_m) atIndex:4];
+    [encoder setBytes:dims.strides[1] length:dims.dims * sizeof(size_m) atIndex:5];
+    [encoder setBytes:&dims.dims length:sizeof(dims.dims) atIndex:6];
+    MTLSize grid;
+    if (dims.dims == 1) grid = MTLSizeMake(dims.shape[0], 1, 1);
+    else if (dims.dims == 2) grid = MTLSizeMake(dims.shape[1], dims.shape[0], 1);
+    else if (dims.dims == 3) grid = MTLSizeMake(dims.shape[2], dims.shape[1], dims.shape[0]);
+    else {
+        size_t outer = 1;
+        for (uint32_t d = 0; d < dims.dims - 2; ++d) outer *= dims.shape[d];
+        grid = MTLSizeMake(dims.shape[dims.dims - 1], dims.shape[dims.dims - 2], outer);
+    }
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup_for_grid(grid, pipeline.maxTotalThreadsPerThreadgroup)];
+}
+
+void matrix::logical_and_backend_gpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<LogicalAndPrimitive*>(output.tape);
+    auto dims = prim->collapsed_dims;
+    if (!dims.dims) { dims.dims = 1; dims.shape[0] = 1; }
+    const int type = static_cast<int>(prim->a.type);
+    const int specialization = dims.dims > 3 ? 3 : int(dims.dims) - 1;
+    if (!GlobalGPUManager.LogicalAndInit[type][specialization].load(std::memory_order_acquire))
+        GlobalGPUManager.initLogicalAnd(type, specialization);
+    auto pipeline = GlobalGPUManager.LogicalAndComputeState[type][specialization];
+    auto encoder = GlobalGPUManager.getCommandEncoder();
+    [encoder setComputePipelineState:pipeline];
+    setBufferOrBytes(encoder, output, 0);
+    setBufferOrBytes(encoder, prim->a, 1);
+    setBufferOrBytes(encoder, prim->b, 2);
+    [encoder setBytes:dims.shape length:dims.dims * sizeof(size_m) atIndex:3];
+    [encoder setBytes:dims.strides[0] length:dims.dims * sizeof(size_m) atIndex:4];
+    [encoder setBytes:dims.strides[1] length:dims.dims * sizeof(size_m) atIndex:5];
+    [encoder setBytes:&dims.dims length:sizeof(dims.dims) atIndex:6];
+    MTLSize grid;
+    if (dims.dims == 1) grid = MTLSizeMake(dims.shape[0], 1, 1);
+    else if (dims.dims == 2) grid = MTLSizeMake(dims.shape[1], dims.shape[0], 1);
+    else if (dims.dims == 3) grid = MTLSizeMake(dims.shape[2], dims.shape[1], dims.shape[0]);
+    else {
+        size_t outer = 1;
+        for (uint32_t d = 0; d < dims.dims - 2; ++d) outer *= dims.shape[d];
+        grid = MTLSizeMake(dims.shape[dims.dims - 1], dims.shape[dims.dims - 2], outer);
+    }
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup_for_grid(grid, pipeline.maxTotalThreadsPerThreadgroup)];
+}
+
+void matrix::where_backend_gpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<WherePrimitive*>(output.tape);
+    auto dims = prim->collapsed_dims;
+    if (!dims.dims) { dims.dims = 1; dims.shape[0] = 1; }
+    const int type = static_cast<int>(prim->a.type);
+    const int specialization = dims.dims > 3 ? 3 : int(dims.dims) - 1;
+    if (!GlobalGPUManager.WhereInit[type][specialization].load(std::memory_order_acquire))
+        GlobalGPUManager.initWhere(type, specialization);
+    auto pipeline = GlobalGPUManager.WhereComputeState[type][specialization];
+    auto encoder = GlobalGPUManager.getCommandEncoder();
+    [encoder setComputePipelineState:pipeline];
+    setBufferOrBytes(encoder, output, 0);
+    setBufferOrBytes(encoder, prim->cond, 1);
+    setBufferOrBytes(encoder, prim->a, 2);
+    setBufferOrBytes(encoder, prim->b, 3);
+    [encoder setBytes:dims.shape length:dims.dims * sizeof(size_m) atIndex:4];
+    [encoder setBytes:dims.strides[0] length:dims.dims * sizeof(size_m) atIndex:5];
+    [encoder setBytes:dims.strides[1] length:dims.dims * sizeof(size_m) atIndex:6];
+    [encoder setBytes:dims.strides[2] length:dims.dims * sizeof(size_m) atIndex:7];
+    [encoder setBytes:&dims.dims length:sizeof(dims.dims) atIndex:8];
+    MTLSize grid;
+    if (dims.dims == 1) grid = MTLSizeMake(dims.shape[0], 1, 1);
+    else if (dims.dims == 2) grid = MTLSizeMake(dims.shape[1], dims.shape[0], 1);
+    else if (dims.dims == 3) grid = MTLSizeMake(dims.shape[2], dims.shape[1], dims.shape[0]);
+    else {
+        size_t outer = 1;
+        for (uint32_t d = 0; d < dims.dims - 2; ++d) outer *= dims.shape[d];
+        grid = MTLSizeMake(dims.shape[dims.dims - 1], dims.shape[dims.dims - 2], outer);
+    }
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup_for_grid(grid, pipeline.maxTotalThreadsPerThreadgroup)];
+}
+
+void matrix::arange_backend_gpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<ArangePrimitive*>(output.tape);
+    const int type = static_cast<int>(output.type);
+    if (!GlobalGPUManager.ArangeInit[type].load(std::memory_order_acquire)) GlobalGPUManager.initArange(type);
+    auto pipeline = GlobalGPUManager.ArangeComputeState[type];
+    auto encoder = GlobalGPUManager.getCommandEncoder();
+    [encoder setComputePipelineState:pipeline];
+    setBufferOrBytes(encoder, output, 0);
+    setBufferOrBytes(encoder, prim->start, 1);
+    setBufferOrBytes(encoder, prim->step, 2);
+    auto grid = MTLSizeMake(output.total_size, 1, 1);
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup_for_grid(grid, pipeline.maxTotalThreadsPerThreadgroup)];
+}
+
+void matrix::full_backend_gpu(matrix& output) {
+    if (!output.total_size) return;
+    auto* prim = static_cast<FullPrimitive*>(output.tape);
+    auto dims = prim->collapsed_dims;
+    if (!dims.dims) { dims.dims = 1; dims.shape[0] = 1; }
+    const int type = static_cast<int>(prim->value.type);
+    const int specialization = dims.dims > 3 ? 3 : int(dims.dims) - 1;
+    if (!GlobalGPUManager.FullInit[type][specialization].load(std::memory_order_acquire))
+        GlobalGPUManager.initFull(type, specialization);
+    auto pipeline = GlobalGPUManager.FullComputeState[type][specialization];
+    auto encoder = GlobalGPUManager.getCommandEncoder();
+    [encoder setComputePipelineState:pipeline];
+    setBufferOrBytes(encoder, output, 0);
+    setBufferOrBytes(encoder, prim->value, 1);
+    [encoder setBytes:dims.shape length:dims.dims * sizeof(size_m) atIndex:2];
+    [encoder setBytes:dims.strides[0] length:dims.dims * sizeof(size_m) atIndex:3];
+    [encoder setBytes:&dims.dims length:sizeof(dims.dims) atIndex:4];
+    MTLSize grid;
+    if (dims.dims == 1) grid = MTLSizeMake(dims.shape[0], 1, 1);
+    else if (dims.dims == 2) grid = MTLSizeMake(dims.shape[1], dims.shape[0], 1);
+    else if (dims.dims == 3) grid = MTLSizeMake(dims.shape[2], dims.shape[1], dims.shape[0]);
+    else {
+        size_t outer = 1;
+        for (uint32_t d = 0; d < dims.dims - 2; ++d) outer *= dims.shape[d];
+        grid = MTLSizeMake(dims.shape[dims.dims - 1], dims.shape[dims.dims - 2], outer);
+    }
+    [encoder dispatchThreads:grid threadsPerThreadgroup:threadgroup_for_grid(grid, pipeline.maxTotalThreadsPerThreadgroup)];
 }
 
 matrix matrix::equal(const matrix& a, const matrix& b) {

@@ -6610,6 +6610,977 @@ public:
     matrix& input_at(uint32_t i) override { return inputs[i]; }
 };
 
+// A collapsed iteration descriptor cached directly on each operation's primitive.
+struct ElementwiseDims {
+    size_m shape[MAX_TENSOR_DIMS]{};
+    size_m strides[3][MAX_TENSOR_DIMS]{};
+    uint32_t dims = 0;
+};
+
+// arctan2: owns its graph lifecycle and dispatches its own CPU and Metal backends.
+class Arctan2Primitive : public Primitive {
+public:
+    matrix a;
+    matrix b;
+    ElementwiseDims collapsed_dims;
+    std::vector<size_m> output_shape;
+    Arctan2Primitive(const std::vector<matrix>& ins, const std::vector<size_m>& shape)
+        : a(ensure_graph_ready(ins[0])), b(ensure_graph_ready(ins[1])), output_shape(shape) {}
+
+    void eval_cpu(matrix& out, EvalType t) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_cpu(a, t); }
+        a.update_from_trace();
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_cpu(b, t); }
+        b.update_from_trace();
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                begin_output_refcount(out);
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        matrix::arctan2_backend_cpu(out);
+    }
+
+    void eval_metal(matrix& out, EvalType t) override {
+        // Empty outputs require no input data and cannot have a Metal wrapper.
+        if (out.total_size) {
+            if (a.tape && !a.tape->evaluated) {
+                a.tape->eval_metal(a, t); a.update_from_trace();
+            } else { a.update_from_trace(); ensure_metal_buffer(a); }
+            if (b.tape && !b.tape->evaluated) {
+                b.tape->eval_metal(b, t); b.update_from_trace();
+            } else { b.update_from_trace(); ensure_metal_buffer(b); }
+        }
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.total_size ? out.effectiveBufferSize() * dtype_size(out.type) : 0];
+                begin_output_refcount(out);
+                if (out.total_size) out.buildMetalBuffer();
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // CPU -> Metal rerun: build/adopt the wrapper during COMPILE, never EXECUTE.
+        if (out.total_size && !out_metal_buffer) {
+            out.buildMetalBuffer(); out_metal_buffer = out.metalBuffer;
+        } else if (out.total_size && !out.metalBuffer) {
+            out.metalBuffer = out_metal_buffer;
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        if (out.total_size) matrix::arctan2_backend_gpu(out);
+    }
+
+    std::vector<matrix> vjp(matrix& g) override {
+        matrix den = a * a + b * b;
+        return {(g * b / den).unbroadcast_shape(a.shape(), a.dims),
+                (g * (a * -1.0f) / den).unbroadcast_shape(b.shape(), b.dims)};
+    }
+    matrix jvp(std::vector<matrix>& t) override { return (b * t[0] - a * t[1]) / (a * a + b * b); }
+
+    bool invalidate_pass(uint64_t id) override {
+        if (last_visited_pass_id == id) return !evaluated;
+        last_visited_pass_id = id;
+        bool inv = false;
+        uint64_t new_version = version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(id)) inv = true;
+            if (a.tape->version > version) inv = true;
+            new_version = std::max(new_version, a.tape->version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(id)) inv = true;
+            if (b.tape->version > version) inv = true;
+            new_version = std::max(new_version, b.tape->version);
+        }
+        if (inv) { evaluated = false; version = new_version; }
+        return inv;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (a.tape) a.tape->clear_trace_checks();
+        if (b.tape) b.tape->clear_trace_checks();
+    }
+    matrix vmap(std::function<matrix(const matrix&)>, std::vector<int>) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {a, b}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override {
+        if (i == 0) return a;
+        if (i == 1) return b;
+        throw std::out_of_range("Arctan2Primitive input index");
+    }
+};
+
+// arcsin: owns its graph lifecycle and dispatches its own CPU and Metal backends.
+class ArcsinPrimitive : public Primitive {
+public:
+    matrix input;
+    ElementwiseDims collapsed_dims;
+    std::vector<size_m> output_shape;
+    ArcsinPrimitive(const std::vector<matrix>& ins, const std::vector<size_m>& shape)
+        : input(ensure_graph_ready(ins[0])), output_shape(shape) {}
+
+    void eval_cpu(matrix& out, EvalType t) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, t); }
+        input.update_from_trace();
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                begin_output_refcount(out);
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        matrix::arcsin_backend_cpu(out);
+    }
+
+    void eval_metal(matrix& out, EvalType t) override {
+        // Empty outputs require no input data and cannot have a Metal wrapper.
+        if (out.total_size) {
+            if (input.tape && !input.tape->evaluated) {
+                input.tape->eval_metal(input, t); input.update_from_trace();
+            } else { input.update_from_trace(); ensure_metal_buffer(input); }
+        }
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.total_size ? out.effectiveBufferSize() * dtype_size(out.type) : 0];
+                begin_output_refcount(out);
+                if (out.total_size) out.buildMetalBuffer();
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // CPU -> Metal rerun: build/adopt the wrapper during COMPILE, never EXECUTE.
+        if (out.total_size && !out_metal_buffer) {
+            out.buildMetalBuffer(); out_metal_buffer = out.metalBuffer;
+        } else if (out.total_size && !out.metalBuffer) {
+            out.metalBuffer = out_metal_buffer;
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        if (out.total_size) matrix::arcsin_backend_gpu(out);
+    }
+
+    std::vector<matrix> vjp(matrix& g) override { return {g / matrix::sqrt(1.0f - input * input)}; }
+    matrix jvp(std::vector<matrix>& t) override { return t[0] / matrix::sqrt(1.0f - input * input); }
+
+    bool invalidate_pass(uint64_t id) override {
+        if (last_visited_pass_id == id) return !evaluated;
+        last_visited_pass_id = id;
+        bool inv = false;
+        uint64_t new_version = version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(id)) inv = true;
+            if (input.tape->version > version) inv = true;
+            new_version = std::max(new_version, input.tape->version);
+        }
+        if (inv) { evaluated = false; version = new_version; }
+        return inv;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (input.tape) input.tape->clear_trace_checks();
+    }
+    matrix vmap(std::function<matrix(const matrix&)>, std::vector<int>) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {input}; }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t) override { return input; }
+};
+
+// floor: owns its graph lifecycle and dispatches its own CPU and Metal backends.
+class FloorPrimitive : public Primitive {
+public:
+    matrix input;
+    ElementwiseDims collapsed_dims;
+    std::vector<size_m> output_shape;
+    FloorPrimitive(const std::vector<matrix>& ins, const std::vector<size_m>& shape)
+        : input(ensure_graph_ready(ins[0])), output_shape(shape) {}
+
+    void eval_cpu(matrix& out, EvalType t) override {
+        if (input.tape && !input.tape->evaluated) { input.tape->eval_cpu(input, t); }
+        input.update_from_trace();
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                begin_output_refcount(out);
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        matrix::floor_backend_cpu(out);
+    }
+
+    void eval_metal(matrix& out, EvalType t) override {
+        // Empty outputs require no input data and cannot have a Metal wrapper.
+        if (out.total_size) {
+            if (input.tape && !input.tape->evaluated) {
+                input.tape->eval_metal(input, t); input.update_from_trace();
+            } else { input.update_from_trace(); ensure_metal_buffer(input); }
+        }
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.total_size ? out.effectiveBufferSize() * dtype_size(out.type) : 0];
+                begin_output_refcount(out);
+                if (out.total_size) out.buildMetalBuffer();
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // CPU -> Metal rerun: build/adopt the wrapper during COMPILE, never EXECUTE.
+        if (out.total_size && !out_metal_buffer) {
+            out.buildMetalBuffer(); out_metal_buffer = out.metalBuffer;
+        } else if (out.total_size && !out.metalBuffer) {
+            out.metalBuffer = out_metal_buffer;
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        if (out.total_size) matrix::floor_backend_gpu(out);
+    }
+
+    std::vector<matrix> vjp(matrix&) override { return {matrix::zeros(std::vector<size_m>(input.shape(), input.shape() + input.dims), dtype::Float)}; }
+    matrix jvp(std::vector<matrix>&) override { return matrix::zeros(output_shape, dtype::Float); }
+
+    bool invalidate_pass(uint64_t id) override {
+        if (last_visited_pass_id == id) return !evaluated;
+        last_visited_pass_id = id;
+        bool inv = false;
+        uint64_t new_version = version;
+        if (input.tape) {
+            if (input.tape->invalidate_pass(id)) inv = true;
+            if (input.tape->version > version) inv = true;
+            new_version = std::max(new_version, input.tape->version);
+        }
+        if (inv) { evaluated = false; version = new_version; }
+        return inv;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (input.tape) input.tape->clear_trace_checks();
+    }
+    matrix vmap(std::function<matrix(const matrix&)>, std::vector<int>) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {input}; }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t) override { return input; }
+};
+
+// greater: owns its graph lifecycle and dispatches its own CPU and Metal backends.
+class GreaterPrimitive : public Primitive {
+public:
+    matrix a;
+    matrix b;
+    ElementwiseDims collapsed_dims;
+    std::vector<size_m> output_shape;
+    GreaterPrimitive(const std::vector<matrix>& ins, const std::vector<size_m>& shape)
+        : a(ensure_graph_ready(ins[0])), b(ensure_graph_ready(ins[1])), output_shape(shape) {}
+
+    void eval_cpu(matrix& out, EvalType t) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_cpu(a, t); }
+        a.update_from_trace();
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_cpu(b, t); }
+        b.update_from_trace();
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                begin_output_refcount(out);
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        matrix::greater_backend_cpu(out);
+    }
+
+    void eval_metal(matrix& out, EvalType t) override {
+        // Empty outputs require no input data and cannot have a Metal wrapper.
+        if (out.total_size) {
+            if (a.tape && !a.tape->evaluated) {
+                a.tape->eval_metal(a, t); a.update_from_trace();
+            } else { a.update_from_trace(); ensure_metal_buffer(a); }
+            if (b.tape && !b.tape->evaluated) {
+                b.tape->eval_metal(b, t); b.update_from_trace();
+            } else { b.update_from_trace(); ensure_metal_buffer(b); }
+        }
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.total_size ? out.effectiveBufferSize() * dtype_size(out.type) : 0];
+                begin_output_refcount(out);
+                if (out.total_size) out.buildMetalBuffer();
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // CPU -> Metal rerun: build/adopt the wrapper during COMPILE, never EXECUTE.
+        if (out.total_size && !out_metal_buffer) {
+            out.buildMetalBuffer(); out_metal_buffer = out.metalBuffer;
+        } else if (out.total_size && !out.metalBuffer) {
+            out.metalBuffer = out_metal_buffer;
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        if (out.total_size) matrix::greater_backend_gpu(out);
+    }
+
+    std::vector<matrix> vjp(matrix&) override { return {matrix::zeros(std::vector<size_m>(a.shape(), a.shape() + a.dims), dtype::Float), matrix::zeros(std::vector<size_m>(b.shape(), b.shape() + b.dims), dtype::Float)}; }
+    matrix jvp(std::vector<matrix>&) override { return matrix::zeros(output_shape, dtype::Float); }
+
+    bool invalidate_pass(uint64_t id) override {
+        if (last_visited_pass_id == id) return !evaluated;
+        last_visited_pass_id = id;
+        bool inv = false;
+        uint64_t new_version = version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(id)) inv = true;
+            if (a.tape->version > version) inv = true;
+            new_version = std::max(new_version, a.tape->version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(id)) inv = true;
+            if (b.tape->version > version) inv = true;
+            new_version = std::max(new_version, b.tape->version);
+        }
+        if (inv) { evaluated = false; version = new_version; }
+        return inv;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (a.tape) a.tape->clear_trace_checks();
+        if (b.tape) b.tape->clear_trace_checks();
+    }
+    matrix vmap(std::function<matrix(const matrix&)>, std::vector<int>) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {a, b}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override {
+        if (i == 0) return a;
+        if (i == 1) return b;
+        throw std::out_of_range("GreaterPrimitive input index");
+    }
+};
+
+// less: owns its graph lifecycle and dispatches its own CPU and Metal backends.
+class LessPrimitive : public Primitive {
+public:
+    matrix a;
+    matrix b;
+    ElementwiseDims collapsed_dims;
+    std::vector<size_m> output_shape;
+    LessPrimitive(const std::vector<matrix>& ins, const std::vector<size_m>& shape)
+        : a(ensure_graph_ready(ins[0])), b(ensure_graph_ready(ins[1])), output_shape(shape) {}
+
+    void eval_cpu(matrix& out, EvalType t) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_cpu(a, t); }
+        a.update_from_trace();
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_cpu(b, t); }
+        b.update_from_trace();
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                begin_output_refcount(out);
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        matrix::less_backend_cpu(out);
+    }
+
+    void eval_metal(matrix& out, EvalType t) override {
+        // Empty outputs require no input data and cannot have a Metal wrapper.
+        if (out.total_size) {
+            if (a.tape && !a.tape->evaluated) {
+                a.tape->eval_metal(a, t); a.update_from_trace();
+            } else { a.update_from_trace(); ensure_metal_buffer(a); }
+            if (b.tape && !b.tape->evaluated) {
+                b.tape->eval_metal(b, t); b.update_from_trace();
+            } else { b.update_from_trace(); ensure_metal_buffer(b); }
+        }
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.total_size ? out.effectiveBufferSize() * dtype_size(out.type) : 0];
+                begin_output_refcount(out);
+                if (out.total_size) out.buildMetalBuffer();
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // CPU -> Metal rerun: build/adopt the wrapper during COMPILE, never EXECUTE.
+        if (out.total_size && !out_metal_buffer) {
+            out.buildMetalBuffer(); out_metal_buffer = out.metalBuffer;
+        } else if (out.total_size && !out.metalBuffer) {
+            out.metalBuffer = out_metal_buffer;
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        if (out.total_size) matrix::less_backend_gpu(out);
+    }
+
+    std::vector<matrix> vjp(matrix&) override { return {matrix::zeros(std::vector<size_m>(a.shape(), a.shape() + a.dims), dtype::Float), matrix::zeros(std::vector<size_m>(b.shape(), b.shape() + b.dims), dtype::Float)}; }
+    matrix jvp(std::vector<matrix>&) override { return matrix::zeros(output_shape, dtype::Float); }
+
+    bool invalidate_pass(uint64_t id) override {
+        if (last_visited_pass_id == id) return !evaluated;
+        last_visited_pass_id = id;
+        bool inv = false;
+        uint64_t new_version = version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(id)) inv = true;
+            if (a.tape->version > version) inv = true;
+            new_version = std::max(new_version, a.tape->version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(id)) inv = true;
+            if (b.tape->version > version) inv = true;
+            new_version = std::max(new_version, b.tape->version);
+        }
+        if (inv) { evaluated = false; version = new_version; }
+        return inv;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (a.tape) a.tape->clear_trace_checks();
+        if (b.tape) b.tape->clear_trace_checks();
+    }
+    matrix vmap(std::function<matrix(const matrix&)>, std::vector<int>) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {a, b}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override {
+        if (i == 0) return a;
+        if (i == 1) return b;
+        throw std::out_of_range("LessPrimitive input index");
+    }
+};
+
+// logical_and: owns its graph lifecycle and dispatches its own CPU and Metal backends.
+class LogicalAndPrimitive : public Primitive {
+public:
+    matrix a;
+    matrix b;
+    ElementwiseDims collapsed_dims;
+    std::vector<size_m> output_shape;
+    LogicalAndPrimitive(const std::vector<matrix>& ins, const std::vector<size_m>& shape)
+        : a(ensure_graph_ready(ins[0])), b(ensure_graph_ready(ins[1])), output_shape(shape) {}
+
+    void eval_cpu(matrix& out, EvalType t) override {
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_cpu(a, t); }
+        a.update_from_trace();
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_cpu(b, t); }
+        b.update_from_trace();
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                begin_output_refcount(out);
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        matrix::logical_and_backend_cpu(out);
+    }
+
+    void eval_metal(matrix& out, EvalType t) override {
+        // Empty outputs require no input data and cannot have a Metal wrapper.
+        if (out.total_size) {
+            if (a.tape && !a.tape->evaluated) {
+                a.tape->eval_metal(a, t); a.update_from_trace();
+            } else { a.update_from_trace(); ensure_metal_buffer(a); }
+            if (b.tape && !b.tape->evaluated) {
+                b.tape->eval_metal(b, t); b.update_from_trace();
+            } else { b.update_from_trace(); ensure_metal_buffer(b); }
+        }
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.total_size ? out.effectiveBufferSize() * dtype_size(out.type) : 0];
+                begin_output_refcount(out);
+                if (out.total_size) out.buildMetalBuffer();
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // CPU -> Metal rerun: build/adopt the wrapper during COMPILE, never EXECUTE.
+        if (out.total_size && !out_metal_buffer) {
+            out.buildMetalBuffer(); out_metal_buffer = out.metalBuffer;
+        } else if (out.total_size && !out.metalBuffer) {
+            out.metalBuffer = out_metal_buffer;
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        if (out.total_size) matrix::logical_and_backend_gpu(out);
+    }
+
+    std::vector<matrix> vjp(matrix&) override { return {matrix::zeros(std::vector<size_m>(a.shape(), a.shape() + a.dims), dtype::Float), matrix::zeros(std::vector<size_m>(b.shape(), b.shape() + b.dims), dtype::Float)}; }
+    matrix jvp(std::vector<matrix>&) override { return matrix::zeros(output_shape, dtype::Float); }
+
+    bool invalidate_pass(uint64_t id) override {
+        if (last_visited_pass_id == id) return !evaluated;
+        last_visited_pass_id = id;
+        bool inv = false;
+        uint64_t new_version = version;
+        if (a.tape) {
+            if (a.tape->invalidate_pass(id)) inv = true;
+            if (a.tape->version > version) inv = true;
+            new_version = std::max(new_version, a.tape->version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(id)) inv = true;
+            if (b.tape->version > version) inv = true;
+            new_version = std::max(new_version, b.tape->version);
+        }
+        if (inv) { evaluated = false; version = new_version; }
+        return inv;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (a.tape) a.tape->clear_trace_checks();
+        if (b.tape) b.tape->clear_trace_checks();
+    }
+    matrix vmap(std::function<matrix(const matrix&)>, std::vector<int>) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {a, b}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override {
+        if (i == 0) return a;
+        if (i == 1) return b;
+        throw std::out_of_range("LogicalAndPrimitive input index");
+    }
+};
+
+// where: owns its graph lifecycle and dispatches its own CPU and Metal backends.
+class WherePrimitive : public Primitive {
+public:
+    matrix cond;
+    matrix a;
+    matrix b;
+    ElementwiseDims collapsed_dims;
+    std::vector<size_m> output_shape;
+    WherePrimitive(const std::vector<matrix>& ins, const std::vector<size_m>& shape)
+        : cond(ensure_graph_ready(ins[0])), a(ensure_graph_ready(ins[1])), b(ensure_graph_ready(ins[2])), output_shape(shape) {}
+
+    void eval_cpu(matrix& out, EvalType t) override {
+        if (cond.tape && !cond.tape->evaluated) { cond.tape->eval_cpu(cond, t); }
+        cond.update_from_trace();
+        if (a.tape && !a.tape->evaluated) { a.tape->eval_cpu(a, t); }
+        a.update_from_trace();
+        if (b.tape && !b.tape->evaluated) { b.tape->eval_cpu(b, t); }
+        b.update_from_trace();
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                begin_output_refcount(out);
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        matrix::where_backend_cpu(out);
+    }
+
+    void eval_metal(matrix& out, EvalType t) override {
+        // Empty outputs require no input data and cannot have a Metal wrapper.
+        if (out.total_size) {
+            if (cond.tape && !cond.tape->evaluated) {
+                cond.tape->eval_metal(cond, t); cond.update_from_trace();
+            } else { cond.update_from_trace(); ensure_metal_buffer(cond); }
+            if (a.tape && !a.tape->evaluated) {
+                a.tape->eval_metal(a, t); a.update_from_trace();
+            } else { a.update_from_trace(); ensure_metal_buffer(a); }
+            if (b.tape && !b.tape->evaluated) {
+                b.tape->eval_metal(b, t); b.update_from_trace();
+            } else { b.update_from_trace(); ensure_metal_buffer(b); }
+        }
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.total_size ? out.effectiveBufferSize() * dtype_size(out.type) : 0];
+                begin_output_refcount(out);
+                if (out.total_size) out.buildMetalBuffer();
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // CPU -> Metal rerun: build/adopt the wrapper during COMPILE, never EXECUTE.
+        if (out.total_size && !out_metal_buffer) {
+            out.buildMetalBuffer(); out_metal_buffer = out.metalBuffer;
+        } else if (out.total_size && !out.metalBuffer) {
+            out.metalBuffer = out_metal_buffer;
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        if (out.total_size) matrix::where_backend_gpu(out);
+    }
+
+    std::vector<matrix> vjp(matrix& g) override {
+        matrix zero = matrix::scalar(0, g.type);
+        return {matrix::zeros(std::vector<size_m>(cond.shape(), cond.shape() + cond.dims), dtype::Float),
+                matrix::where(cond, g, zero).unbroadcast_shape(a.shape(), a.dims),
+                matrix::where(cond, zero, g).unbroadcast_shape(b.shape(), b.dims)};
+    }
+    matrix jvp(std::vector<matrix>& t) override { return matrix::where(cond, t[1], t[2]); }
+
+    bool invalidate_pass(uint64_t id) override {
+        if (last_visited_pass_id == id) return !evaluated;
+        last_visited_pass_id = id;
+        bool inv = false;
+        uint64_t new_version = version;
+        if (cond.tape) {
+            if (cond.tape->invalidate_pass(id)) inv = true;
+            if (cond.tape->version > version) inv = true;
+            new_version = std::max(new_version, cond.tape->version);
+        }
+        if (a.tape) {
+            if (a.tape->invalidate_pass(id)) inv = true;
+            if (a.tape->version > version) inv = true;
+            new_version = std::max(new_version, a.tape->version);
+        }
+        if (b.tape) {
+            if (b.tape->invalidate_pass(id)) inv = true;
+            if (b.tape->version > version) inv = true;
+            new_version = std::max(new_version, b.tape->version);
+        }
+        if (inv) { evaluated = false; version = new_version; }
+        return inv;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (cond.tape) cond.tape->clear_trace_checks();
+        if (a.tape) a.tape->clear_trace_checks();
+        if (b.tape) b.tape->clear_trace_checks();
+    }
+    matrix vmap(std::function<matrix(const matrix&)>, std::vector<int>) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {cond, a, b}; }
+    uint32_t num_inputs() const override { return 3; }
+    matrix& input_at(uint32_t i) override {
+        if (i == 0) return cond;
+        if (i == 1) return a;
+        if (i == 2) return b;
+        throw std::out_of_range("WherePrimitive input index");
+    }
+};
+
+// arange: owns its graph lifecycle and dispatches its own CPU and Metal backends.
+class ArangePrimitive : public Primitive {
+public:
+    matrix start;
+    matrix step;
+    ElementwiseDims collapsed_dims;
+    std::vector<size_m> output_shape;
+    ArangePrimitive(const std::vector<matrix>& ins, const std::vector<size_m>& shape)
+        : start(ensure_graph_ready(ins[0])), step(ensure_graph_ready(ins[1])), output_shape(shape) {}
+
+    void eval_cpu(matrix& out, EvalType t) override {
+        if (start.tape && !start.tape->evaluated) { start.tape->eval_cpu(start, t); }
+        start.update_from_trace();
+        if (step.tape && !step.tape->evaluated) { step.tape->eval_cpu(step, t); }
+        step.update_from_trace();
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                begin_output_refcount(out);
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        matrix::arange_backend_cpu(out);
+    }
+
+    void eval_metal(matrix& out, EvalType t) override {
+        // Empty outputs require no input data and cannot have a Metal wrapper.
+        if (out.total_size) {
+            if (start.tape && !start.tape->evaluated) {
+                start.tape->eval_metal(start, t); start.update_from_trace();
+            } else { start.update_from_trace(); ensure_metal_buffer(start); }
+            if (step.tape && !step.tape->evaluated) {
+                step.tape->eval_metal(step, t); step.update_from_trace();
+            } else { step.update_from_trace(); ensure_metal_buffer(step); }
+        }
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.total_size ? out.effectiveBufferSize() * dtype_size(out.type) : 0];
+                begin_output_refcount(out);
+                if (out.total_size) out.buildMetalBuffer();
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // CPU -> Metal rerun: build/adopt the wrapper during COMPILE, never EXECUTE.
+        if (out.total_size && !out_metal_buffer) {
+            out.buildMetalBuffer(); out_metal_buffer = out.metalBuffer;
+        } else if (out.total_size && !out.metalBuffer) {
+            out.metalBuffer = out_metal_buffer;
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        if (out.total_size) matrix::arange_backend_gpu(out);
+    }
+
+    std::vector<matrix> vjp(matrix&) override { return {matrix::zeros(std::vector<size_m>(start.shape(), start.shape() + start.dims), dtype::Float), matrix::zeros(std::vector<size_m>(step.shape(), step.shape() + step.dims), dtype::Float)}; }
+    matrix jvp(std::vector<matrix>&) override { return matrix::zeros(output_shape, dtype::Float); }
+
+    bool invalidate_pass(uint64_t id) override {
+        if (last_visited_pass_id == id) return !evaluated;
+        last_visited_pass_id = id;
+        bool inv = false;
+        uint64_t new_version = version;
+        if (start.tape) {
+            if (start.tape->invalidate_pass(id)) inv = true;
+            if (start.tape->version > version) inv = true;
+            new_version = std::max(new_version, start.tape->version);
+        }
+        if (step.tape) {
+            if (step.tape->invalidate_pass(id)) inv = true;
+            if (step.tape->version > version) inv = true;
+            new_version = std::max(new_version, step.tape->version);
+        }
+        if (inv) { evaluated = false; version = new_version; }
+        return inv;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (start.tape) start.tape->clear_trace_checks();
+        if (step.tape) step.tape->clear_trace_checks();
+    }
+    matrix vmap(std::function<matrix(const matrix&)>, std::vector<int>) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {start, step}; }
+    uint32_t num_inputs() const override { return 2; }
+    matrix& input_at(uint32_t i) override {
+        if (i == 0) return start;
+        if (i == 1) return step;
+        throw std::out_of_range("ArangePrimitive input index");
+    }
+};
+
+// full: owns its graph lifecycle and dispatches its own CPU and Metal backends.
+class FullPrimitive : public Primitive {
+public:
+    matrix value;
+    ElementwiseDims collapsed_dims;
+    std::vector<size_m> output_shape;
+    FullPrimitive(const std::vector<matrix>& ins, const std::vector<size_m>& shape)
+        : value(ensure_graph_ready(ins[0])), output_shape(shape) {}
+
+    void eval_cpu(matrix& out, EvalType t) override {
+        if (value.tape && !value.tape->evaluated) { value.tape->eval_cpu(value, t); }
+        value.update_from_trace();
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.effectiveBufferSize() * dtype_size(out.type)];
+                begin_output_refcount(out);
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        matrix::full_backend_cpu(out);
+    }
+
+    void eval_metal(matrix& out, EvalType t) override {
+        // Empty outputs require no input data and cannot have a Metal wrapper.
+        if (out.total_size) {
+            if (value.tape && !value.tape->evaluated) {
+                value.tape->eval_metal(value, t); value.update_from_trace();
+            } else { value.update_from_trace(); ensure_metal_buffer(value); }
+        }
+        if (!out.buffer) {
+            if (out_buffer) {
+                out.buffer = out_buffer;
+                out.metalBuffer = out_metal_buffer;
+                out.refCount = out_refcount;
+                out.refCount->fetch_add(1);
+            } else {
+                out.buffer = new uint8_t[out.total_size ? out.effectiveBufferSize() * dtype_size(out.type) : 0];
+                begin_output_refcount(out);
+                if (out.total_size) out.buildMetalBuffer();
+                out_buffer = static_cast<uint8_t*>(out.buffer);
+                out_metal_buffer = out.metalBuffer;
+                out_refcount = out.refCount;
+                out_refcount->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // CPU -> Metal rerun: build/adopt the wrapper during COMPILE, never EXECUTE.
+        if (out.total_size && !out_metal_buffer) {
+            out.buildMetalBuffer(); out_metal_buffer = out.metalBuffer;
+        } else if (out.total_size && !out.metalBuffer) {
+            out.metalBuffer = out_metal_buffer;
+        }
+        if (t == EvalType::COMPILE_TRACE) return;
+        if (evaluated) return;
+        evaluated = true;
+        if (out.total_size) matrix::full_backend_gpu(out);
+    }
+
+    std::vector<matrix> vjp(matrix& g) override { return {g.unbroadcast_shape(value.shape(), value.dims)}; }
+    matrix jvp(std::vector<matrix>& t) override { return matrix::full(output_shape, t[0], t[0].type); }
+
+    bool invalidate_pass(uint64_t id) override {
+        if (last_visited_pass_id == id) return !evaluated;
+        last_visited_pass_id = id;
+        bool inv = false;
+        uint64_t new_version = version;
+        if (value.tape) {
+            if (value.tape->invalidate_pass(id)) inv = true;
+            if (value.tape->version > version) inv = true;
+            new_version = std::max(new_version, value.tape->version);
+        }
+        if (inv) { evaluated = false; version = new_version; }
+        return inv;
+    }
+    void clear_trace_checks() override {
+        evaluated = false;
+        if (value.tape) value.tape->clear_trace_checks();
+    }
+    matrix vmap(std::function<matrix(const matrix&)>, std::vector<int>) override { return matrix(0, dtype::UInt8); }
+    std::vector<matrix> get_inputs() override { return {value}; }
+    uint32_t num_inputs() const override { return 1; }
+    matrix& input_at(uint32_t) override { return value; }
+};
+
 class ArgMaxPrimitive : public Primitive {
 public:
     matrix input;

@@ -8,6 +8,7 @@
 #include <string>
 #include <utility>
 #include <mutex>
+#include <atomic>
 #include <stdexcept>
 
 //@import std_string;
@@ -42,7 +43,134 @@ public:
         }
         return f;
     }
-    
+
+    std::atomic<bool> Arctan2Init[kGPUDtypeSlots][4]{};
+    id<MTLComputePipelineState> Arctan2ComputeState[kGPUDtypeSlots][4] = {};
+    std::mutex Arctan2InitMutex;
+    void initArctan2(int type, int specialization) {
+        std::lock_guard<std::mutex> lock(Arctan2InitMutex);
+        if (Arctan2Init[type][specialization].load(std::memory_order_relaxed)) return;
+        NSError* error = nil;
+        id<MTLFunction> function = requireFunction([NSString stringWithFormat:@"Arctan2GPU_nd_%d_%d", type, specialization]);
+        auto state = [metalDevice newComputePipelineStateWithFunction:function error:&error];
+        if (!state) throw std::runtime_error(error ? error.localizedDescription.UTF8String : "Arctan2 Metal pipeline creation failed");
+        Arctan2ComputeState[type][specialization] = state;
+        Arctan2Init[type][specialization].store(true, std::memory_order_release);
+    }
+
+    std::atomic<bool> ArcsinInit[kGPUDtypeSlots][4]{};
+    id<MTLComputePipelineState> ArcsinComputeState[kGPUDtypeSlots][4] = {};
+    std::mutex ArcsinInitMutex;
+    void initArcsin(int type, int specialization) {
+        std::lock_guard<std::mutex> lock(ArcsinInitMutex);
+        if (ArcsinInit[type][specialization].load(std::memory_order_relaxed)) return;
+        NSError* error = nil;
+        id<MTLFunction> function = requireFunction([NSString stringWithFormat:@"ArcsinGPU_nd_%d_%d", type, specialization]);
+        auto state = [metalDevice newComputePipelineStateWithFunction:function error:&error];
+        if (!state) throw std::runtime_error(error ? error.localizedDescription.UTF8String : "Arcsin Metal pipeline creation failed");
+        ArcsinComputeState[type][specialization] = state;
+        ArcsinInit[type][specialization].store(true, std::memory_order_release);
+    }
+
+    std::atomic<bool> FloorInit[kGPUDtypeSlots][4]{};
+    id<MTLComputePipelineState> FloorComputeState[kGPUDtypeSlots][4] = {};
+    std::mutex FloorInitMutex;
+    void initFloor(int type, int specialization) {
+        std::lock_guard<std::mutex> lock(FloorInitMutex);
+        if (FloorInit[type][specialization].load(std::memory_order_relaxed)) return;
+        NSError* error = nil;
+        id<MTLFunction> function = requireFunction([NSString stringWithFormat:@"FloorGPU_%d_%d", type, specialization]);
+        auto state = [metalDevice newComputePipelineStateWithFunction:function error:&error];
+        if (!state) throw std::runtime_error(error ? error.localizedDescription.UTF8String : "Floor Metal pipeline creation failed");
+        FloorComputeState[type][specialization] = state;
+        FloorInit[type][specialization].store(true, std::memory_order_release);
+    }
+
+    std::atomic<bool> GreaterInit[kGPUDtypeSlots][4]{};
+    id<MTLComputePipelineState> GreaterComputeState[kGPUDtypeSlots][4] = {};
+    std::mutex GreaterInitMutex;
+    void initGreater(int type, int specialization) {
+        std::lock_guard<std::mutex> lock(GreaterInitMutex);
+        if (GreaterInit[type][specialization].load(std::memory_order_relaxed)) return;
+        NSError* error = nil;
+        id<MTLFunction> function = requireFunction([NSString stringWithFormat:@"GreaterGPU_%d_%d", type, specialization]);
+        auto state = [metalDevice newComputePipelineStateWithFunction:function error:&error];
+        if (!state) throw std::runtime_error(error ? error.localizedDescription.UTF8String : "Greater Metal pipeline creation failed");
+        GreaterComputeState[type][specialization] = state;
+        GreaterInit[type][specialization].store(true, std::memory_order_release);
+    }
+
+    std::atomic<bool> LessInit[kGPUDtypeSlots][4]{};
+    id<MTLComputePipelineState> LessComputeState[kGPUDtypeSlots][4] = {};
+    std::mutex LessInitMutex;
+    void initLess(int type, int specialization) {
+        std::lock_guard<std::mutex> lock(LessInitMutex);
+        if (LessInit[type][specialization].load(std::memory_order_relaxed)) return;
+        NSError* error = nil;
+        id<MTLFunction> function = requireFunction([NSString stringWithFormat:@"LessGPU_%d_%d", type, specialization]);
+        auto state = [metalDevice newComputePipelineStateWithFunction:function error:&error];
+        if (!state) throw std::runtime_error(error ? error.localizedDescription.UTF8String : "Less Metal pipeline creation failed");
+        LessComputeState[type][specialization] = state;
+        LessInit[type][specialization].store(true, std::memory_order_release);
+    }
+
+    std::atomic<bool> LogicalAndInit[kGPUDtypeSlots][4]{};
+    id<MTLComputePipelineState> LogicalAndComputeState[kGPUDtypeSlots][4] = {};
+    std::mutex LogicalAndInitMutex;
+    void initLogicalAnd(int type, int specialization) {
+        std::lock_guard<std::mutex> lock(LogicalAndInitMutex);
+        if (LogicalAndInit[type][specialization].load(std::memory_order_relaxed)) return;
+        NSError* error = nil;
+        id<MTLFunction> function = requireFunction([NSString stringWithFormat:@"LogicalAndGPU_%d_%d", type, specialization]);
+        auto state = [metalDevice newComputePipelineStateWithFunction:function error:&error];
+        if (!state) throw std::runtime_error(error ? error.localizedDescription.UTF8String : "LogicalAnd Metal pipeline creation failed");
+        LogicalAndComputeState[type][specialization] = state;
+        LogicalAndInit[type][specialization].store(true, std::memory_order_release);
+    }
+
+    std::atomic<bool> WhereInit[kGPUDtypeSlots][4]{};
+    id<MTLComputePipelineState> WhereComputeState[kGPUDtypeSlots][4] = {};
+    std::mutex WhereInitMutex;
+    void initWhere(int type, int specialization) {
+        std::lock_guard<std::mutex> lock(WhereInitMutex);
+        if (WhereInit[type][specialization].load(std::memory_order_relaxed)) return;
+        NSError* error = nil;
+        id<MTLFunction> function = requireFunction([NSString stringWithFormat:@"WhereGPU_%d_%d", type, specialization]);
+        auto state = [metalDevice newComputePipelineStateWithFunction:function error:&error];
+        if (!state) throw std::runtime_error(error ? error.localizedDescription.UTF8String : "Where Metal pipeline creation failed");
+        WhereComputeState[type][specialization] = state;
+        WhereInit[type][specialization].store(true, std::memory_order_release);
+    }
+
+    std::atomic<bool> FullInit[kGPUDtypeSlots][4]{};
+    id<MTLComputePipelineState> FullComputeState[kGPUDtypeSlots][4] = {};
+    std::mutex FullInitMutex;
+    void initFull(int type, int specialization) {
+        std::lock_guard<std::mutex> lock(FullInitMutex);
+        if (FullInit[type][specialization].load(std::memory_order_relaxed)) return;
+        NSError* error = nil;
+        id<MTLFunction> function = requireFunction([NSString stringWithFormat:@"FullGPU_%d_%d", type, specialization]);
+        auto state = [metalDevice newComputePipelineStateWithFunction:function error:&error];
+        if (!state) throw std::runtime_error(error ? error.localizedDescription.UTF8String : "Full Metal pipeline creation failed");
+        FullComputeState[type][specialization] = state;
+        FullInit[type][specialization].store(true, std::memory_order_release);
+    }
+
+    std::atomic<bool> ArangeInit[kGPUDtypeSlots]{};
+    id<MTLComputePipelineState> ArangeComputeState[kGPUDtypeSlots] = {};
+    std::mutex ArangeInitMutex;
+    void initArange(int type) {
+        std::lock_guard<std::mutex> lock(ArangeInitMutex);
+        if (ArangeInit[type].load(std::memory_order_relaxed)) return;
+        NSError* error = nil;
+        id<MTLFunction> function = requireFunction([NSString stringWithFormat:@"ArangeGPU_%d", type]);
+        auto state = [metalDevice newComputePipelineStateWithFunction:function error:&error];
+        if (!state) throw std::runtime_error(error ? error.localizedDescription.UTF8String : "Arange Metal pipeline creation failed");
+        ArangeComputeState[type] = state;
+        ArangeInit[type].store(true, std::memory_order_release);
+    }
+
+
     id<MTLComputePipelineState> blendCompute;
     bool blendInit = false;
     

@@ -491,6 +491,8 @@ struct data {
         }
     }
 };
+template <typename T> inline dtype scalar_operand_type(T scalar, dtype m);
+
 class matrix {
 public:
     array_descriptor array_desc;
@@ -737,6 +739,15 @@ public:
     static matrix zeros(std::initializer_list<size_m> shapeI, dtype type = dtype::Float);
     static matrix zeros(const std::vector<size_m>& shapeI, dtype type = dtype::Float);
 
+    // Lazy, half-open range. Integer output casts start/step before generating, like MLX.
+    static matrix arange(double start, double stop, double step = 1, dtype type = dtype::Float);
+    static matrix arange(double stop, dtype type = dtype::Float) { return arange(0, stop, 1, type); }
+    static matrix full(const std::vector<size_m>& shape, const matrix& value, dtype type = dtype::Float);
+    template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+    static matrix full(const std::vector<size_m>& shape, T value, dtype type = dtype::Float) {
+        return full(shape, matrix::scalar(value, type), type);
+    }
+
     static matrix ones(std::initializer_list<size_m> shapeI, dtype type = dtype::Float);
 
     static matrix gaussian(std::initializer_list<size_m> shapeI, float std_dev = 1.0f, bool normalize = true, dtype type = dtype::Float);
@@ -956,6 +967,7 @@ public:
     
     void reshape_eval(matrix& output, array_descriptor reshape_desc, size_t reshape_dims, ExecutionDevice execDev = ExecutionDevice::AUTO);
     matrix reshape(array_descriptor reshape_desc, size_t reshape_dims);
+    matrix reshape(const std::vector<size_m>& new_shape) const;   // for a shape built at runtime, any rank
     matrix unsqueeze(int axis) const;
     matrix unsqueeze(uint32_t* axes, uint32_t num_axes) const;
     matrix unsqueeze(int insertion_axis, int num) const;
@@ -1597,6 +1609,41 @@ public:
     // straight into other tensors). No gradient. See .agents/MatrixAPI.md.
     static matrix equal(const matrix& a, const matrix& b);
     static void equal_backend(matrix& output, ExecutionDevice exec_device);
+
+    // Real-valued pointwise ops; all inputs broadcast. Angles are Float, masks are Bool.
+    static matrix arctan2(const matrix& a, const matrix& b);
+    static matrix arcsin(const matrix& x);
+    static matrix floor(const matrix& x);
+    static matrix greater(const matrix& a, const matrix& b);
+    static matrix less(const matrix& a, const matrix& b);
+    static matrix logical_and(const matrix& a, const matrix& b);
+    static matrix where(const matrix& cond, const matrix& a, const matrix& b);
+    static void arctan2_backend_cpu(matrix& output);
+    static void arctan2_backend_gpu(matrix& output);
+    static void arcsin_backend_cpu(matrix& output);
+    static void arcsin_backend_gpu(matrix& output);
+    static void floor_backend_cpu(matrix& output);
+    static void floor_backend_gpu(matrix& output);
+    static void greater_backend_cpu(matrix& output);
+    static void greater_backend_gpu(matrix& output);
+    static void less_backend_cpu(matrix& output);
+    static void less_backend_gpu(matrix& output);
+    static void logical_and_backend_cpu(matrix& output);
+    static void logical_and_backend_gpu(matrix& output);
+    static void where_backend_cpu(matrix& output);
+    static void where_backend_gpu(matrix& output);
+    static void arange_backend_cpu(matrix& output);
+    static void arange_backend_gpu(matrix& output);
+    static void full_backend_cpu(matrix& output);
+    static void full_backend_gpu(matrix& output);
+    template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+    static matrix greater(const matrix& a, T b) { return greater(a, matrix::scalar(b, scalar_operand_type(b, a.type))); }
+    template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+    static matrix less(const matrix& a, T b) { return less(a, matrix::scalar(b, scalar_operand_type(b, a.type))); }
+    template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+    static matrix where(const matrix& cond, const matrix& a, T b) { return where(cond, a, matrix::scalar(b, scalar_operand_type(b, a.type))); }
+    template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+    static matrix where(const matrix& cond, T a, const matrix& b) { return where(cond, matrix::scalar(a, scalar_operand_type(a, b.type)), b); }
     // Broadcasted elementwise binomial coefficient nCr ("n choose r") in the promoted dtype.
     // Inputs are truncated to integers; r < 0, n < 0 or r > n give 0. Integer dtypes are exact
     // and saturate at the dtype's max; Float/Float16 use the multiplicative formula in float
@@ -1743,6 +1790,9 @@ matrix operator+(const matrix &a, const matrix &b);
 matrix operator-(const matrix &a, const matrix &b);
 matrix operator*(const matrix &a, const matrix &b);
 matrix operator/(const matrix &a, const matrix &b);
+// Elementwise comparisons return a lazy, broadcasted Bool matrix.
+inline matrix operator>(const matrix& a, const matrix& b) { return matrix::greater(a, b); }
+inline matrix operator<(const matrix& a, const matrix& b) { return matrix::less(a, b); }
 
 // The dtype a C++ scalar takes next to a matrix of dtype m (MLX's "weak" Python scalars): it
 // adopts m's dtype, so uint8 * 2 stays uint8 and half * 0.5f stays Float16. Unlike a plain cast,
@@ -1818,6 +1868,16 @@ template <typename T>
 matrix operator/(const matrix& m, T scalar) { return m / matrix::scalar(scalar, scalar_operand_type(scalar, m.type)); }
 template <typename T>
 matrix operator/(T scalar, const matrix& m) { return matrix::scalar(scalar, scalar_operand_type(scalar, m.type)) / m; }
+
+// Elementwise comparisons with weak scalar promotion, matching arithmetic operators.
+template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+matrix operator>(const matrix& m, T scalar) { return matrix::greater(m, scalar); }
+template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+matrix operator>(T scalar, const matrix& m) { return matrix::greater(matrix::scalar(scalar, scalar_operand_type(scalar, m.type)), m); }
+template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+matrix operator<(const matrix& m, T scalar) { return matrix::less(m, scalar); }
+template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+matrix operator<(T scalar, const matrix& m) { return matrix::less(matrix::scalar(scalar, scalar_operand_type(scalar, m.type)), m); }
 
 bool compare_shapes(const matrix &a, const matrix &b);
 
