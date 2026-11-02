@@ -95,6 +95,14 @@ public:
     
     bool MinInit[kGPUDtypeSlots][8];
     id<MTLComputePipelineState> MinComputeState_nd[kGPUDtypeSlots][8];
+
+    // ArgMax.metal: the same 8 kernels per dtype as Max (0-3 one thread per output, 4-7 TGR).
+    bool ArgMaxInit[kGPUDtypeSlots][8] = {{false}};
+    id<MTLComputePipelineState> ArgMaxComputeState_nd[kGPUDtypeSlots][8];
+
+    // ArgMin.metal: the same layout as ArgMax.
+    bool ArgMinInit[kGPUDtypeSlots][8] = {{false}};
+    id<MTLComputePipelineState> ArgMinComputeState_nd[kGPUDtypeSlots][8];
     
     bool SinInit[kGPUDtypeSlots];
     id<MTLComputePipelineState> SinComputeState[kGPUDtypeSlots];
@@ -710,6 +718,20 @@ public:
         id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"MinGPU_%i_%i", type_code, cdims]);
         MinComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
         MinInit[type_code][cdims] = true;
+    }
+
+    void initArgMax_nd(int type_code, int cdims) {
+        NSError* error = nil;
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ArgMaxGPU_%i_%i", type_code, cdims]);
+        ArgMaxComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        ArgMaxInit[type_code][cdims] = true;
+    }
+
+    void initArgMin_nd(int type_code, int cdims) {
+        NSError* error = nil;
+        id<MTLFunction> func = requireFunction([NSString stringWithFormat:@"ArgMinGPU_%i_%i", type_code, cdims]);
+        ArgMinComputeState_nd[type_code][cdims] = [metalDevice newComputePipelineStateWithFunction:func error:&error];
+        ArgMinInit[type_code][cdims] = true;
     }
     
     void initSin(int i) {

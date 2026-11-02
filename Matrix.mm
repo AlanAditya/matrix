@@ -15200,9 +15200,13 @@ matrix matrix::argmax(int axis, bool keepdims) const {
 }
 
 void matrix::argmax(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device) const {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+
     size_m reduce_axis_stride = strides()[axis];
     size_m noOfOpp = shape()[axis];
-    
+
     ArgMaxPrimitive* primit = static_cast<ArgMaxPrimitive*>(output.tape);
     
     CollapsedDims_2 collapsed;
@@ -15224,11 +15228,79 @@ void matrix::argmax(matrix& output, int axis, bool keepdims, ExecutionDevice exe
         collapsed.shape[0] = 1;
     }
 
+    if (exec_device == ExecutionDevice::METAL) {
+        bool use_tgr = (noOfOpp > 256);
+        int kernel_idx = cdims >= 4 ? 3 : cdims - 1;
+        if (use_tgr) {
+            kernel_idx += 4; // TGR kernels are at offset +4
+        }
+
+        if (!GlobalGPUManager.ArgMaxInit[(int)type][kernel_idx]) {
+            GlobalGPUManager.initArgMax_nd((int)type, kernel_idx);
+        }
+        id<MTLComputePipelineState> pipeline = GlobalGPUManager.ArgMaxComputeState_nd[(int)type][kernel_idx];
+
+        id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+
+        setBufferOrBytes(commandEncoder, output, 0);
+        setBufferOrBytes(commandEncoder, *this, 1);
+
+        [commandEncoder setBytes:&reduce_axis_stride length: sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:&noOfOpp length: sizeof(size_m) atIndex:3];
+
+        auto _threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        // TGR: one threadgroup per output, as wide as the axis can keep busy (at least 4 elements a
+        // thread, up to 1024 threads), always whole 32-lane simdgroups so every shuffle lane is live.
+        NSUInteger x_multiplier = 1;
+        if (use_tgr) {
+            NSUInteger width = std::min<NSUInteger>(1024, pipeline.maxTotalThreadsPerThreadgroup) / 32 * 32;
+            while (width > 32 && width * 4 > noOfOpp) {
+                width = std::max<NSUInteger>(32, width / 2 / 32 * 32);
+            }
+            x_multiplier = width;
+            _threadsPerThreadgroup = MTLSizeMake(width, 1, 1);
+        }
+
+        if (cdims == 1) {
+            [commandEncoder setBytes:&collapsed.stridesA[0] length:sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&collapsed.stridesB[0] length:sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[0] * x_multiplier, 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setBytes:collapsed.stridesA length:2 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:2 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[1] * x_multiplier, collapsed.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setBytes:collapsed.stridesA length:3 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:3 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[2] * x_multiplier, collapsed.shape[1], collapsed.shape[0]);
+        } else {
+            [commandEncoder setBytes:collapsed.stridesA length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:cdims * sizeof(size_m) atIndex:5];
+            [commandEncoder setBytes:collapsed.shape length:cdims * sizeof(size_m) atIndex:6];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:7];
+
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= collapsed.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[cdims-1] * x_multiplier, collapsed.shape[cdims-2], acc);
+        }
+
+        if (!use_tgr) {
+            _threadsPerThreadgroup = threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup);
+        }
+
+        [commandEncoder setComputePipelineState:pipeline];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        return;
+    }
+
     dispatch_type(type, buffer, [&](auto *in_data) {
         using T = std::decay_t<decltype(*in_data)>;
         int32_t* out_data = (int32_t*)output.buffer;
         size_t total_out = output.total_size;
-        
+
         for (size_t gid = 0; gid < total_out; gid++) {
             size_t AxisOffset = 0;
             size_t remaining = gid;
@@ -15283,6 +15355,10 @@ matrix matrix::argmin(int axis, bool keepdims) const {
 }
 
 void matrix::argmin(matrix& output, int axis, bool keepdims, ExecutionDevice exec_device) const {
+    if (exec_device == ExecutionDevice::AUTO) {
+        exec_device = total_size > 10 ? ExecutionDevice::METAL : ExecutionDevice::CPU;
+    }
+
     size_m reduce_axis_stride = strides()[axis];
     size_m noOfOpp = shape()[axis];
     
@@ -15305,6 +15381,74 @@ void matrix::argmin(matrix& output, int axis, bool keepdims, ExecutionDevice exe
         collapsed.stridesA[0] = 1;
         collapsed.stridesB[0] = 1;
         collapsed.shape[0] = 1;
+    }
+
+    if (exec_device == ExecutionDevice::METAL) {
+        bool use_tgr = (noOfOpp > 256);
+        int kernel_idx = cdims >= 4 ? 3 : cdims - 1;
+        if (use_tgr) {
+            kernel_idx += 4; // TGR kernels are at offset +4
+        }
+
+        if (!GlobalGPUManager.ArgMinInit[(int)type][kernel_idx]) {
+            GlobalGPUManager.initArgMin_nd((int)type, kernel_idx);
+        }
+        id<MTLComputePipelineState> pipeline = GlobalGPUManager.ArgMinComputeState_nd[(int)type][kernel_idx];
+
+        id<MTLCommandBuffer> commandBuffer = GlobalGPUManager.getCommandBuffer();
+        id<MTLComputeCommandEncoder> commandEncoder = GlobalGPUManager.getCommandEncoder();
+
+        setBufferOrBytes(commandEncoder, output, 0);
+        setBufferOrBytes(commandEncoder, *this, 1);
+
+        [commandEncoder setBytes:&reduce_axis_stride length: sizeof(size_m) atIndex:2];
+        [commandEncoder setBytes:&noOfOpp length: sizeof(size_m) atIndex:3];
+
+        auto _threadsPerThreadgroup = MTLSizeMake(1, 1, 1);
+        auto _dispatchExecutionSize = MTLSizeMake(1, 1, 1);
+
+        // TGR: one threadgroup per output, as wide as the axis can keep busy (at least 4 elements a
+        // thread, up to 1024 threads), always whole 32-lane simdgroups so every shuffle lane is live.
+        NSUInteger x_multiplier = 1;
+        if (use_tgr) {
+            NSUInteger width = std::min<NSUInteger>(1024, pipeline.maxTotalThreadsPerThreadgroup) / 32 * 32;
+            while (width > 32 && width * 4 > noOfOpp) {
+                width = std::max<NSUInteger>(32, width / 2 / 32 * 32);
+            }
+            x_multiplier = width;
+            _threadsPerThreadgroup = MTLSizeMake(width, 1, 1);
+        }
+
+        if (cdims == 1) {
+            [commandEncoder setBytes:&collapsed.stridesA[0] length:sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:&collapsed.stridesB[0] length:sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[0] * x_multiplier, 1, 1);
+        } else if (cdims == 2) {
+            [commandEncoder setBytes:collapsed.stridesA length:2 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:2 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[1] * x_multiplier, collapsed.shape[0], 1);
+        } else if (cdims == 3) {
+            [commandEncoder setBytes:collapsed.stridesA length:3 * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:3 * sizeof(size_m) atIndex:5];
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[2] * x_multiplier, collapsed.shape[1], collapsed.shape[0]);
+        } else {
+            [commandEncoder setBytes:collapsed.stridesA length:cdims * sizeof(size_m) atIndex:4];
+            [commandEncoder setBytes:collapsed.stridesB length:cdims * sizeof(size_m) atIndex:5];
+            [commandEncoder setBytes:collapsed.shape length:cdims * sizeof(size_m) atIndex:6];
+            [commandEncoder setBytes:&cdims length:sizeof(uint32_t) atIndex:7];
+
+            size_m acc = 1;
+            for (int i = 0; i < cdims-2; i++) { acc *= collapsed.shape[i]; }
+            _dispatchExecutionSize = MTLSizeMake(collapsed.shape[cdims-1] * x_multiplier, collapsed.shape[cdims-2], acc);
+        }
+
+        if (!use_tgr) {
+            _threadsPerThreadgroup = threadgroup_for_grid(_dispatchExecutionSize, pipeline.maxTotalThreadsPerThreadgroup);
+        }
+
+        [commandEncoder setComputePipelineState:pipeline];
+        [commandEncoder dispatchThreads:_dispatchExecutionSize threadsPerThreadgroup:_threadsPerThreadgroup];
+        return;
     }
 
     dispatch_type(type, buffer, [&](auto *in_data) {

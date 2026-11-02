@@ -6680,7 +6680,7 @@ public:
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
         if (evaluated) {return;} else {evaluated = true;}
-        input.argmax(out, axis, keepdims, ExecutionDevice::CPU); // Fallback to CPU
+        input.argmax(out, axis, keepdims, ExecutionDevice::METAL);
     }
     // No gradient: one zero per input, since build_grad_graph pairs vjp()[i] with get_inputs()[i].
     std::vector<matrix> vjp(matrix& grad_out) override {
@@ -6788,7 +6788,7 @@ public:
         }
         if (eval_type == EvalType::COMPILE_TRACE) {return;}
         if (evaluated) {return;} else {evaluated = true;}
-        input.argmin(out, axis, keepdims, ExecutionDevice::CPU); // Fallback to CPU
+        input.argmin(out, axis, keepdims, ExecutionDevice::METAL);
     }
     // No gradient: one zero per input, since build_grad_graph pairs vjp()[i] with get_inputs()[i].
     std::vector<matrix> vjp(matrix& grad_out) override {

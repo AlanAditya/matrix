@@ -346,7 +346,6 @@ Bugs 5 and 6 were verified standalone with a live-descriptor counter: before the
 
 **Open issues found by reading the code (not fixed yet):**
 - `MultiInputCompilePrimitive::eval_metal` does `sib->evaluated = true` without a null check. `eval_cpu` checks, and the destructor sets entries in the siblings' lists to null, so running a surviving sibling after one is destroyed dereferences null.
-- `ArgMax`/`ArgMin` `eval_metal` run the CPU kernel in the middle of a Metal pass without waiting for queued GPU work, so they can read stale input.
 - `ConvolvePrimitive::eval_cpu` has no CPU implementation (it's commented out), so a CPU conv returns uninitialized memory.
 - `PaddingPrimitive` never evaluates its `value` input and leaves it out of `clear_trace_checks`/`invalidate_pass`.
 - Sum/Max/Min reductions, ArgMax/ArgMin, Take, Padding and ExecutionBoundary skip `ensure_graph_ready()`, so a tapeless input isn't refcounted.
