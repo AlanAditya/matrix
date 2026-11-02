@@ -970,7 +970,6 @@ public:
     matrix reshape(const std::vector<size_m>& new_shape) const;   // for a shape built at runtime, any rank
     matrix unsqueeze(int axis) const;
     matrix unsqueeze(uint32_t* axes, uint32_t num_axes) const;
-    matrix unsqueeze(const std::vector<int>& axes) const;
     matrix unsqueeze(int insertion_axis, int num) const;
     matrix squeeze(int axis) const;
     matrix squeeze() const;
@@ -1133,7 +1132,6 @@ public:
     // take's backends, one per device: TakePrimitive::eval_cpu / eval_metal call them directly.
     void take_backend_cpu(const matrix& index, matrix& output, int axis) const;
     void take_backend_gpu(const matrix& index, matrix& output, int axis) const;
-    
 
     // Inverse of take: returns a copy of dst where each update is combined (mode) into the
     // slot along `axis` that its index names. updates broadcasts to take(dst, indices, axis)'s
@@ -1175,11 +1173,11 @@ public:
     matrix sum() const; // global sum
     
     matrix mean(int axis, bool keepdims = false) const;
-    matrix mean(int start, int end, bool keepdims = false) const;
+    matrix mean(int start, int end = -1, bool keepdims = false) const;
     matrix mean() const; // global mean
 
     matrix rms(int axis, bool keepdims = false) const;
-    matrix rms(int start, int end, bool keepdims = false) const;
+    matrix rms(int start, int end = -1, bool keepdims = false) const;
     matrix rms() const; // global rms
 
     matrix norm(int axis, bool keepdims = false) const;

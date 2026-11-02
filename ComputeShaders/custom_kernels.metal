@@ -334,22 +334,3 @@ kernel void gpu_func_scale(TENSOR_ARG(out, float, 0), TENSOR_ARG(x, const float,
     out[elem_to_loc<int64_t>(gid, out_shape, out_strides, out_dims)] =
         x[elem_to_loc<int64_t>(gid, x_shape, x_strides, x_dims)] * s[0];
 }
-
-// signed_distance_field_tester (MatrixH.mm): writes the BGRA colour of every pixel into `out`
-// ([H, W, 4] Float, 0-255). No inputs. Dispatched over {H, W}: gid.x = row (out axis 0),
-// gid.y = column. uv: origin at the centre, y up, 1 unit = half the image height.
-kernel void signed_distance_field(TENSOR_ARG(out, float, 0), uint2 gid [[thread_position_in_grid]]) {
-    float H = out_shape[0], W = out_shape[1];
-    float2 uv = float2((gid.y + 0.5f - W * 0.5f) / (H * 0.5f), (H * 0.5f - gid.x - 0.5f) / (H * 0.5f));
-
-    float d = length(uv) - 0.5f;                                  // placeholder: a circle of radius 0.5
-    float3 rgb = d < 0.0f ? float3(1.0f) : float3(0.0f);          // placeholder: white inside, black outside
-    
-    
-
-    device float* px = out + gid.x * out_strides[0] + gid.y * out_strides[1];
-    px[0 * out_strides[2]] = rgb.b * 255.0f;
-    px[1 * out_strides[2]] = rgb.g * 255.0f;
-    px[2 * out_strides[2]] = rgb.r * 255.0f;
-    px[3 * out_strides[2]] = 255.0f;
-}

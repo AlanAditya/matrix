@@ -8,7 +8,6 @@
 #ifndef Utils_h
 #define Utils_h
 #include <vector>
-#include <tuple>
 #include <iostream>
 #include <chrono>
 //#include <simd/simd.h>
@@ -107,8 +106,7 @@ enum class MouseEvent {
 
 struct ViewerEvent {
     MouseEvent type;
-    simd_float2 normalized_pos = {0, 0};        // cursor in the whole view, -1..1 (Metal style, y up)
-    simd_float2 prev_normalized_pos = {0, 0};   // the cursor on the previous event (drag / scroll)
+    simd_float2 normalized_pos;
     simd_float2 delta;
     float zoom_magnitude;
     simd_float3 ray_origin;
@@ -117,52 +115,11 @@ struct ViewerEvent {
     simd_float3 prev_ray_dir;
 };
 
-// Moved from MatrixH.mm so Viewer.cpp can use it too. A template on the camera type because
-// Camera3D.h includes matrix.h, which imports this module; Cam is always Camera3D.
-template <typename Cam>
-std::tuple<simd_float3, simd_float3, simd_float2> ray_from_screen_space(simd_float2 view_coords, simd_float2 view_bounds, Cam& cam) {
-    // Returns Ray origin , Ray direction, event location in view [-1.0f, 1.0f] (metal style coord)
-    simd_float2 metal_coords = (2 * view_coords / view_bounds) - 1;
-    simd_float4 metal_screen_space_coords_p1 = simd_make_float4(metal_coords.x, metal_coords.y, 0, 1);
-    simd_float4 metal_screen_space_coords_p2 = simd_make_float4(metal_coords.x, metal_coords.y, 1, 1);
-    simd_float4x4 invViewProj = simd_mul(cam.inverseViewMatrix, cam.inverseProjectionMatrix);
-    
-    //: Alternate Approach (causes float instability in p2 due to pre pultiplication of farP)
-//    simd_float4 metal_view_space_coords_p1 = simd_mul(renderer->cam.inverseProjectionMatrix, metal_screen_space_coords_p1* cam.nearP);
-//    simd_float4 metal_view_space_coords_p2 = simd_mul(renderer->cam.inverseProjectionMatrix, metal_screen_space_coords_p2* cam.farP);
-//    
-//    simd_float4 metal_world_space_coords_p1 = simd_mul(renderer->cam.inverseViewMatrix, metal_view_space_coords_p1);
-//    simd_float4 metal_world_space_coords_p2 = simd_mul(renderer->cam.inverseViewMatrix, metal_view_space_coords_p2);
-//    
-//    simd_float4 metal_world_space_coords_direct_p1 = simd_mul(invViewProj, metal_screen_space_coords_p1* cam.nearP);
-//    simd_float4 metal_world_space_coords_direct_p2 = simd_mul(invViewProj, metal_screen_space_coords_p2* cam.farP);
-    
-    
-    simd_float4 world_p1_homo = simd_mul(invViewProj, metal_screen_space_coords_p1);
-    simd_float4 world_p2_homo = simd_mul(invViewProj, metal_screen_space_coords_p2);
-    
-    // 4. THE CRITICAL STEP: Perspective Divide (Divide by W)
-    simd_float3 world_p1 = simd_make_float3(world_p1_homo.x / world_p1_homo.w,
-                                            world_p1_homo.y / world_p1_homo.w,
-                                            world_p1_homo.z / world_p1_homo.w);
-                                            
-    simd_float3 world_p2 = simd_make_float3(world_p2_homo.x / world_p2_homo.w,
-                                                world_p2_homo.y / world_p2_homo.w,
-                                                world_p2_homo.z / world_p2_homo.w);
-    
-    
-    
-    simd_float3 ray_origin = world_p1;
-    simd_float3 ray_direction = (world_p2 - world_p1);
-    return {ray_origin, ray_direction, metal_coords};
-}
-
 enum Flags : unsigned int {
     NON_OWNERSHIP_FLAG = 1u << 0,  // Bit 0
     NON_CONTIGUOUS_FLAG = 1u << 1,  // Bit 1
     COMPUTE_GRAPH = 1u << 2, // Bit 2
-    NON_ROW_CONTIGUOUS_FLAG = 1u << 3,
-    SCATTERED_VIEW = 1u << 4
+    NON_ROW_CONTIGUOUS_FLAG = 1u << 3
 };
 
 using size_m = uint32_t;

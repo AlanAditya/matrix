@@ -460,7 +460,7 @@ matrix matrix::reshape(array_descriptor reshape_desc, size_t reshape_dims) {
 //    }
     bool REQUIRES_NEW_BUFFER = (flags & NON_CONTIGUOUS_FLAG) != 0;
     output.tape = new ReshapePrimitive(*this, output.array_desc, output.dims, REQUIRES_NEW_BUFFER);
-
+    
     return output;
 }
 
@@ -706,21 +706,6 @@ matrix matrix::unsqueeze(uint32_t* axes, uint32_t num_axes) const {
     return output;
 }
 
-matrix matrix::unsqueeze(const std::vector<int>& axes) const {
-    uint32_t num_axes = (uint32_t)axes.size();
-    if (num_axes == 0) return *this;
-    // axes index into the output, so negatives wrap around the new rank
-    int new_dims = dims + num_axes;
-    std::vector<uint32_t> norm_axes(num_axes);
-    for (uint32_t i = 0; i < num_axes; i++) {
-        int axis = axes[i];
-        if (axis < 0) axis += new_dims;
-        assert(axis >= 0 && axis < new_dims && "unsqueeze: axis out of range");
-        norm_axes[i] = (uint32_t)axis;
-    }
-    return unsqueeze(norm_axes.data(), num_axes);
-}
-
 //template <typename Func>
 //inline void dispatch_type(dtype type, void *buffer, Func &&function_to_run) {
 //    if (!buffer)
@@ -932,12 +917,6 @@ inline void matrix::update_from_trace() {
 //        if (refCount) {
             refCount->fetch_add(1);
 //        }
-    } else if (tape && tape->out_metal_buffer) {
-        // A CPU -> Metal pass may add a wrapper without moving the buffer. Sibling
-        // handles must adopt it too, or small inputs use setBytes with the previous
-        // pass's host values while this pass is still queued on the GPU. Keep a
-        // locally built wrapper when the tape has none (e.g. a tapeless/view input).
-        metalBuffer = tape->out_metal_buffer;
     }
 }
 void matrix::calcStrides() {
@@ -3587,7 +3566,6 @@ void matrix::CopyToTexture(id<MTLTexture> texture, Execution exec) {
                                  "Matrix must be at least 2D to blit to a texture.");
     }
 #endif
-    *this = this->astype(dtype::UInt8);
     eval();
     // The blit below reads from metalBuffer, and blit encoders have no setBytes fallback.
     // A matrix evaluated on the CPU (eval_cpu(), at(), or eval() on <= 10 elements) has
@@ -8461,14 +8439,12 @@ void matrix::eval_metal() {
         update_from_trace();
         return;
     }
+    id<MTLCommandBuffer> oldBuffer = GlobalGPUManager._thread_gCommandBuffer ? GlobalGPUManager.getCommandBuffer() : nullptr;
     tape->eval_metal(*this, EvalType::EVAL_INSTANTLY);
     update_from_trace();
 
-    // The result must be in memory when eval returns, so commit whatever command buffer is open,
-    // even one this eval didn't open (e.g. read_gpu's blit). Committing only a buffer this call
-    // opened left an already-open one uncommitted: eval returned before the GPU had run, and
-    // callers read unfinished results and freed temporaries the GPU wrote into later.
-    if (GlobalGPUManager._thread_gCommandBuffer) {
+    
+    if (GlobalGPUManager._thread_gCommandBuffer && oldBuffer == nullptr) {
         GlobalGPUManager.endCommandEncoding();
         GlobalGPUManager.commitCommandBuffer();
     }
@@ -8484,10 +8460,10 @@ void matrix::execute_cpu() {
 }
 void matrix::execute_metal() {
     if (!tape) return;
+    id<MTLCommandBuffer> oldBuffer = GlobalGPUManager._thread_gCommandBuffer ? GlobalGPUManager.getCommandBuffer() : nullptr;
     tape->eval_metal(*this, EvalType::EXEC_TRACE);
     
-    // Same as eval_metal: finished on return, whoever opened the command buffer.
-    if (GlobalGPUManager._thread_gCommandBuffer) {
+    if (GlobalGPUManager._thread_gCommandBuffer && oldBuffer == nullptr) {
         GlobalGPUManager.endCommandEncoding();
         GlobalGPUManager.commitCommandBuffer();
     }
