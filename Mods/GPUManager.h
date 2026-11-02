@@ -231,7 +231,7 @@ public:
     // ArgMin.metal: the same layout as ArgMax.
     bool ArgMinInit[kGPUDtypeSlots][8] = {{false}};
     id<MTLComputePipelineState> ArgMinComputeState_nd[kGPUDtypeSlots][8];
-    
+
     bool SinInit[kGPUDtypeSlots];
     id<MTLComputePipelineState> SinComputeState[kGPUDtypeSlots];
     

@@ -302,11 +302,43 @@ public:
         return matrix::conv(tangents[0], kernel, stride, pad, dilation_rhs, dilation_lhs, groups, flip) + matrix::conv(input, tangents[1], stride, pad, dilation_rhs, dilation_lhs, groups, flip);
     }
 
+    // MLX's group_transpose. A plain transpose can't give the gradient conv a full-size channel axis
+    // when groups > 1, so split axis `group_dim` into [groups, n / groups], swap ax_a and ax_b, then
+    // merge the groups axis into the one after it. The kernel [O, K..., I/G] becomes [I, K..., O/G].
+    matrix group_transpose(const matrix& x, int group_dim, int ax_a, int ax_b) const {
+        if (groups == 1) return x.swapaxes(0, -1);
+        if (group_dim < 0) group_dim += x.dims;
+        std::vector<size_m> split(x.shape(), x.shape() + x.dims);
+        split.insert(split.begin() + group_dim, (size_m)groups);
+        split[group_dim + 1] /= groups;
+        return x.reshape(split).swapaxes(ax_a, ax_b).flatten(group_dim, group_dim + 1);
+    }
+
+    // As MLX's Convolution::vjp: each gradient is itself a conv, with stride and dilation roles swapped.
     std::vector<matrix> vjp(matrix& grad_out) override {
-        std::vector<int> stride_g(grad_out.dims - 2, 1);
-        std::vector<int> pad_lo(grad_out.dims - 2, 1);
-        std::vector<int> pad_hi(grad_out.dims - 2, 1);
-        return {matrix::conv(grad_out, kernel.swapaxes(0, -1), dilation_lhs, matrix::ConvPadding{pad_lo, pad_hi}, dilation_rhs, stride, groups, !flip)};
+        int N = (int)input.dims - 2;
+        auto dilate = [](int n, int d) { return (n - 1) * d + 1; };
+        std::vector<int> in_lo(N), in_hi(N), wt_hi(N);
+        for (int i = 0; i < N; i++) {
+            int in_size = dilate((int)input.shape()[i + 1], dilation_lhs[i]);
+            int out_size = dilate((int)grad_out.shape()[i + 1], stride[i]);
+            int wt_size = dilate((int)kernel.shape()[i + 1], dilation_rhs[i]);
+            in_lo[i] = wt_size - padding[i] - 1;
+            in_hi[i] = in_size - out_size + padding[i];
+            wt_hi[i] = out_size - in_size + wt_size - padding[i] - 1;
+        }
+
+        // Negative padding needs no clamp-and-slice as in MLX: conv crops the dilated input itself.
+        matrix grad_input = matrix::conv(grad_out, group_transpose(kernel, 0, 1, -1), dilation_lhs, matrix::ConvPadding{in_lo, in_hi}, dilation_rhs, stride, groups, !flip);
+
+        matrix grad_kernel = matrix::conv(group_transpose(input, -1, 0, -1), grad_out.swapaxes(0, -1), dilation_rhs, matrix::ConvPadding{padding, wt_hi}, stride, dilation_lhs, groups, false);
+        if (flip) {
+            for (int i = 1; i <= N; i++) {
+                int n = (int)grad_kernel.shape()[i];
+                grad_kernel = grad_kernel.take(matrix::linespace(n - 1, 0, (size_t)n, dtype::Int32), i);
+            }
+        }
+        return {grad_input, grad_kernel.swapaxes(0, -1)};
     }
 
     matrix* get_borrowed_input() override {
@@ -3315,7 +3347,15 @@ public:
     // Balances the retain() in the constructor. array_descriptor is a union with no
     // destructor, so nothing else gives back this primitive's hold on the heap
     // SharedArrayDescriptor (dims > SBO_MAX_DIMS); without this it leaked one per node.
-    ~ReshapePrimitive() {
+    ~ReshapePrimitive() override {
+        // A view may borrow an interior pointer (e.g. unsqueeze on an offset
+        // slice). Drop its cache hold while input is alive, so the input chain
+        // performs the final release using the allocation base. Owning reshapes
+        // keep their cache for ~Primitive to free normally.
+        if (!REQUIRES_NEW_BUFFER && out_refcount) {
+            out_refcount->fetch_sub(1, std::memory_order_relaxed);
+            out_refcount = nullptr;
+        }
         reshape_desc.release(reshape_dim);
     }
     void eval_cpu(matrix &out, EvalType eval_type) override {
@@ -3683,7 +3723,14 @@ public:
     // Balances the retain() in the constructor. array_descriptor is a union with no
     // destructor, so nothing else gives back this primitive's hold on the heap
     // SharedArrayDescriptor (dims > SBO_MAX_DIMS); without this it leaked one per node.
-    ~TransposePrimitive() {
+    ~TransposePrimitive() override {
+        // A transpose of an offset slice still points inside the allocation.
+        // Drop the borrowed cache hold while input is alive, as SlicePrimitive
+        // does, so the final owner frees the allocation's base pointer.
+        if (out_refcount) {
+            out_refcount->fetch_sub(1, std::memory_order_relaxed);
+            out_refcount = nullptr;
+        }
         transpose_desc.release(input.dims);
     }
     void eval_cpu(matrix &out, EvalType eval_type) override {
